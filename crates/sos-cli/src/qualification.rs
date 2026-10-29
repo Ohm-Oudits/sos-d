@@ -1,15 +1,32 @@
-use std::{fs, path::PathBuf, process::ExitCode, time::Duration};
+use std::{env, fs, path::PathBuf, process::ExitCode, time::Duration};
 
 use sos_ai::{
-    qualify_humanization_model, trusted_open_model, CommandModelProvider, ModelQualificationCorpus,
-    ModelQualificationResult, OllamaModelProvider,
+    qualify_humanization_model, trusted_open_model, AnthropicModelProvider,
+    CloudflareModelProvider, CommandModelProvider, GroqModelProvider, HuggingFaceModelProvider,
+    ModelQualificationCorpus, ModelQualificationResult, OllamaModelProvider, OpenAiModelProvider,
+    CLOUDFLARE_GPT_OSS_120B, GROQ_GPT_OSS_120B, HUGGING_FACE_GPT_OSS_120B,
 };
 
 const DEFAULT_CORPUS_PROMPT: &str = "sos-model-qualification-v1";
 
+fn anthropic_provider(api_key: String) -> Result<AnthropicModelProvider, sos_ai::AiError> {
+    let provider = AnthropicModelProvider::new(api_key)?;
+    match env::var("ANTHROPIC_WORKSPACE_ID") {
+        Ok(workspace_id) if !workspace_id.trim().is_empty() => {
+            provider.with_workspace_id(workspace_id)
+        }
+        _ => Ok(provider),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QualificationProvider {
     Ollama,
+    Groq,
+    HuggingFace,
+    Cloudflare,
+    OpenAi,
+    Anthropic,
     Command,
 }
 
@@ -30,7 +47,7 @@ struct QualificationOptions {
 impl QualificationOptions {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let Some(corpus) = args.first() else {
-            return Err("usage: sos qualify-model <corpus.json> [--provider ollama|command] [--model MODEL] [--ollama-url URL|--model-command PATH] [--minimum-score 0..1] [--timeout-seconds N] [--context-tokens N] [--allow-unreviewed-model] [--out PATH]".into());
+            return Err("usage: sos qualify-model <corpus.json> [--provider ollama|groq|huggingface|cloudflare|openai|anthropic|command] [--model MODEL] [--ollama-url URL|--model-command PATH] [--minimum-score 0..1] [--timeout-seconds N] [--context-tokens N] [--allow-unreviewed-model] [--out PATH]".into());
         };
         let mut options = Self {
             corpus: PathBuf::from(corpus),
@@ -44,6 +61,7 @@ impl QualificationOptions {
             allow_unreviewed_model: false,
             output: None,
         };
+        let mut model_explicit = false;
         let mut index = 1;
         while index < args.len() {
             if args[index] == "--allow-unreviewed-model" {
@@ -59,11 +77,19 @@ impl QualificationOptions {
                 "--provider" => {
                     options.provider = match value.as_str() {
                         "ollama" => QualificationProvider::Ollama,
+                        "groq" => QualificationProvider::Groq,
+                        "huggingface" => QualificationProvider::HuggingFace,
+                        "cloudflare" => QualificationProvider::Cloudflare,
+                        "openai" => QualificationProvider::OpenAi,
+                        "anthropic" => QualificationProvider::Anthropic,
                         "command" => QualificationProvider::Command,
                         _ => return Err(format!("unsupported qualification provider {value:?}")),
                     }
                 }
-                "--model" => options.model = value.clone(),
+                "--model" => {
+                    options.model = value.clone();
+                    model_explicit = true;
+                }
                 "--ollama-url" => options.ollama_url = value.clone(),
                 "--model-command" => {
                     options.model_command = Some(PathBuf::from(value));
@@ -100,6 +126,26 @@ impl QualificationOptions {
                 _ => return Err(format!("unknown qualify-model option: {flag}")),
             }
             index += 2;
+        }
+        if !model_explicit {
+            options.model = match options.provider {
+                QualificationProvider::Ollama => "gpt-oss:20b".into(),
+                QualificationProvider::Groq => GROQ_GPT_OSS_120B.into(),
+                QualificationProvider::HuggingFace => HUGGING_FACE_GPT_OSS_120B.into(),
+                QualificationProvider::Cloudflare => CLOUDFLARE_GPT_OSS_120B.into(),
+                QualificationProvider::OpenAi => env::var("SOS_OPENAI_MODEL").map_err(|_| {
+                    "--provider openai requires --model MODEL or SOS_OPENAI_MODEL".to_string()
+                })?,
+                QualificationProvider::Anthropic => {
+                    env::var("SOS_ANTHROPIC_MODEL").map_err(|_| {
+                        "--provider anthropic requires --model MODEL or SOS_ANTHROPIC_MODEL"
+                            .to_string()
+                    })?
+                }
+                QualificationProvider::Command => {
+                    return Err("--provider command requires --model MODEL".into())
+                }
+            };
         }
         if options.model.trim().is_empty() {
             return Err("--model cannot be empty".into());
@@ -150,6 +196,93 @@ pub(super) fn qualify_model_command(args: Vec<String>) -> ExitCode {
             &corpus,
             options.minimum_score,
         ),
+        QualificationProvider::Groq => match env::var("GROQ_API_KEY") {
+            Ok(api_key) => GroqModelProvider::new(api_key).and_then(|provider| {
+                qualify_humanization_model(
+                    provider,
+                    "groq_hosted_open_weights",
+                    &options.model,
+                    DEFAULT_CORPUS_PROMPT,
+                    &corpus,
+                    options.minimum_score,
+                )
+            }),
+            Err(_) => {
+                eprintln!("error: GROQ_API_KEY is required for --provider groq");
+                return ExitCode::from(2);
+            }
+        },
+        QualificationProvider::HuggingFace => match env::var("HF_TOKEN") {
+            Ok(token) => HuggingFaceModelProvider::new(token).and_then(|provider| {
+                qualify_humanization_model(
+                    provider,
+                    "huggingface_inference_open_weights",
+                    &options.model,
+                    DEFAULT_CORPUS_PROMPT,
+                    &corpus,
+                    options.minimum_score,
+                )
+            }),
+            Err(_) => {
+                eprintln!("error: HF_TOKEN is required for --provider huggingface");
+                return ExitCode::from(2);
+            }
+        },
+        QualificationProvider::Cloudflare => {
+            match (
+                env::var("CLOUDFLARE_ACCOUNT_ID"),
+                env::var("CLOUDFLARE_API_TOKEN"),
+            ) {
+                (Ok(account), Ok(token)) => {
+                    CloudflareModelProvider::new(account, token).and_then(|provider| {
+                        qualify_humanization_model(
+                            provider,
+                            "cloudflare_workers_ai_open_weights",
+                            &options.model,
+                            DEFAULT_CORPUS_PROMPT,
+                            &corpus,
+                            options.minimum_score,
+                        )
+                    })
+                }
+                _ => {
+                    eprintln!("error: CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are required for --provider cloudflare");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        QualificationProvider::OpenAi => match env::var("OPENAI_API_KEY") {
+            Ok(api_key) => OpenAiModelProvider::new(api_key).and_then(|provider| {
+                qualify_humanization_model(
+                    provider,
+                    "openai_responses_api",
+                    &options.model,
+                    DEFAULT_CORPUS_PROMPT,
+                    &corpus,
+                    options.minimum_score,
+                )
+            }),
+            Err(_) => {
+                eprintln!("error: OPENAI_API_KEY is required for --provider openai");
+                return ExitCode::from(2);
+            }
+        },
+        QualificationProvider::Anthropic => match env::var("ANTHROPIC_API_KEY") {
+            Ok(api_key) => anthropic_provider(api_key).and_then(|provider| {
+                qualify_humanization_model(
+                    provider,
+                    "anthropic_messages_api",
+                    &options.model,
+                    DEFAULT_CORPUS_PROMPT,
+                    &corpus,
+                    options.minimum_score,
+                )
+            }),
+            Err(_) => {
+                eprintln!("error: ANTHROPIC_API_KEY is required for --provider anthropic");
+                return ExitCode::from(2);
+            }
+        },
         QualificationProvider::Command => qualify_humanization_model(
             CommandModelProvider::new(
                 options
@@ -213,6 +346,22 @@ mod tests {
         let options = QualificationOptions::parse(vec!["corpus.json".into()]).unwrap();
         assert_eq!(options.model, "gpt-oss:20b");
         assert_eq!(options.minimum_score, 0.8);
+        let groq = QualificationOptions::parse(vec![
+            "corpus.json".into(),
+            "--provider".into(),
+            "groq".into(),
+        ])
+        .unwrap();
+        assert_eq!(groq.model, GROQ_GPT_OSS_120B);
+        let openai = QualificationOptions::parse(vec![
+            "corpus.json".into(),
+            "--provider".into(),
+            "openai".into(),
+            "--model".into(),
+            "explicit-model".into(),
+        ])
+        .unwrap();
+        assert_eq!(openai.model, "explicit-model");
         assert!(QualificationOptions::parse(vec![
             "corpus.json".into(),
             "--model".into(),

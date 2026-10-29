@@ -249,6 +249,9 @@ Qualification requires every response to pass the normal JSON schema,
 evidence-reference, and anti-cheese gates, then scores hidden semantic concept
 groups and forbidden reconstruction shortcuts. A passing score is bounded corpus
 evidence—not a declaration that the weights are universally safe or correct.
+The command also accepts the reviewed Groq, Hugging Face, and Cloudflare routes,
+plus explicit OpenAI or Anthropic model IDs using the credential placeholders
+documented below.
 
 The same reviewed local pipeline is available directly from a deployed address;
 no separate model-adapter command is required. Scope the first run to an entrypoint

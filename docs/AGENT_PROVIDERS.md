@@ -122,8 +122,10 @@ sos qualify-model fixtures/model-qualification-v1.json \
   --out model-qualification.json
 ```
 
-Provider-neutral adapters can be assessed with `--provider command
---model-command PATH`. The result records each case's input hash, schema/evidence
+The same command supports `groq`, `huggingface`, `cloudflare`, `openai`, and
+`anthropic` using the credential variables below. Provider-neutral adapters can
+be assessed with `--provider command --model-command PATH`. The result records
+each case's input hash, schema/evidence
 acceptance, missing concept groups, forbidden matches, output, score, and the
 explicit limitations of corpus-based evaluation.
 

@@ -4709,7 +4709,7 @@ fn usage() -> ExitCode {
     eprintln!("       sos benchmark <artifact> [--repeats N] [--out PATH]");
     eprintln!("       sos judge <original-sbf-elf> <candidate-sbf-elf> [--minimum-score 0..1] [--require-exact] [--out PATH]");
     eprintln!("       sos rebuild-judge <original-sbf-elf> <candidate-Cargo.toml> [--expected-solana-version VERSION] [--expected-platform-tools-version VERSION] [--expected-sbf-rustc-version VERSION] [--timeout-seconds N] [--build-dir DIR] [--minimum-score 0..1] [--require-exact] [--out PATH]");
-    eprintln!("       sos qualify-model <corpus.json> [--provider ollama|command] [--model MODEL] [--ollama-url URL|--model-command PATH] [--minimum-score 0..1] [--timeout-seconds N] [--allow-unreviewed-model] [--out PATH]");
+    eprintln!("       sos qualify-model <corpus.json> [--provider ollama|groq|huggingface|cloudflare|openai|anthropic|command] [--model MODEL] [--ollama-url URL|--model-command PATH] [--minimum-score 0..1] [--timeout-seconds N] [--allow-unreviewed-model] [--out PATH]");
     ExitCode::from(2)
 }
 
