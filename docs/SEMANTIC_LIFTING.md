@@ -77,6 +77,13 @@ cargo run -p sos-cli -- lift ./analysis \
   --out ./analysis/lifted
 ```
 
+For iterative work on a large binary, scope a run to one canonical IR function
+(`fn_` followed by its hexadecimal entry PC):
+
+```bash
+cargo run -p sos-cli -- lift ./analysis --function fn_0 --out ./analysis/lifted-fn-0
+```
+
 Outputs:
 
 - `model.json`: complete per-stage audit bundle and input/output hashes;

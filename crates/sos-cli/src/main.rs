@@ -1397,13 +1397,14 @@ struct LiftOptions {
     model: String,
     context_tokens: usize,
     allow_unreviewed_model: bool,
+    function_id: Option<String>,
 }
 
 impl LiftOptions {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let Some(directory) = args.first() else {
             return Err(
-                "usage: sos lift <analysis-directory> [--model gpt-oss:20b] [--ollama-url URL] [--context-tokens N] [--out DIR]".into(),
+                "usage: sos lift <analysis-directory> [--function fn_ID] [--model gpt-oss:20b] [--ollama-url URL] [--context-tokens N] [--out DIR]".into(),
             );
         };
         let mut options = Self {
@@ -1413,6 +1414,7 @@ impl LiftOptions {
             model: "gpt-oss:20b".into(),
             context_tokens: 65_536,
             allow_unreviewed_model: false,
+            function_id: None,
         };
         let mut index = 1;
         while index < args.len() {
@@ -1429,6 +1431,7 @@ impl LiftOptions {
                 "--out" => options.output = PathBuf::from(value),
                 "--ollama-url" => options.ollama_url = value.clone(),
                 "--model" => options.model = value.clone(),
+                "--function" => options.function_id = Some(value.clone()),
                 "--context-tokens" => {
                     options.context_tokens = value
                         .parse::<usize>()
@@ -1492,6 +1495,13 @@ fn lift_command(args: Vec<String>) -> ExitCode {
     };
     let mut functions = analysis.functions.clone();
     functions.sort_by_key(|function| function.pc);
+    if let Some(function_id) = options.function_id.as_deref() {
+        functions.retain(|function| format!("fn_{:x}", function.pc) == function_id);
+        if functions.is_empty() {
+            eprintln!("error: function {function_id:?} does not exist in the analysis IR");
+            return ExitCode::from(2);
+        }
+    }
     if functions.is_empty() {
         bundle = run_pipeline(provider, config, &analysis, &global_semantics);
     } else {
@@ -2210,14 +2220,14 @@ fn usage() -> ExitCode {
     eprintln!(
         "       sos decompile <analysis-directory> [--format rust-like|c-like|json] [--out PATH]"
     );
-    eprintln!("       sos lift <analysis-directory> [--model gpt-oss:20b] [--ollama-url URL] [--context-tokens N] [--out DIR]");
+    eprintln!("       sos lift <analysis-directory> [--function fn_ID] [--model gpt-oss:20b] [--ollama-url URL] [--context-tokens N] [--out DIR]");
     eprintln!("       sos benchmark <artifact> [--repeats N] [--out PATH]");
     ExitCode::from(2)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{transaction_account_addresses, BenchmarkOptions, ExplainOptions};
+    use super::{transaction_account_addresses, BenchmarkOptions, ExplainOptions, LiftOptions};
 
     #[test]
     fn transaction_accounts_include_static_and_loaded_keys_without_duplicates() {
@@ -2264,6 +2274,23 @@ mod tests {
             options.model_endpoint.as_deref(),
             Some("http://127.0.0.1:8080/generate")
         );
+    }
+
+    #[test]
+    fn lift_accepts_a_function_scope_and_rejects_unreviewed_models() {
+        let options = LiftOptions::parse(vec![
+            "./analysis".into(),
+            "--function".into(),
+            "fn_10".into(),
+        ])
+        .unwrap();
+        assert_eq!(options.function_id.as_deref(), Some("fn_10"));
+        assert!(LiftOptions::parse(vec![
+            "./analysis".into(),
+            "--model".into(),
+            "unknown:latest".into(),
+        ])
+        .is_err());
     }
 
     #[test]
