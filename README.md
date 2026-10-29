@@ -200,7 +200,7 @@ ollama serve
 
 The script uses only the reviewed `gpt-oss:20b` profile unless `SOS_MODEL` is
 explicitly changed, and prints the paths to the readable source, audited model
-bundle, and quality result.
+bundle, local model-manifest provenance, and quality result.
 
 Hosted providers can implement the same provider-neutral JSON protocol through an
 HTTP endpoint:

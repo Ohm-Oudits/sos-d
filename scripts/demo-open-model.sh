@@ -31,6 +31,14 @@ ollama list | awk 'NR > 1 {print $1}' | grep -Fx "$model" >/dev/null || {
 test -s "$artifact" || ./scripts/build-c-fixture.sh
 
 mkdir -p "$analysis_dir" "$lift_dir"
+model_digest="$(ollama list | awk -v selected="$model" '$1 == selected {print $2}')"
+jq -n \
+  --arg model "$model" \
+  --arg digest "$model_digest" \
+  --arg weights_url "https://huggingface.co/openai/gpt-oss-20b" \
+  --arg license "Apache-2.0" \
+  '{schema_version: 1, runtime: "ollama", model: $model, local_manifest_digest: $digest, weights_url: $weights_url, license: $license}' \
+  >"$lift_dir/model-provenance.json"
 cargo run -q -p sos-cli -- analyze "$artifact" --out "$analysis_dir"
 cargo run -q -p sos-cli -- lift "$analysis_dir" \
   --function fn_0 \
@@ -47,4 +55,5 @@ jq '{model, stages: [.stages[] | {task, status, error}]}' "$lift_dir/model.json"
 jq '{score, accepted, passed, total}' "$lift_dir/quality.json"
 echo "Readable output: $lift_dir/readable.rs"
 echo "Audit bundle:    $lift_dir/model.json"
+echo "Model provenance: $lift_dir/model-provenance.json"
 echo "Quality result:  $lift_dir/quality.json"
