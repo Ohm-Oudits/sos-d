@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "fixture": "sos-c-fixture",
+  "minimum_score": 0.9,
+  "expectations": [
+    {
+      "id": "deserialize_input",
+      "description": "deserializes the Solana entrypoint input",
+      "any": ["sol_deserialize", "deserialize_input", "deserialize"]
+    },
+    {
+      "id": "fixture_log",
+      "description": "emits the fixture banner",
+      "any": ["SOS C fixture"]
+    },
+    {
+      "id": "ping_log",
+      "description": "emits the ping branch log",
+      "any": ["c:ping"]
+    },
+    {
+      "id": "other_log",
+      "description": "emits the fallback branch log",
+      "any": ["c:other"]
+    },
+    {
+      "id": "instruction_data_length",
+      "description": "checks that instruction data is non-empty",
+      "any": ["data_len", "instruction_data.len", "instruction_data_length"]
+    },
+    {
+      "id": "instruction_tag",
+      "description": "dispatches on byte 0x43",
+      "any": ["0x43", "== 67", "==67"]
+    },
+    {
+      "id": "signer_check",
+      "description": "validates the first account signer flag",
+      "any": ["is_signer", "missing_required_signature", "missingrequiredsignature"]
+    },
+    {
+      "id": "writable_check",
+      "description": "validates the second account writable flag",
+      "any": ["is_writable", "writable"]
+    },
+    {
+      "id": "invalid_argument_path",
+      "description": "retains the invalid-argument error path",
+      "any": ["invalid_argument", "invalidargument", "ERROR_INVALID_ARGUMENT"]
+    },
+    {
+      "id": "success_path",
+      "description": "retains the success return path",
+      "any": ["SUCCESS", "Ok(())", "return 0", "return 0;"]
+    }
+  ]
+}

@@ -91,6 +91,16 @@ Outputs:
 - `readable.rs`: best accepted source candidate per function, with unresolved
   functions left explicit.
 
+For source-backed corpus fixtures, run the deterministic behavior judge after
+lifting. It fails when required observable semantics are absent:
+
+```bash
+python3 scripts/evaluate-readable.py \
+  ./analysis/lifted/readable.rs \
+  fixtures/c/expected-semantics.json \
+  --out ./analysis/lifted/quality.json
+```
+
 ## Current trust boundary
 
 `readable.rs` is a hypothesis until independent checks pass. Compilation proves
