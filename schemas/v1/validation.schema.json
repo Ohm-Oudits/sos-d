@@ -35,6 +35,38 @@
         "compiler": {"type": ["string", "null"]},
         "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "mir_summary": {
+          "type": ["object", "null"],
+          "properties": {
+            "schema_version": {"const": 1},
+            "functions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "parameter_count",
+                  "basic_block_count",
+                  "edges",
+                  "branch_terminators",
+                  "calls",
+                  "memory_writes",
+                  "returns",
+                  "has_loop"
+                ]
+              }
+            }
+          }
+        },
+        "limitations": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "mir_effects": {
+      "type": ["object", "null"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "status": {"enum": ["covered", "mismatch", "not_available"]},
+        "functions": {"type": "array"},
         "limitations": {"type": "array", "items": {"type": "string"}}
       }
     },

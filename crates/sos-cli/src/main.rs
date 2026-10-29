@@ -8,20 +8,20 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sos_ai::{
-    compile_refinement_output, default_stage_output_tokens, deterministic_humanize_pseudocode_unit,
-    evidence_pack_from_pseudocode_unit, partition_pseudocode, run_pipeline,
-    run_pipeline_with_context, run_refinement_loop, run_refinement_loop_with_limits,
-    scope_analysis_to_function, trusted_open_model, unavailable_pipeline_bundle,
-    validate_model_response_for_pack, validate_pipeline_bundle_with_context, AiPipelineBundle,
-    AiPipelineConfig, AiStageModels, AiStageResult, AiStageStatus, AiStageTokenBudgets,
-    AnthropicModelProvider, CloudflareModelProvider, CommandModelProvider, CompilationStatus,
-    EvidencePack, EvidencePackLimits, GroqModelProvider, HttpModelProvider,
-    HuggingFaceModelProvider, ModelGateway, ModelProvider, ModelResponse, ModelTask,
-    OllamaModelProvider, OpenAiModelProvider, PseudocodeUnit, RefinementFeedback,
-    RefinementLoopLimits, RefinementLoopResult, RefinementOutput, RefinementValidation,
-    StructureRecoveryOutput, UntrustedEvidence, CLOUDFLARE_GPT_OSS_120B, GROQ_GPT_OSS_120B,
-    HUGGING_FACE_GPT_OSS_120B, MAX_STAGE_OUTPUT_TOKENS, MIN_STAGE_OUTPUT_TOKENS,
-    VALIDATION_BUNDLE_SCHEMA_VERSION,
+    compare_mir_effects, compile_refinement_output, default_stage_output_tokens,
+    deterministic_humanize_pseudocode_unit, evidence_pack_from_pseudocode_unit,
+    partition_pseudocode, run_pipeline, run_pipeline_with_context, run_refinement_loop,
+    run_refinement_loop_with_limits, scope_analysis_to_function, trusted_open_model,
+    unavailable_pipeline_bundle, validate_model_response_for_pack,
+    validate_pipeline_bundle_with_context, AiPipelineBundle, AiPipelineConfig, AiStageModels,
+    AiStageResult, AiStageStatus, AiStageTokenBudgets, AnthropicModelProvider,
+    CloudflareModelProvider, CommandModelProvider, CompilationStatus, EvidencePack,
+    EvidencePackLimits, GroqModelProvider, HttpModelProvider, HuggingFaceModelProvider,
+    ModelGateway, ModelProvider, ModelResponse, ModelTask, OllamaModelProvider,
+    OpenAiModelProvider, PseudocodeUnit, RefinementFeedback, RefinementLoopLimits,
+    RefinementLoopResult, RefinementOutput, RefinementValidation, StructureRecoveryOutput,
+    UntrustedEvidence, CLOUDFLARE_GPT_OSS_120B, GROQ_GPT_OSS_120B, HUGGING_FACE_GPT_OSS_120B,
+    MAX_STAGE_OUTPUT_TOKENS, MIN_STAGE_OUTPUT_TOKENS, VALIDATION_BUNDLE_SCHEMA_VERSION,
 };
 use sos_analysis::{analyze_elf, build_canonical_ir, compare_binary_analyses};
 use sos_artifact::{
@@ -47,8 +47,8 @@ const HUMANIZATION_PROMPT_VERSION: &str = "sos-v1";
 const DETERMINISTIC_HUMANIZER_ID: &str = "sos-deterministic-syntax-v1";
 const HUMANIZATION_CACHE_SCHEMA_VERSION: u32 = 1;
 const HUMANIZATION_CACHE_RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
-const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v4";
-const LIFT_CACHE_SCHEMA_VERSION: u32 = 5;
+const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v5";
+const LIFT_CACHE_SCHEMA_VERSION: u32 = 6;
 const LIFT_CACHE_RECORD_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 fn main() -> ExitCode {
@@ -638,6 +638,8 @@ fn validate_command_inner(args: Vec<String>, announce_output: bool) -> ExitCode 
             return ExitCode::from(1);
         }
     };
+    let analysis_result =
+        read_json::<sos_analysis::StaticAnalysis>(&directory.join("analysis.json"));
     let mut refinement = bundle
         .stages
         .iter()
@@ -652,14 +654,13 @@ fn validate_command_inner(args: Vec<String>, announce_output: bool) -> ExitCode 
             eprintln!("error: --repair requires --model-command PATH");
             return ExitCode::from(2);
         };
-        let analysis =
-            match read_json::<sos_analysis::StaticAnalysis>(&directory.join("analysis.json")) {
-                Ok(analysis) => analysis,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    return ExitCode::from(1);
-                }
-            };
+        let analysis = match analysis_result.as_ref() {
+            Ok(analysis) => analysis.clone(),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        };
         let semantics =
             match read_json::<sos_solana::SemanticAnalysis>(&directory.join("semantics.json")) {
                 Ok(semantics) => semantics,
@@ -675,6 +676,7 @@ fn validate_command_inner(args: Vec<String>, announce_output: bool) -> ExitCode 
             &semantics,
             EvidencePackLimits::default(),
         );
+        let mir_validation_pack = pack.clone();
         let repair_trace = trace_path
             .as_deref()
             .and_then(|path| read_json::<ExecutionTrace>(path).ok());
@@ -697,30 +699,47 @@ fn validate_command_inner(args: Vec<String>, announce_output: bool) -> ExitCode 
                     repair_compiler.as_deref(),
                     Duration::from_secs(30),
                 );
-                let (behavioral_status, mismatches, limitations) = match repair_trace.as_ref() {
-                    Some(trace) if !candidate.observations.is_empty() => {
-                        let comparison =
-                            compare_candidate_observations(&candidate.observations, trace);
-                        let status = match comparison.status {
-                            sos_types::EvidenceStatus::BehaviorallyValidated => {
-                                "behaviorally_validated"
-                            }
-                            sos_types::EvidenceStatus::NotAvailable => "not_available",
-                            _ => "unverified",
-                        };
-                        (status.into(), comparison.mismatches, comparison.limitations)
-                    }
-                    Some(_) => (
-                        "unverified".into(),
-                        Vec::new(),
-                        vec!["candidate supplied no directly comparable observations".into()],
-                    ),
-                    None => (
-                        "not_requested".into(),
-                        Vec::new(),
-                        vec!["candidate replay comparison was not requested".into()],
-                    ),
-                };
+                let mir_comparison =
+                    compare_mir_effects(&mir_validation_pack, compilation.mir_summary.as_ref());
+                let mir_mismatches = mir_comparison
+                    .functions
+                    .iter()
+                    .flat_map(|function| {
+                        function.missing.iter().map(|effect| {
+                            format!(
+                                "candidate MIR for {} does not realize required {:?} effect",
+                                function.function_id, effect
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let (behavioral_status, mut mismatches, mut limitations) =
+                    match repair_trace.as_ref() {
+                        Some(trace) if !candidate.observations.is_empty() => {
+                            let comparison =
+                                compare_candidate_observations(&candidate.observations, trace);
+                            let status = match comparison.status {
+                                sos_types::EvidenceStatus::BehaviorallyValidated => {
+                                    "behaviorally_validated"
+                                }
+                                sos_types::EvidenceStatus::NotAvailable => "not_available",
+                                _ => "unverified",
+                            };
+                            (status.into(), comparison.mismatches, comparison.limitations)
+                        }
+                        Some(_) => (
+                            "unverified".into(),
+                            Vec::new(),
+                            vec!["candidate supplied no directly comparable observations".into()],
+                        ),
+                        None => (
+                            "not_requested".into(),
+                            Vec::new(),
+                            vec!["candidate replay comparison was not requested".into()],
+                        ),
+                    };
+                mismatches.extend(mir_mismatches);
+                limitations.extend(mir_comparison.limitations);
                 RefinementFeedback {
                     compilation: compilation.status,
                     compiler_diagnostics: compilation.diagnostics,
@@ -749,6 +768,16 @@ fn validate_command_inner(args: Vec<String>, announce_output: bool) -> ExitCode 
         compiler.as_deref(),
         Duration::from_secs(30),
     );
+    let mir_effects = analysis_result.as_ref().ok().map(|analysis| {
+        let semantics = sos_solana::analyze(analysis);
+        let pack = EvidencePack::from_analysis(
+            ModelTask::Refinement,
+            bundle.artifact_sha256.clone(),
+            analysis.clone(),
+            semantics,
+        );
+        compare_mir_effects(&pack, compilation.mir_summary.as_ref())
+    });
     let (behavioral_status, behavioral_evidence, behavioral_mismatches, behavioral_limitations) =
         match trace_path.as_deref() {
             Some(path) => match read_json::<ExecutionTrace>(path) {
@@ -812,6 +841,7 @@ fn validate_command_inner(args: Vec<String>, announce_output: bool) -> ExitCode 
         "artifact_sha256": bundle.artifact_sha256,
         "refinement_output_sha256": refinement_output_sha256,
         "compilation": compilation,
+        "mir_effects": mir_effects,
         "behavioral_status": behavioral_status,
         "behavioral_evidence": behavioral_evidence,
         "behavioral_mismatches": behavioral_mismatches,

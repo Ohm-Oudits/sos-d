@@ -270,7 +270,7 @@ pub fn required_structure_effects(pack: &EvidencePack, function_id: &str) -> Vec
             .is_some_and(|effect| effect.starts_with("store:"))
         {
             Some(RecoveredEffectKind::MemoryWrite)
-        } else if operation.assembly == "exit" {
+        } else if matches!(operation.assembly.as_str(), "exit" | "return") {
             Some(RecoveredEffectKind::Return)
         } else if operation.kind.contains("call")
             || operation.kind == "syscall"
@@ -403,6 +403,63 @@ pub struct CompilationResult {
     pub compiler: Option<String>,
     pub source_sha256: String,
     pub diagnostics: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mir_summary: Option<MirProgramSummary>,
+    pub limitations: Vec<String>,
+}
+
+pub const MIR_SUMMARY_SCHEMA_VERSION: u32 = 1;
+pub const MIR_EFFECT_COMPARISON_SCHEMA_VERSION: u32 = 1;
+
+/// Bounded, compiler-produced control/effect summary of a reconstructed Rust
+/// candidate. The raw textual MIR is intentionally not persisted: rustc marks
+/// that representation unstable, while this projection is versioned by SOS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MirProgramSummary {
+    pub schema_version: u32,
+    pub functions: Vec<MirFunctionSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MirFunctionSummary {
+    pub name: String,
+    pub parameter_count: usize,
+    pub basic_block_count: usize,
+    pub edges: Vec<MirEdge>,
+    pub branch_terminators: usize,
+    pub calls: usize,
+    pub memory_writes: usize,
+    pub returns: usize,
+    pub has_loop: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MirEdge {
+    pub source: usize,
+    pub destination: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MirEffectComparisonStatus {
+    Covered,
+    Mismatch,
+    NotAvailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MirFunctionEffectComparison {
+    pub function_id: String,
+    pub required: Vec<RecoveredEffectKind>,
+    pub observed: Vec<RecoveredEffectKind>,
+    pub missing: Vec<RecoveredEffectKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MirEffectComparison {
+    pub schema_version: u32,
+    pub status: MirEffectComparisonStatus,
+    pub functions: Vec<MirFunctionEffectComparison>,
     pub limitations: Vec<String>,
 }
 
@@ -2374,6 +2431,264 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Parse stable facts from rustc's human-readable MIR output. SOS intentionally
+/// recognizes only function headers, basic-block labels, CFG targets, returns,
+/// calls, and projected-place writes. Unknown lines remain ignored rather than
+/// being guessed into semantic facts.
+pub fn summarize_rustc_mir(source: &str) -> MirProgramSummary {
+    #[derive(Default)]
+    struct Builder {
+        name: String,
+        parameter_count: usize,
+        blocks: BTreeSet<usize>,
+        edges: BTreeSet<MirEdge>,
+        branch_terminators: usize,
+        calls: usize,
+        memory_writes: usize,
+        returns: usize,
+        current_block: Option<usize>,
+    }
+
+    fn finish(builder: Builder) -> MirFunctionSummary {
+        let edges = builder.edges.into_iter().collect::<Vec<_>>();
+        let has_loop = edges.iter().any(|edge| {
+            edge.source == edge.destination
+                || mir_path_exists(&edges, edge.destination, edge.source)
+        });
+        MirFunctionSummary {
+            name: builder.name,
+            parameter_count: builder.parameter_count,
+            basic_block_count: builder.blocks.len(),
+            edges,
+            branch_terminators: builder.branch_terminators,
+            calls: builder.calls,
+            memory_writes: builder.memory_writes,
+            returns: builder.returns,
+            has_loop,
+        }
+    }
+
+    let mut functions = Vec::new();
+    let mut current: Option<Builder> = None;
+    for line in source.lines() {
+        if !line.chars().next().is_some_and(char::is_whitespace) && line.starts_with("fn ") {
+            if let Some(builder) = current.take() {
+                functions.push(finish(builder));
+            }
+            let signature = line.trim_start_matches("fn ");
+            let Some((name, remainder)) = signature.split_once('(') else {
+                continue;
+            };
+            let parameters = remainder
+                .split_once(") ->")
+                .map(|(parameters, _)| parameters)
+                .unwrap_or_default();
+            current = Some(Builder {
+                name: name.trim().to_owned(),
+                parameter_count: count_mir_parameters(parameters),
+                ..Builder::default()
+            });
+            continue;
+        }
+        let Some(builder) = current.as_mut() else {
+            continue;
+        };
+        if line == "}" {
+            functions.push(finish(current.take().expect("MIR builder exists")));
+            continue;
+        }
+        let trimmed = line.trim();
+        if let Some(block) = parse_mir_block_label(trimmed) {
+            builder.blocks.insert(block);
+            builder.current_block = Some(block);
+            continue;
+        }
+        let Some(source_block) = builder.current_block else {
+            continue;
+        };
+        let targets = mir_block_targets(trimmed);
+        for destination in &targets {
+            builder.edges.insert(MirEdge {
+                source: source_block,
+                destination: *destination,
+            });
+        }
+        let is_call = trimmed.contains(" -> [return: bb")
+            && trimmed
+                .split_once(" = ")
+                .is_some_and(|(_, right)| right.contains('('));
+        if is_call {
+            builder.calls = builder.calls.saturating_add(1);
+        } else if !targets.is_empty()
+            && (trimmed.starts_with("goto ->")
+                || trimmed.starts_with("switchInt(")
+                || trimmed.starts_with("assert(")
+                || trimmed.starts_with("drop(")
+                || trimmed.starts_with("falseEdge ->")
+                || trimmed.starts_with("falseUnwind ->"))
+        {
+            builder.branch_terminators = builder.branch_terminators.saturating_add(1);
+        }
+        if trimmed == "return;" {
+            builder.returns = builder.returns.saturating_add(1);
+        }
+        if let Some((left, _)) = trimmed.split_once(" = ") {
+            let left = left.trim();
+            if left.contains("(*") || left.contains('[') {
+                builder.memory_writes = builder.memory_writes.saturating_add(1);
+            }
+        }
+    }
+    if let Some(builder) = current {
+        functions.push(finish(builder));
+    }
+    functions.sort_by(|left, right| left.name.cmp(&right.name));
+    MirProgramSummary {
+        schema_version: MIR_SUMMARY_SCHEMA_VERSION,
+        functions,
+    }
+}
+
+fn parse_mir_block_label(line: &str) -> Option<usize> {
+    let digits = line.strip_prefix("bb")?.strip_suffix(": {")?;
+    digits.parse().ok()
+}
+
+fn mir_block_targets(line: &str) -> Vec<usize> {
+    let bytes = line.as_bytes();
+    let mut targets = BTreeSet::new();
+    let mut index = 0;
+    while index + 2 <= bytes.len() {
+        if bytes[index] == b'b' && bytes[index + 1] == b'b' {
+            let begin = index + 2;
+            let mut end = begin;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > begin {
+                if let Ok(value) = line[begin..end].parse::<usize>() {
+                    targets.insert(value);
+                }
+                index = end;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    targets.into_iter().collect()
+}
+
+fn count_mir_parameters(parameters: &str) -> usize {
+    let mut depth = 0_i32;
+    let mut count = usize::from(!parameters.trim().is_empty());
+    for character in parameters.chars() {
+        match character {
+            '(' | '[' | '<' | '{' => depth += 1,
+            ')' | ']' | '>' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => count = count.saturating_add(1),
+            _ => {}
+        }
+    }
+    count
+}
+
+fn mir_path_exists(edges: &[MirEdge], start: usize, goal: usize) -> bool {
+    let mut pending = vec![start];
+    let mut visited = BTreeSet::new();
+    while let Some(node) = pending.pop() {
+        if node == goal {
+            return true;
+        }
+        if !visited.insert(node) {
+            continue;
+        }
+        pending.extend(
+            edges
+                .iter()
+                .filter(|edge| edge.source == node)
+                .map(|edge| edge.destination),
+        );
+    }
+    false
+}
+
+/// Compare compiler-produced MIR effect classes with deterministic SBPF
+/// obligations. This is deliberately a category-presence gate rather than an
+/// instruction-count comparison because one source loop or assignment can
+/// lower to many SBPF branches and stores.
+pub fn compare_mir_effects(
+    pack: &EvidencePack,
+    summary: Option<&MirProgramSummary>,
+) -> MirEffectComparison {
+    let Some(summary) = summary else {
+        return MirEffectComparison {
+            schema_version: MIR_EFFECT_COMPARISON_SCHEMA_VERSION,
+            status: MirEffectComparisonStatus::NotAvailable,
+            functions: Vec::new(),
+            limitations: vec!["rustc MIR output was not available for comparison".into()],
+        };
+    };
+    let mut functions = Vec::new();
+    let mut has_mismatch = false;
+    for function in &pack.ir.functions {
+        let required = required_structure_effects(pack, &function.id)
+            .into_iter()
+            .map(|effect| effect.kind)
+            .collect::<BTreeSet<_>>();
+        let observed = summary
+            .functions
+            .iter()
+            .find(|candidate| candidate.name == function.id)
+            .map(mir_observed_effects)
+            .unwrap_or_default();
+        let missing = required.difference(&observed).copied().collect::<Vec<_>>();
+        has_mismatch |= !missing.is_empty()
+            || !summary
+                .functions
+                .iter()
+                .any(|candidate| candidate.name == function.id);
+        functions.push(MirFunctionEffectComparison {
+            function_id: function.id.clone(),
+            required: required.into_iter().collect(),
+            observed: observed.into_iter().collect(),
+            missing,
+        });
+    }
+    MirEffectComparison {
+        schema_version: MIR_EFFECT_COMPARISON_SCHEMA_VERSION,
+        status: if has_mismatch {
+            MirEffectComparisonStatus::Mismatch
+        } else {
+            MirEffectComparisonStatus::Covered
+        },
+        functions,
+        limitations: vec![
+            "MIR effect coverage checks category presence, not semantic equivalence or one-to-one instruction lowering".into(),
+            "rustc textual MIR is parsed into a versioned SOS summary because the upstream text format is not stable".into(),
+        ],
+    }
+}
+
+fn mir_observed_effects(function: &MirFunctionSummary) -> BTreeSet<RecoveredEffectKind> {
+    let mut observed = BTreeSet::new();
+    if function.memory_writes > 0 {
+        observed.insert(RecoveredEffectKind::MemoryWrite);
+    }
+    if function.branch_terminators > 0 {
+        observed.insert(RecoveredEffectKind::Branch);
+    }
+    if function.has_loop {
+        observed.insert(RecoveredEffectKind::Loop);
+    }
+    if function.calls > 0 {
+        observed.insert(RecoveredEffectKind::Call);
+    }
+    if function.returns > 0 {
+        observed.insert(RecoveredEffectKind::Return);
+    }
+    observed
+}
+
 /// Compile only the bounded refinement snippets supplied by a validated model
 /// response. This is a syntax/type check, never execution of the candidate.
 /// The compiler is invoked directly, with a temporary source/output path,
@@ -2396,6 +2711,7 @@ pub fn compile_refinement_output(
             compiler: compiler.map(|path| path.display().to_string()),
             source_sha256: sha256_bytes(b""),
             diagnostics: Vec::new(),
+            mir_summary: None,
             limitations: vec!["the refinement response contained no source patches".into()],
         };
     }
@@ -2419,6 +2735,7 @@ pub fn compile_refinement_output(
             compiler: None,
             source_sha256,
             diagnostics: Vec::new(),
+            mir_summary: None,
             limitations: vec!["no Rust compiler was configured".into()],
         };
     };
@@ -2442,6 +2759,7 @@ pub fn compile_refinement_output(
                 diagnostics: vec![format!(
                     "candidate contains forbidden compilation directive `{forbidden}`"
                 )],
+                mir_summary: None,
                 limitations: vec![
                     "candidate compilation rejects file inclusion, environment access, and external crates".into(),
                 ],
@@ -2456,6 +2774,7 @@ pub fn compile_refinement_output(
     let base = std::env::temp_dir().join(format!("sos-refinement-{}-{stamp}", std::process::id()));
     let source_path = base.with_extension("rs");
     let output_path = base.with_extension("rmeta");
+    let mir_path = base.with_extension("mir");
     if let Err(error) = fs::write(&source_path, source.as_bytes()) {
         return CompilationResult {
             schema_version: VALIDATION_SCHEMA_VERSION,
@@ -2463,14 +2782,18 @@ pub fn compile_refinement_output(
             compiler: Some(compiler.display().to_string()),
             source_sha256,
             diagnostics: vec![format!("unable to create compiler input: {error}")],
+            mir_summary: None,
             limitations: Vec::new(),
         };
     }
 
     let mut child = match Command::new(compiler)
-        .args(["--crate-type", "lib", "--emit", "metadata"])
-        .arg("-o")
-        .arg(&output_path)
+        .args(["--crate-type", "lib", "--emit"])
+        .arg(format!(
+            "metadata={},mir={}",
+            output_path.display(),
+            mir_path.display()
+        ))
         .arg(&source_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2485,6 +2808,7 @@ pub fn compile_refinement_output(
                 compiler: Some(compiler.display().to_string()),
                 source_sha256,
                 diagnostics: vec![format!("unable to start compiler: {error}")],
+                mir_summary: None,
                 limitations: Vec::new(),
             };
         }
@@ -2509,6 +2833,7 @@ pub fn compile_refinement_output(
                 let _ = join_reader(stderr_reader);
                 let _ = fs::remove_file(&source_path);
                 let _ = fs::remove_file(&output_path);
+                let _ = fs::remove_file(&mir_path);
                 return CompilationResult {
                     schema_version: VALIDATION_SCHEMA_VERSION,
                     status: CompilationStatus::TimedOut,
@@ -2518,6 +2843,7 @@ pub fn compile_refinement_output(
                         "compiler timed out after {} ms",
                         timeout.as_millis()
                     )],
+                    mir_summary: None,
                     limitations: vec!["candidate compilation was terminated".into()],
                 };
             }
@@ -2528,12 +2854,14 @@ pub fn compile_refinement_output(
                 let _ = join_reader(stderr_reader);
                 let _ = fs::remove_file(&source_path);
                 let _ = fs::remove_file(&output_path);
+                let _ = fs::remove_file(&mir_path);
                 return CompilationResult {
                     schema_version: VALIDATION_SCHEMA_VERSION,
                     status: CompilationStatus::Failed,
                     compiler: Some(compiler.display().to_string()),
                     source_sha256,
                     diagnostics: vec![format!("compiler wait failed: {error}")],
+                    mir_summary: None,
                     limitations: Vec::new(),
                 };
             }
@@ -2550,8 +2878,6 @@ pub fn compile_refinement_output(
             Err(_) => diagnostics.push("compiler output reader panicked".into()),
         }
     }
-    let _ = fs::remove_file(&source_path);
-    let _ = fs::remove_file(&output_path);
     let status = match status {
         Ok(status) if status.success() => CompilationStatus::Passed,
         Ok(_) => CompilationStatus::Failed,
@@ -2560,14 +2886,27 @@ pub fn compile_refinement_output(
             CompilationStatus::Failed
         }
     };
+    let mir_summary = if status == CompilationStatus::Passed {
+        fs::metadata(&mir_path)
+            .ok()
+            .filter(|metadata| metadata.len() <= 4 * 1024 * 1024)
+            .and_then(|_| fs::read_to_string(&mir_path).ok())
+            .map(|mir| summarize_rustc_mir(&mir))
+    } else {
+        None
+    };
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    let _ = fs::remove_file(&mir_path);
     CompilationResult {
         schema_version: VALIDATION_SCHEMA_VERSION,
         status,
         compiler: Some(compiler.display().to_string()),
         source_sha256,
         diagnostics,
+        mir_summary,
         limitations: vec![
-            "compilation checks syntax and types only; it does not execute the candidate".into(),
+            "compilation checks syntax, types, and bounded MIR structure only; it does not execute the candidate".into(),
         ],
     }
 }
@@ -3981,6 +4320,10 @@ mod tests {
         let valid_result =
             compile_refinement_output(&valid, Some(Path::new("rustc")), Duration::from_secs(10));
         assert_eq!(valid_result.status, CompilationStatus::Passed);
+        assert!(valid_result
+            .mir_summary
+            .as_ref()
+            .is_some_and(|summary| summary.functions.iter().any(|item| item.name == "fn_0")));
 
         let invalid = RefinementOutput {
             schema_version: REFINEMENT_SCHEMA_VERSION,
@@ -3999,6 +4342,113 @@ mod tests {
             compile_refinement_output(&invalid, Some(Path::new("rustc")), Duration::from_secs(10));
         assert_eq!(invalid_result.status, CompilationStatus::Failed);
         assert!(!invalid_result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn rustc_mir_summary_recovers_cfg_calls_writes_and_loops() {
+        let mir = r#"
+fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
+    let mut _0: ();
+
+    bb0: {
+        goto -> bb1;
+    }
+
+    bb1: {
+        switchInt(copy _3) -> [0: bb3, otherwise: bb2];
+    }
+
+    bb2: {
+        (*_1)[_3] = copy _2;
+        _3 = helper(copy _3) -> [return: bb1, unwind continue];
+    }
+
+    bb3: {
+        return;
+    }
+}
+"#;
+        let summary = summarize_rustc_mir(mir);
+        let function = &summary.functions[0];
+        assert_eq!(function.name, "fn_80");
+        assert_eq!(function.parameter_count, 3);
+        assert_eq!(function.basic_block_count, 4);
+        assert_eq!(function.calls, 1);
+        assert_eq!(function.memory_writes, 1);
+        assert_eq!(function.returns, 1);
+        assert!(function.branch_terminators >= 2);
+        assert!(function.has_loop);
+
+        let mut pack = empty_pack();
+        pack.task = ModelTask::Refinement;
+        pack.ir.functions[0].id = "fn_80".into();
+        pack.ir.blocks[0].function_id = "fn_80".into();
+        pack.ir.operations[0].kind = "store".into();
+        pack.ir.operations[0].assembly = "stxb [r1], r2".into();
+        pack.ir.operations[0].memory_effect = Some("store:1:1+0".into());
+        pack.ir.operations.push(sos_analysis::IrOperation {
+            id: "op_1".into(),
+            block_id: "bb_0".into(),
+            pc: 1,
+            kind: "control_flow".into(),
+            assembly: "jne r3, 0, lbb_0".into(),
+            dst: 3,
+            src: 0,
+            offset: -1,
+            immediate: 0,
+            memory_effect: None,
+            call_target_pc: None,
+        });
+        pack.ir.operations.push(sos_analysis::IrOperation {
+            id: "op_2".into(),
+            block_id: "bb_0".into(),
+            pc: 2,
+            kind: "raw".into(),
+            assembly: "exit".into(),
+            dst: 0,
+            src: 0,
+            offset: 0,
+            immediate: 0,
+            memory_effect: None,
+            call_target_pc: None,
+        });
+        pack.ir.sccs = vec![sos_analysis::SccFact {
+            id: 0,
+            block_starts: vec![0],
+            recursive: true,
+        }];
+        let comparison = compare_mir_effects(&pack, Some(&summary));
+        assert_eq!(comparison.status, MirEffectComparisonStatus::Covered);
+        assert!(comparison.functions[0].missing.is_empty());
+    }
+
+    #[test]
+    fn mir_effect_comparison_rejects_ledger_only_memory_writes() {
+        let mut pack = empty_pack();
+        pack.task = ModelTask::Refinement;
+        pack.ir.operations[0].kind = "store".into();
+        pack.ir.operations[0].assembly = "stxdw [r1], r2".into();
+        pack.ir.operations[0].memory_effect = Some("store:8:1+0".into());
+        let summary = MirProgramSummary {
+            schema_version: MIR_SUMMARY_SCHEMA_VERSION,
+            functions: vec![MirFunctionSummary {
+                name: "fn_0".into(),
+                parameter_count: 0,
+                basic_block_count: 1,
+                edges: Vec::new(),
+                branch_terminators: 0,
+                calls: 0,
+                memory_writes: 0,
+                returns: 1,
+                has_loop: false,
+            }],
+        };
+        let comparison = compare_mir_effects(&pack, Some(&summary));
+        assert_eq!(comparison.status, MirEffectComparisonStatus::Mismatch);
+        assert_eq!(
+            comparison.functions[0].missing,
+            vec![RecoveredEffectKind::MemoryWrite]
+        );
     }
 
     #[test]

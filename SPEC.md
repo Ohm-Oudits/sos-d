@@ -167,6 +167,13 @@ The AI subsystem is a constrained evidence consumer with five stages:
 4. Explanation and report generation from verified graph data.
 5. Bounded refinement using schema validation, compilation, and replay comparison.
 
+Successful refinement compilation must request compiler-produced MIR and persist
+a bounded, versioned CFG/effect summary. SOS compares the MIR function matching
+each canonical IR function against the deterministic required-effect classes.
+Missing writes, branches, loops, calls, or returns are validation mismatches and
+must be supplied to a bounded repair round when repair is enabled. This gate does
+not replace pinned SBPF recompilation or replay-based behavioral validation.
+
 Each stage returns strict JSON. Inputs are tagged as untrusted data, and model output
 cannot alter facts, evidence references, or confidence values directly.
 

@@ -407,6 +407,7 @@ pub(crate) fn system_prompt(task: ModelTask) -> &'static str {
             "Produce readable, idiomatic Rust-like replacements for recovered IR functions. Reconcile earlier structure and semantic labels with the raw IR. Preserve every meaningful branch, validation, memory effect, CPI, PDA derivation, log, and error path. Prefer explicit unknown_* helpers over invented behavior.\n",
             "When deterministic semantic facts recover the Solana C SDK deserializer, instruction-data length/tag guards, exact log strings, SolAccountInfo fields, or built-in errors, express them directly in the replacement and do not degrade them back to register-level operations.\n",
             "Produce standalone safe Rust using only the standard library. Include minimal type or helper declarations when the function needs them, and use compiler diagnostics from external_validation to repair syntax and type errors without deleting behavior.\n",
+            "External validation may report candidate MIR effect mismatches. Repair the named function so its compiled MIR actually contains every required write, branch, loop, call, or return; do not merely add comments or claim coverage in prose.\n",
             "Never emit inline assembly, raw byte arrays, include directives, unsafe code, or sos_raw_op calls. Never claim original source or validation. Set validation.status to unverified. Every patch must cite existing evidence identifiers exactly. Return only schema-valid JSON."
         ),
         ModelTask::PseudocodeHumanization => concat!(

@@ -36,6 +36,7 @@ ELF/SBPF facts
   -> security-oriented explanation
   -> source refinement
   -> syntax/type validation
+  -> rustc MIR effect/CFG comparison
   -> replay and deterministic recompilation comparison
 ```
 
@@ -346,6 +347,13 @@ Outputs:
 - `repair.json`: bounded `rustc` diagnostics and compiler-repair rounds. A
   successful compile is still marked unverified until replay agrees.
 
+The compilation record includes a versioned SOS summary of stable
+`rustc --emit=mir` output. For each reconstructed `fn_<pc>`, SOS compares MIR-observed
+writes, branches, loops, calls, and returns with the effect categories required
+by canonical SBPF IR. Missing categories are fed into bounded repair as external
+validation mismatches. Raw MIR is not persisted because rustc explicitly treats
+its textual representation as unstable.
+
 For source-backed corpus fixtures, run the lightweight text-contract smoke test
 after lifting. It fails when required observable semantics are absent from the
 readable candidate:
@@ -383,8 +391,9 @@ with replay evidence.
 ## Current trust boundary
 
 `readable.rs` is a hypothesis until independent checks pass. Compilation proves
-only syntax and type consistency. Replay proves behavior only for the selected
-paths. Deterministic function-level recompilation scoring is implemented. The
-remaining judge work is automatic pinned candidate builds, type-layout
-verification, stronger call-graph non-regression constraints, and
-multi-transaction path coverage.
+syntax and type consistency; MIR comparison additionally proves bounded
+structural effect coverage, not semantic equivalence. Replay proves behavior
+only for the selected paths. Deterministic function-level recompilation scoring
+is implemented. The remaining judge work is automatic pinned candidate builds,
+type-layout verification, variable-dependency correspondence, stronger
+call-graph non-regression constraints, and multi-transaction path coverage.

@@ -184,6 +184,14 @@ This is a strong reconstruction regression gate, not proof of semantic
 equivalence; compiler, linker, optimization, and SBPF toolchain versions must be
 pinned for meaningful comparisons.
 
+`sos validate` also asks stable `rustc` to emit MIR for every compiled
+refinement. SOS reduces that compiler output to a bounded function/CFG summary
+and verifies that each SBPF-required effect category is present in the actual
+candidate MIR. A model cannot satisfy this gate merely by returning an effect
+ledger while omitting the corresponding write, branch, loop, call, or return
+from its code. MIR coverage is still a structural non-regression check, not a
+claim of semantic equivalence.
+
 ### Local open-weight semantic lifting
 
 SOS can now pass deterministic IR through a five-stage local semantic-lifting
