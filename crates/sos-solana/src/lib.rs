@@ -182,6 +182,15 @@ pub struct ConstantCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeErrorCandidate {
+    pub instruction_pc: usize,
+    pub value: u64,
+    pub name: String,
+    pub status: EvidenceStatus,
+    pub evidence: Vec<EvidenceRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolFingerprint {
     pub program_id: String,
     pub name: String,
@@ -285,6 +294,8 @@ pub struct SemanticAnalysis {
     pub runtime_abi: Vec<RuntimeAbiField>,
     pub string_candidates: Vec<StringCandidate>,
     pub constant_candidates: Vec<ConstantCandidate>,
+    #[serde(default)]
+    pub runtime_error_candidates: Vec<RuntimeErrorCandidate>,
     #[serde(default)]
     pub protocol_fingerprints: Vec<ProtocolFingerprint>,
     #[serde(default)]
@@ -809,6 +820,7 @@ pub fn analyze_with_registry(
     let input_field_candidates = input_fields(analysis, &mut evidence);
     let string_candidates = string_candidates(analysis, &mut evidence);
     let constant_candidates = constant_candidates(analysis, &mut evidence);
+    let runtime_error_candidates = runtime_error_candidates(analysis, &mut evidence);
     let protocol_fingerprints = protocol_fingerprints(analysis, protocols, &mut evidence);
     let validation_checks = validation_checks(analysis, &mut evidence);
 
@@ -939,6 +951,7 @@ pub fn analyze_with_registry(
         runtime_abi: runtime_abi(),
         string_candidates,
         constant_candidates,
+        runtime_error_candidates,
         protocol_fingerprints,
         validation_checks,
         error_candidates,
@@ -946,6 +959,72 @@ pub fn analyze_with_registry(
         resolved_log_calls,
         evidence,
     }
+}
+
+fn runtime_error_candidates(
+    analysis: &StaticAnalysis,
+    evidence: &mut Vec<EvidenceItem>,
+) -> Vec<RuntimeErrorCandidate> {
+    analysis
+        .immediate_constants
+        .iter()
+        .filter_map(|constant| {
+            let value = u64::try_from(constant.value).ok()?;
+            let name = solana_builtin_error_name(value)?;
+            let evidence_refs = vec![constant_ref(constant)];
+            let candidate = RuntimeErrorCandidate {
+                instruction_pc: constant.pc,
+                value,
+                name: name.into(),
+                status: EvidenceStatus::Recovered,
+                evidence: evidence_refs.clone(),
+            };
+            evidence.push(EvidenceItem {
+                kind: "solana_builtin_error".into(),
+                value: serde_json::json!({
+                    "instruction_pc": candidate.instruction_pc,
+                    "value": candidate.value,
+                    "name": candidate.name,
+                }),
+                confidence: Some(1.0),
+                status: EvidenceStatus::Recovered,
+                evidence: evidence_refs,
+            });
+            Some(candidate)
+        })
+        .collect()
+}
+
+fn solana_builtin_error_name(value: u64) -> Option<&'static str> {
+    Some(match value {
+        0x1_0000_0000 => "ERROR_CUSTOM_ZERO",
+        0x2_0000_0000 => "ERROR_INVALID_ARGUMENT",
+        0x3_0000_0000 => "ERROR_INVALID_INSTRUCTION_DATA",
+        0x4_0000_0000 => "ERROR_INVALID_ACCOUNT_DATA",
+        0x5_0000_0000 => "ERROR_ACCOUNT_DATA_TOO_SMALL",
+        0x6_0000_0000 => "ERROR_INSUFFICIENT_FUNDS",
+        0x7_0000_0000 => "ERROR_INCORRECT_PROGRAM_ID",
+        0x8_0000_0000 => "ERROR_MISSING_REQUIRED_SIGNATURES",
+        0x9_0000_0000 => "ERROR_ACCOUNT_ALREADY_INITIALIZED",
+        0xa_0000_0000 => "ERROR_UNINITIALIZED_ACCOUNT",
+        0xb_0000_0000 => "ERROR_NOT_ENOUGH_ACCOUNT_KEYS",
+        0xc_0000_0000 => "ERROR_ACCOUNT_BORROW_FAILED",
+        0xd_0000_0000 => "ERROR_MAX_SEED_LENGTH_EXCEEDED",
+        0xe_0000_0000 => "ERROR_INVALID_SEEDS",
+        0xf_0000_0000 => "ERROR_BORSH_IO_ERROR",
+        0x10_0000_0000 => "ERROR_ACCOUNT_NOT_RENT_EXEMPT",
+        0x11_0000_0000 => "ERROR_UNSUPPORTED_SYSVAR",
+        0x12_0000_0000 => "ERROR_ILLEGAL_OWNER",
+        0x13_0000_0000 => "ERROR_MAX_ACCOUNTS_DATA_ALLOCATIONS_EXCEEDED",
+        0x14_0000_0000 => "ERROR_INVALID_ACCOUNT_DATA_REALLOC",
+        0x15_0000_0000 => "ERROR_MAX_INSTRUCTION_TRACE_LENGTH_EXCEEDED",
+        0x16_0000_0000 => "ERROR_BUILTIN_PROGRAMS_MUST_CONSUME_COMPUTE_UNITS",
+        0x17_0000_0000 => "ERROR_INVALID_ACCOUNT_OWNER",
+        0x18_0000_0000 => "ERROR_ARITHMETIC_OVERFLOW",
+        0x19_0000_0000 => "ERROR_IMMUTABLE",
+        0x1a_0000_0000 => "ERROR_INCORRECT_AUTHORITY",
+        _ => return None,
+    })
 }
 
 fn resolved_log_calls(
@@ -2392,5 +2471,18 @@ mod tests {
         assert_eq!(calls[0].value, value);
         assert_eq!(calls[0].status, EvidenceStatus::Recovered);
         assert!(evidence.iter().any(|item| item.kind == "resolved_log_call"));
+    }
+
+    #[test]
+    fn names_exact_solana_builtin_return_codes_without_guessing_custom_values() {
+        assert_eq!(
+            solana_builtin_error_name(0x2_0000_0000),
+            Some("ERROR_INVALID_ARGUMENT")
+        );
+        assert_eq!(
+            solana_builtin_error_name(0x8_0000_0000),
+            Some("ERROR_MISSING_REQUIRED_SIGNATURES")
+        );
+        assert_eq!(solana_builtin_error_name(42), None);
     }
 }

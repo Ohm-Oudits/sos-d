@@ -128,6 +128,18 @@ pub fn render_markdown(analysis: &StaticAnalysis, semantics: &SemanticAnalysis) 
         output.push_str("No LDDW immediate constants were identified.\n");
     }
     output.push('\n');
+    output.push_str("## Recovered Solana return codes\n\n");
+    if semantics.runtime_error_candidates.is_empty() {
+        output.push_str("No exact Solana built-in error values were recovered.\n");
+    } else {
+        for candidate in semantics.runtime_error_candidates.iter().take(64) {
+            output.push_str(&format!(
+                "- `0x{:x}`: `0x{:x}` -> `{}` (`{:?}`).\n",
+                candidate.instruction_pc, candidate.value, candidate.name, candidate.status
+            ));
+        }
+    }
+    output.push('\n');
     output.push_str("## Known Solana program fingerprints\n\n");
     if semantics.protocol_fingerprints.is_empty() {
         output.push_str(
@@ -696,6 +708,23 @@ fn render_instruction(
             ));
         }
         output.push_str(&format!("{padding}sol_log({rendered_value});\n"));
+        return;
+    }
+    let runtime_error = semantics
+        .runtime_error_candidates
+        .iter()
+        .find(|candidate| candidate.instruction_pc == instruction.pc);
+    if let Some(candidate) = runtime_error {
+        let comment_prefix = if c_like { "/*" } else { "//" };
+        let comment_suffix = if c_like { " */" } else { "" };
+        output.push_str(&format!(
+            "{padding}{comment_prefix} 0x{:x}: {} — exact Solana built-in return code; evidence: analysis/instruction:0x{:x}{comment_suffix}\n",
+            instruction.pc, instruction.assembly, instruction.pc
+        ));
+        output.push_str(&format!(
+            "{padding}r{} = {};\n",
+            instruction.dst, candidate.name
+        ));
         return;
     }
     let syscall = semantics

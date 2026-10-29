@@ -464,6 +464,12 @@ impl EvidencePack {
             .take(limits.max_constants)
             .cloned()
             .collect();
+        bounded_semantics.runtime_error_candidates = semantics
+            .runtime_error_candidates
+            .iter()
+            .take(limits.max_constants)
+            .cloned()
+            .collect();
         bounded_semantics.protocol_fingerprints = semantics
             .protocol_fingerprints
             .iter()
