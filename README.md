@@ -173,6 +173,9 @@ sos explain ./analysis --provider ollama --task structure --function fn_0 \
   --out ./analysis/structure-fn-0.json
 sos judge ./program.so ./recompiled-candidate.so \
   --minimum-score 0.90 --out ./binary-judge.json
+sos rebuild-judge ./program.so ./candidate/Cargo.toml \
+  --expected-solana-version 3.0.0 --minimum-score 0.90 \
+  --out ./rebuild-judge.json
 ```
 
 `sos judge` compares a candidate rebuilt with the pinned Solana/SBPF toolchain
@@ -183,6 +186,16 @@ score. Add `--require-exact` when every normalized function shape must match.
 This is a strong reconstruction regression gate, not proof of semantic
 equivalence; compiler, linker, optimization, and SBPF toolchain versions must be
 pinned for meaningful comparisons.
+
+`sos rebuild-judge` performs that pinned rebuild automatically. It requires both
+`solana-cli` and `solana-cargo-build-sbf` to exactly match the requested version,
+also verifies and explicitly pins platform-tools v1.51 and SBF rustc 1.84.1,
+requires `Cargo.lock`, invokes `cargo-build-sbf` with `--locked` and an explicit
+SBPF architecture, and writes the candidate into a fresh isolated directory so a
+stale `.so` cannot pass. The versioned result retains tool output, exact arguments,
+bounded build logs, manifest/source/lock hashes, and both ELF hashes before running
+the same deterministic judge. The default pin is Solana 3.0.0 and the default build
+timeout is 15 minutes (bounded to one hour).
 
 `sos validate` also asks stable `rustc` to emit MIR for every compiled
 refinement. SOS reduces that compiler output to a bounded function/CFG summary

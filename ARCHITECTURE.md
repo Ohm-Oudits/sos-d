@@ -430,6 +430,14 @@ requires every normalized function shape to match. The versioned result records
 both content hashes and per-function components. This remains structural
 evidence—not semantic equivalence—and is interpreted alongside replay results.
 
+`sos rebuild-judge` owns the reproducible compiler boundary around this gate. It
+first validates exact `solana-cli` and `solana-cargo-build-sbf` versions, resolves
+the package and cdylib target through locked Cargo metadata, hashes the package
+source plus workspace lockfile, and calls `cargo-build-sbf` directly with bounded
+time and logs. A unique `--sbf-out-dir` prevents stale-output reuse. Only a newly
+emitted ELF is passed into the existing deterministic analyzer and judge, while
+the complete non-secret build provenance is retained in versioned JSON.
+
 Refinement output can carry directly comparable, evidence-linked observations for
 logs, CPI targets, status, and return data. The validator matches these observations
 against the trace and emits explicit mismatch records. A bounded repair loop returns

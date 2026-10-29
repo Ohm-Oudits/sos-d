@@ -31,3 +31,6 @@ successful compilation alone is never represented as behavioral agreement.
 The binary-judge contract records content hashes, per-function structural scores,
 the configured acceptance threshold, exact-match status, and explicit limitations;
 it is a deterministic regression signal rather than equivalence proof.
+The rebuild-judge contract additionally records the strict Solana toolchain gate,
+locked dependency graph, package-source hash, exact build arguments, bounded logs,
+build duration, isolated output directory, and emitted candidate hash.

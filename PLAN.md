@@ -350,7 +350,9 @@ Deliverables:
 - transaction history ingestion;
 - account hydration and trace bundles;
 - isolated local replay;
-- automatic candidate builds under a pinned Solana/SBPF compiler and linker;
+- automatic candidate builds under a pinned Solana/SBPF compiler and linker
+  (implemented by `sos rebuild-judge` with locked metadata, isolated output,
+  bounded execution, and versioned provenance);
 - type-layout and deeper call-graph checks around the deterministic binary judge;
 - bounded candidate-vs-trace comparison and repair loop.
 

@@ -193,6 +193,10 @@ mod tests {
                 include_str!("../../../schemas/v1/binary-judge.schema.json"),
                 1,
             ),
+            (
+                include_str!("../../../schemas/v1/rebuild-judge.schema.json"),
+                1,
+            ),
         ];
 
         for (source, expected_version) in schemas {

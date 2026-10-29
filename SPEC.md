@@ -229,6 +229,16 @@ this judge matched. Reproducible evaluation must pin the compiler, linker,
 optimization flags, SDK, and SBPF toolchain. Behavioral claims still require
 independent replay or observed execution evidence.
 
+`sos rebuild-judge <original.so> <candidate-Cargo.toml>` must automate the
+reproducible path. It rejects Solana CLI and `cargo-build-sbf` versions that do
+not exactly match the configured pin, also verifies the configured platform-tools
+and SBF Rust compiler versions, requires a workspace `Cargo.lock`, invokes
+the builder without a shell using `--locked`, emits into a new output directory,
+and enforces a bounded wall-clock time and bounded captured logs. Its versioned
+record includes tool versions, exact arguments, manifest/source/lock hashes,
+build duration, emitted ELF hash, and the ordinary binary-judge result. It must
+never consume a pre-existing candidate artifact from the selected output path.
+
 ### 4.6 Output formats
 
 Required formats are versioned JSON and Markdown. Rust-like pseudocode is a readable
