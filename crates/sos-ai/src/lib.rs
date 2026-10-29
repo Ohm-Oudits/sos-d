@@ -181,6 +181,14 @@ pub struct UntrustedEvidence {
     pub content: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PseudocodeUnit {
+    pub id: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub source: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidencePack {
     pub schema_version: u32,
@@ -548,19 +556,21 @@ impl EvidencePack {
 /// IR function. Each original line becomes one or more evidence-addressable
 /// operations, allowing a hosted model to improve readability without receiving
 /// an ELF or inventing citations absent from the submitted pseudocode.
-pub fn evidence_pack_from_pseudocode(source: &str) -> Result<EvidencePack, AiError> {
-    const MAX_SOURCE_BYTES: usize = 512 * 1024;
-    // Groq's free GPT-OSS tier is token constrained. Larger inputs should be
-    // split by recovered function/call-graph unit before model submission.
-    const MAX_SOURCE_LINES: usize = 128;
-    const MAX_LINE_BYTES: usize = 4_096;
-    const MAX_IR_OPERATIONS: usize = 128;
-    const OPERATION_TEXT_CHARS: usize = 96;
+const MAX_PSEUDOCODE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PSEUDOCODE_UNITS: usize = 512;
+const MAX_PSEUDOCODE_UNIT_LINES: usize = 128;
+const MAX_PSEUDOCODE_LINE_BYTES: usize = 4_096;
+const MAX_PSEUDOCODE_IR_OPERATIONS: usize = 128;
+const PSEUDOCODE_OPERATION_TEXT_CHARS: usize = 96;
 
-    if source.len() > MAX_SOURCE_BYTES {
+/// Partition decompiler output by detected function boundaries and then by the
+/// hosted operation budget. Units preserve global line numbers, so independently
+/// recovered regions can be merged and audited without losing source identity.
+pub fn partition_pseudocode(source: &str) -> Result<Vec<PseudocodeUnit>, AiError> {
+    if source.len() > MAX_PSEUDOCODE_BYTES {
         return Err(AiError::EvidencePackTooLarge {
             bytes: source.len(),
-            limit: MAX_SOURCE_BYTES,
+            limit: MAX_PSEUDOCODE_BYTES,
         });
     }
     if source.trim().is_empty() {
@@ -572,33 +582,131 @@ pub fn evidence_pack_from_pseudocode(source: &str) -> Result<EvidencePack, AiErr
         .split('\n')
         .map(|line| line.strip_suffix('\r').unwrap_or(line))
         .collect::<Vec<_>>();
-    if lines.len() > MAX_SOURCE_LINES {
-        return Err(AiError::EvidencePackTooLarge {
-            bytes: lines.len(),
-            limit: MAX_SOURCE_LINES,
-        });
-    }
     if let Some((index, _)) = lines
         .iter()
         .enumerate()
-        .find(|(_, line)| line.len() > MAX_LINE_BYTES)
+        .find(|(_, line)| line.len() > MAX_PSEUDOCODE_LINE_BYTES)
     {
         return Err(AiError::InvalidResponse(format!(
-            "pseudocode line {} exceeds {MAX_LINE_BYTES} bytes",
+            "pseudocode line {} exceeds {MAX_PSEUDOCODE_LINE_BYTES} bytes",
             index + 1
         )));
+    }
+
+    let mut units = Vec::new();
+    let mut start = 0;
+    let mut operation_count = 0_usize;
+    for (index, line) in lines.iter().enumerate() {
+        let line_operations = line
+            .chars()
+            .count()
+            .div_ceil(PSEUDOCODE_OPERATION_TEXT_CHARS)
+            .max(1);
+        let function_boundary = index > start && looks_like_function_start(&lines, index);
+        let budget_boundary = index > start
+            && (index - start >= MAX_PSEUDOCODE_UNIT_LINES
+                || operation_count.saturating_add(line_operations) > MAX_PSEUDOCODE_IR_OPERATIONS);
+        if function_boundary || budget_boundary {
+            push_pseudocode_unit(&mut units, &lines, start, index)?;
+            start = index;
+            operation_count = 0;
+        }
+        operation_count = operation_count.saturating_add(line_operations);
+    }
+    push_pseudocode_unit(&mut units, &lines, start, lines.len())?;
+    Ok(units)
+}
+
+fn looks_like_function_start(lines: &[&str], index: usize) -> bool {
+    let trimmed = lines[index].trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if [
+        "if ", "if(", "for ", "for(", "while ", "while(", "switch ", "switch(", "match ", "loop ",
+        "else", "catch ", "catch(",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+    {
+        return false;
+    }
+    if lower.starts_with("fn ") && trimmed.contains('(') {
+        return true;
+    }
+    let next_is_open_brace = lines.get(index + 1).is_some_and(|next| next.trim() == "{");
+    trimmed.contains('(')
+        && trimmed.contains(')')
+        && !trimmed.ends_with(';')
+        && !trimmed.contains('=')
+        && (trimmed.ends_with('{') || next_is_open_brace)
+}
+
+fn push_pseudocode_unit(
+    units: &mut Vec<PseudocodeUnit>,
+    lines: &[&str],
+    start: usize,
+    end: usize,
+) -> Result<(), AiError> {
+    if start >= end {
+        return Ok(());
+    }
+    if units.len() >= MAX_PSEUDOCODE_UNITS {
+        return Err(AiError::EvidencePackTooLarge {
+            bytes: units.len().saturating_add(1),
+            limit: MAX_PSEUDOCODE_UNITS,
+        });
+    }
+    units.push(PseudocodeUnit {
+        id: format!("unit_{:04}", units.len() + 1),
+        start_line: start + 1,
+        end_line: end,
+        source: lines[start..end].join("\n"),
+    });
+    Ok(())
+}
+
+pub fn evidence_pack_from_pseudocode(source: &str) -> Result<EvidencePack, AiError> {
+    let units = partition_pseudocode(source)?;
+    if units.len() != 1 {
+        return Err(AiError::InvalidResponse(format!(
+            "pseudocode requires {} bounded units; use partition_pseudocode and evidence_pack_from_pseudocode_unit",
+            units.len()
+        )));
+    }
+    evidence_pack_from_pseudocode_unit(&units[0])
+}
+
+pub fn evidence_pack_from_pseudocode_unit(unit: &PseudocodeUnit) -> Result<EvidencePack, AiError> {
+    if unit.start_line == 0 || unit.end_line < unit.start_line {
+        return Err(AiError::InvalidResponse(
+            "pseudocode unit has an invalid line range".into(),
+        ));
+    }
+    let lines = unit
+        .source
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect::<Vec<_>>();
+    if lines.len() != unit.end_line - unit.start_line + 1 {
+        return Err(AiError::InvalidResponse(
+            "pseudocode unit line range does not match its source".into(),
+        ));
     }
 
     let mut instructions = Vec::new();
     for (line_index, line) in lines.iter().enumerate() {
         let chars = line.chars().collect::<Vec<_>>();
-        let parts = chars.chunks(OPERATION_TEXT_CHARS).collect::<Vec<_>>();
+        let parts = chars
+            .chunks(PSEUDOCODE_OPERATION_TEXT_CHARS)
+            .collect::<Vec<_>>();
         let part_count = parts.len().max(1);
         for part_index in 0..part_count {
-            if instructions.len() >= MAX_IR_OPERATIONS {
+            if instructions.len() >= MAX_PSEUDOCODE_IR_OPERATIONS {
                 return Err(AiError::EvidencePackTooLarge {
                     bytes: instructions.len().saturating_add(1),
-                    limit: MAX_IR_OPERATIONS,
+                    limit: MAX_PSEUDOCODE_IR_OPERATIONS,
                 });
             }
             let text = parts
@@ -606,7 +714,7 @@ pub fn evidence_pack_from_pseudocode(source: &str) -> Result<EvidencePack, AiErr
                 .map(|part| part.iter().collect::<String>())
                 .unwrap_or_default();
             instructions.push(InstructionFact {
-                pc: instructions.len(),
+                pc: ((unit.start_line + line_index - 1) << 8) | part_index,
                 opcode: 0,
                 dst: 0,
                 src: 0,
@@ -614,25 +722,26 @@ pub fn evidence_pack_from_pseudocode(source: &str) -> Result<EvidencePack, AiErr
                 immediate: 0,
                 assembly: format!(
                     "line_{:04}_part_{:02}: {text}",
-                    line_index + 1,
+                    unit.start_line + line_index,
                     part_index + 1
                 ),
             });
         }
     }
     let instruction_count = instructions.len();
+    let function_pc = (unit.start_line - 1) << 8;
     let analysis = StaticAnalysis {
         schema_version: ANALYSIS_SCHEMA_VERSION,
         sbpf_version: "textual_pseudocode".into(),
-        entrypoint: 0,
+        entrypoint: function_pc,
         instructions,
         functions: vec![FunctionFact {
-            pc: 0,
+            pc: function_pc,
             symbol_hash: 0,
-            name: "humanize_input".into(),
+            name: format!("humanize_{}", unit.id),
         }],
         basic_blocks: vec![BasicBlockFact {
-            start_pc: 0,
+            start_pc: function_pc,
             end_instruction_index: instruction_count,
             destinations: Vec::new(),
             label: "pseudocode_input".into(),
@@ -652,7 +761,7 @@ pub fn evidence_pack_from_pseudocode(source: &str) -> Result<EvidencePack, AiErr
     let semantics = sos_solana::analyze(&analysis);
     Ok(EvidencePack::from_analysis(
         ModelTask::PseudocodeHumanization,
-        Some(sha256_bytes(source.as_bytes())),
+        Some(sha256_bytes(unit.source.as_bytes())),
         analysis,
         semantics,
     ))
@@ -2876,7 +2985,7 @@ mod tests {
         assert_eq!(pack.task, ModelTask::PseudocodeHumanization);
         assert_eq!(pack.ir.functions[0].id, "fn_0");
         assert_eq!(pack.ir.operations.len(), 3);
-        assert_eq!(pack.ir.operations[1].id, "op_1");
+        assert_eq!(pack.ir.operations[1].id, "op_100");
         assert!(pack.ir.operations[1]
             .assembly
             .starts_with("line_0002_part_01:"));
@@ -2905,7 +3014,7 @@ mod tests {
                             "pseudocode": "fn read_value(ctx: &Context) -> Result<u64, Error> { /* recovered */ }",
                             "evidence": [{
                                 "source": "ir",
-                                "location": "operation:op_1",
+                                "location": "operation:op_100",
                                 "detail": "null guard on line 2"
                             }]
                         }]
@@ -2927,5 +3036,39 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("read_value"));
+    }
+
+    #[test]
+    fn pseudocode_partitioning_prefers_functions_then_bounds_oversized_regions() {
+        let functions =
+            "undefined8 first()\n{\n  return 1;\n}\nundefined8 second()\n{\n  return 2;\n}";
+        let units = partition_pseudocode(functions).unwrap();
+        assert_eq!(units.len(), 2);
+        assert_eq!((units[0].start_line, units[0].end_line), (1, 4));
+        assert_eq!((units[1].start_line, units[1].end_line), (5, 8));
+
+        let large = (1..=300)
+            .map(|line| format!("value_{line} = value_{line} + 1;"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let units = partition_pseudocode(&large).unwrap();
+        assert_eq!(units.len(), 3);
+        assert_eq!((units[0].start_line, units[0].end_line), (1, 128));
+        assert_eq!((units[1].start_line, units[1].end_line), (129, 256));
+        assert_eq!((units[2].start_line, units[2].end_line), (257, 300));
+        assert_eq!(
+            units
+                .iter()
+                .map(|unit| unit.source.lines().count())
+                .sum::<usize>(),
+            300
+        );
+
+        let second = evidence_pack_from_pseudocode_unit(&units[1]).unwrap();
+        assert_eq!(second.ir.functions[0].id, "fn_8000");
+        assert_eq!(second.ir.operations[0].id, "op_8000");
+        assert!(second.ir.operations[0]
+            .assembly
+            .starts_with("line_0129_part_01:"));
     }
 }

@@ -124,10 +124,22 @@ references, inline assembly, raw byte arrays, include directives, unsafe code,
 and raw-operation passthroughs. The output is a reconstruction hypothesis—not
 original source or proof of equivalence.
 
-The free-tier projection is bounded to 128 lines. Larger pseudocode should be
-partitioned by recovered function or call-graph slice. This follows GoonFi's
-function-by-function reconstruction and Patina's staged region recovery while
-keeping each model request reviewable and within hosted token limits.
+Each free-tier projection is bounded to 128 evidence operations. SOS detects
+common C/Ghidra/Rust-style function headers first, then automatically splits
+oversized functions into bounded line regions while retaining global line
+numbers. Successful and unresolved units are merged into one output and all
+unit results remain in the audit. This follows GoonFi's function-by-function
+reconstruction and Patina's staged region recovery while keeping each request
+reviewable and within hosted token limits. The CLI defaults to 16 units per run
+and requires an explicit `--max-units N` increase for larger submissions.
+
+Use `--plan` to write the source hash, detected line ranges, synthetic function
+IDs, operation counts, and per-unit hashes without requiring an API key or
+contacting any model:
+
+```bash
+sos humanize ./decompiler-output.txt --plan --audit-out ./humanize-plan.json
+```
 
 ### Local
 

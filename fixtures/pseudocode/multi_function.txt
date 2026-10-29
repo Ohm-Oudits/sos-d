@@ -1,0 +1,24 @@
+ulong read_amount(byte *data, ulong data_len)
+{
+  if (data_len < 9) {
+    return 0;
+  }
+  return *(ulong *)(data + 1);
+}
+
+undefined8 process_account(long ctx, byte *instruction_data, ulong instruction_len)
+{
+  long account;
+  ulong amount;
+
+  account = *(long *)(ctx + 0x20);
+  if (*(byte *)(account + 0x08) == 0) {
+    return 5;
+  }
+  amount = read_amount(instruction_data, instruction_len);
+  if (amount == 0) {
+    return 0x100000002;
+  }
+  *(ulong *)(account + 0x50) = *(ulong *)(account + 0x50) + amount;
+  return 0;
+}

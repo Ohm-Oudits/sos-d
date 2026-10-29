@@ -246,9 +246,17 @@ sos humanize ./decompiler-output.txt \
 Every source line receives one or more deterministic IR operation IDs. Model output must
 cite those IDs, passes the same anti-cheese checks as binary lifting, and is
 marked unverified. `humanize.json` stores the input hash, evidence pack, model
-identity, and response without storing the API key. Free-tier submissions are
-limited to 128 lines per call; split larger output by recovered function or
-call-graph unit, following the GoonFi/Patina workflow.
+identity, and response without storing the API key. SOS automatically detects
+function boundaries and partitions larger input into free-tier-sized units of
+at most 128 evidence operations, following the GoonFi/Patina workflow. Hosted
+rate-limit pacing applies between units. A run defaults to at most 16 units;
+review the partition and pass `--max-units N` to authorize a larger run.
+
+Preview decomposition without loading or contacting any model:
+
+```bash
+sos humanize ./decompiler-output.txt --plan --audit-out ./humanize-plan.json
+```
 
 The command writes `readable.rs`, `model.json`, and `ai-report.md`. Generated
 source remains evidence-linked hypothesis material; functions without an accepted

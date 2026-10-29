@@ -6,13 +6,14 @@ use std::{
 };
 
 use sos_ai::{
-    compile_refinement_output, evidence_pack_from_pseudocode, run_pipeline, run_refinement_loop,
-    scope_analysis_to_function, trusted_open_model, unavailable_pipeline_bundle, AiPipelineBundle,
-    AiPipelineConfig, AiStageResult, AiStageStatus, CommandModelProvider, CompilationStatus,
-    EvidencePack, EvidencePackLimits, GroqModelProvider, HttpModelProvider, ModelGateway,
-    ModelProvider, ModelResponse, ModelTask, OllamaModelProvider, RefinementFeedback,
-    RefinementLoopResult, RefinementOutput, RefinementValidation, StructureRecoveryOutput,
-    UntrustedEvidence, VALIDATION_BUNDLE_SCHEMA_VERSION,
+    compile_refinement_output, evidence_pack_from_pseudocode_unit, partition_pseudocode,
+    run_pipeline, run_refinement_loop, scope_analysis_to_function, trusted_open_model,
+    unavailable_pipeline_bundle, AiPipelineBundle, AiPipelineConfig, AiStageResult, AiStageStatus,
+    CommandModelProvider, CompilationStatus, EvidencePack, EvidencePackLimits, GroqModelProvider,
+    HttpModelProvider, ModelGateway, ModelProvider, ModelResponse, ModelTask, OllamaModelProvider,
+    PseudocodeUnit, RefinementFeedback, RefinementLoopResult, RefinementOutput,
+    RefinementValidation, StructureRecoveryOutput, UntrustedEvidence,
+    VALIDATION_BUNDLE_SCHEMA_VERSION,
 };
 use sos_analysis::{analyze_elf, build_canonical_ir};
 use sos_artifact::{
@@ -1496,13 +1497,15 @@ struct HumanizeOptions {
     model: String,
     ollama_url: String,
     allow_unreviewed_model: bool,
+    max_units: usize,
+    plan_only: bool,
 }
 
 impl HumanizeOptions {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let Some(input) = args.first().map(PathBuf::from) else {
             return Err(
-                "usage: sos humanize <pseudocode-file> [--provider groq|ollama] [--model MODEL] [--out PATH] [--audit-out PATH]".into(),
+                "usage: sos humanize <pseudocode-file> [--plan] [--provider groq|ollama] [--model MODEL] [--max-units N] [--out PATH] [--audit-out PATH]".into(),
             );
         };
         let mut output = input.clone();
@@ -1517,12 +1520,19 @@ impl HumanizeOptions {
             model: "openai/gpt-oss-120b".into(),
             ollama_url: "http://127.0.0.1:11434".into(),
             allow_unreviewed_model: false,
+            max_units: 16,
+            plan_only: false,
         };
         let mut model_explicit = false;
         let mut index = 1;
         while index < args.len() {
             if args[index] == "--allow-unreviewed-model" {
                 options.allow_unreviewed_model = true;
+                index += 1;
+                continue;
+            }
+            if args[index] == "--plan" {
+                options.plan_only = true;
                 index += 1;
                 continue;
             }
@@ -1539,6 +1549,14 @@ impl HumanizeOptions {
                 "--ollama-url" => options.ollama_url = value.clone(),
                 "--out" => options.output = PathBuf::from(value),
                 "--audit-out" => options.audit_output = PathBuf::from(value),
+                "--max-units" => {
+                    options.max_units = value
+                        .parse::<usize>()
+                        .map_err(|error| format!("invalid max unit count: {error}"))?;
+                    if !(1..=512).contains(&options.max_units) {
+                        return Err("--max-units must be between 1 and 512".into());
+                    }
+                }
                 _ => return Err(format!("unknown humanize option: {flag}")),
             }
             index += 2;
@@ -1566,6 +1584,146 @@ impl HumanizeOptions {
     }
 }
 
+struct HumanizationRun {
+    readable_fragments: Vec<String>,
+    unit_audits: Vec<serde_json::Value>,
+    failures: usize,
+}
+
+fn build_humanization_plan(
+    source: &str,
+    units: &[PseudocodeUnit],
+) -> Result<serde_json::Value, String> {
+    let mut planned_units = Vec::with_capacity(units.len());
+    for unit in units {
+        let pack = evidence_pack_from_pseudocode_unit(unit).map_err(|error| error.to_string())?;
+        planned_units.push(serde_json::json!({
+            "id": unit.id,
+            "start_line": unit.start_line,
+            "end_line": unit.end_line,
+            "function_id": pack.ir.functions.first().map(|function| &function.id),
+            "operation_count": pack.ir.operations.len(),
+            "unit_sha256": pack.artifact_sha256,
+        }));
+    }
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "mode": "plan_only_no_inference",
+        "source_sha256": sha256_hex(source.as_bytes()),
+        "unit_count": units.len(),
+        "units": planned_units,
+    }))
+}
+
+fn run_humanization_units<P>(provider: P, model: &str, units: &[PseudocodeUnit]) -> HumanizationRun
+where
+    P: ModelProvider + Clone,
+{
+    let mut run = HumanizationRun {
+        readable_fragments: Vec::with_capacity(units.len()),
+        unit_audits: Vec::with_capacity(units.len()),
+        failures: 0,
+    };
+    for (index, unit) in units.iter().enumerate() {
+        eprintln!(
+            "humanizing unit {}/{}: {} (lines {}-{})",
+            index + 1,
+            units.len(),
+            unit.id,
+            unit.start_line,
+            unit.end_line
+        );
+        let pack = match evidence_pack_from_pseudocode_unit(unit) {
+            Ok(pack) => pack,
+            Err(error) => {
+                run.failures += 1;
+                run.readable_fragments.push(format!(
+                    "// UNRESOLVED {} (lines {}-{}): {}",
+                    unit.id, unit.start_line, unit.end_line, error
+                ));
+                run.unit_audits.push(serde_json::json!({
+                    "unit": unit,
+                    "status": "rejected",
+                    "error": error.to_string(),
+                }));
+                continue;
+            }
+        };
+        let expected_function = pack
+            .ir
+            .functions
+            .first()
+            .map(|function| function.id.clone())
+            .unwrap_or_else(|| "fn_unknown".into());
+        let response = submit_model(
+            provider.clone(),
+            ModelTask::PseudocodeHumanization,
+            model,
+            pack.clone(),
+        );
+        match response {
+            Ok(response) => {
+                let candidate = serde_json::from_value::<StructureRecoveryOutput>(
+                    response.structured_output.clone(),
+                )
+                .ok()
+                .and_then(|recovered| {
+                    recovered
+                        .functions
+                        .into_iter()
+                        .find(|function| function.function_id == expected_function)
+                });
+                if let Some(function) = candidate {
+                    run.readable_fragments.push(format!(
+                        "// {}: original pseudocode lines {}-{}; evidence function {}\n{}",
+                        unit.id,
+                        unit.start_line,
+                        unit.end_line,
+                        expected_function,
+                        function.pseudocode.trim()
+                    ));
+                    run.unit_audits.push(serde_json::json!({
+                        "unit": unit,
+                        "status": "accepted_unverified",
+                        "evidence_pack": pack,
+                        "response": response,
+                    }));
+                } else {
+                    run.failures += 1;
+                    let error = format!(
+                        "model returned no candidate for expected function {expected_function}"
+                    );
+                    run.readable_fragments.push(format!(
+                        "// UNRESOLVED {} (lines {}-{}): {}",
+                        unit.id, unit.start_line, unit.end_line, error
+                    ));
+                    run.unit_audits.push(serde_json::json!({
+                        "unit": unit,
+                        "status": "rejected",
+                        "error": error,
+                        "evidence_pack": pack,
+                        "response": response,
+                    }));
+                }
+            }
+            Err(error) => {
+                run.failures += 1;
+                run.readable_fragments.push(format!(
+                    "// UNRESOLVED {} (lines {}-{}): {}",
+                    unit.id, unit.start_line, unit.end_line, error
+                ));
+                run.unit_audits.push(serde_json::json!({
+                    "unit": unit,
+                    "status": "not_available",
+                    "error": error,
+                    "evidence_pack": pack,
+                }));
+            }
+        }
+    }
+    run
+}
+
 fn humanize_command(args: Vec<String>) -> ExitCode {
     let options = match HumanizeOptions::parse(args) {
         Ok(options) => options,
@@ -1581,15 +1739,50 @@ fn humanize_command(args: Vec<String>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let pack = match evidence_pack_from_pseudocode(&source) {
-        Ok(pack) => pack,
+    let units = match partition_pseudocode(&source) {
+        Ok(units) => units,
         Err(error) => {
             eprintln!("error: {error}");
             return ExitCode::from(2);
         }
     };
-    let source_sha256 = pack.artifact_sha256.clone();
-    let response = match options.provider {
+    if units.len() > options.max_units {
+        eprintln!(
+            "error: pseudocode requires {} hosted units, exceeding --max-units {}; review the partition or raise the limit explicitly",
+            units.len(),
+            options.max_units
+        );
+        return ExitCode::from(2);
+    }
+    if options.plan_only {
+        let plan = match build_humanization_plan(&source, &units) {
+            Ok(plan) => plan,
+            Err(error) => {
+                eprintln!("error: unable to build humanization plan: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        if let Some(parent) = options
+            .audit_output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            if let Err(error) = fs::create_dir_all(parent) {
+                eprintln!("error: {}: {error}", parent.display());
+                return ExitCode::from(1);
+            }
+        }
+        if let Err(error) = fs::write(
+            &options.audit_output,
+            serde_json::to_vec_pretty(&plan).expect("humanization plan is serializable"),
+        ) {
+            eprintln!("error: {}: {error}", options.audit_output.display());
+            return ExitCode::from(1);
+        }
+        println!("humanization_plan={}", options.audit_output.display());
+        return ExitCode::SUCCESS;
+    }
+    let run = match options.provider {
         LiftProvider::Groq => {
             let api_key = match env::var("GROQ_API_KEY") {
                 Ok(api_key) => api_key,
@@ -1605,43 +1798,13 @@ fn humanize_command(args: Vec<String>) -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            submit_model(
-                provider,
-                ModelTask::PseudocodeHumanization,
-                &options.model,
-                pack.clone(),
-            )
+            run_humanization_units(provider, &options.model, &units)
         }
-        LiftProvider::Ollama => submit_model(
+        LiftProvider::Ollama => run_humanization_units(
             OllamaModelProvider::new(&options.ollama_url),
-            ModelTask::PseudocodeHumanization,
             &options.model,
-            pack.clone(),
+            &units,
         ),
-    };
-    let response = match response {
-        Ok(response) => response,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return ExitCode::from(1);
-        }
-    };
-    let recovered =
-        match serde_json::from_value::<StructureRecoveryOutput>(response.structured_output.clone())
-        {
-            Ok(recovered) => recovered,
-            Err(error) => {
-                eprintln!("error: invalid humanization output: {error}");
-                return ExitCode::from(1);
-            }
-        };
-    let Some(function) = recovered
-        .functions
-        .iter()
-        .find(|function| function.function_id == "fn_0")
-    else {
-        eprintln!("error: model returned no humanized fn_0 candidate");
-        return ExitCode::from(1);
     };
     if let Some(parent) = options
         .output
@@ -1654,8 +1817,8 @@ fn humanize_command(args: Vec<String>) -> ExitCode {
         }
     }
     let readable = format!(
-        "// SOS model-assisted reconstruction. Unverified; not original source.\n{}\n",
-        function.pseudocode.trim()
+        "// SOS model-assisted reconstruction. Unverified; not original source.\n\n{}\n",
+        run.readable_fragments.join("\n\n")
     );
     if let Err(error) = fs::write(&options.output, readable) {
         eprintln!("error: {}: {error}", options.output.display());
@@ -1665,9 +1828,10 @@ fn humanize_command(args: Vec<String>) -> ExitCode {
         "schema_version": 1,
         "provider": match options.provider { LiftProvider::Groq => "groq_hosted_open_weights", LiftProvider::Ollama => "ollama_local_open_weights" },
         "model": options.model,
-        "source_sha256": source_sha256,
-        "evidence_pack": pack,
-        "response": response,
+        "source_sha256": sha256_hex(source.as_bytes()),
+        "unit_count": units.len(),
+        "failed_units": run.failures,
+        "units": run.unit_audits,
     });
     if let Some(parent) = options
         .audit_output
@@ -1688,7 +1852,16 @@ fn humanize_command(args: Vec<String>) -> ExitCode {
     }
     println!("readable_source={}", options.output.display());
     println!("audit={}", options.audit_output.display());
-    ExitCode::SUCCESS
+    if run.failures == 0 {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "error: {} of {} pseudocode units were not humanized; partial output was preserved",
+            run.failures,
+            units.len()
+        );
+        ExitCode::from(1)
+    }
 }
 
 #[derive(Debug)]
@@ -2817,7 +2990,7 @@ fn usage() -> ExitCode {
         "       sos decompile <analysis-directory> [--format rust-like|c-like|json] [--out PATH]"
     );
     eprintln!("       sos lift <analysis-directory> [--provider ollama|groq] [--function fn_ID] [--model MODEL] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]");
-    eprintln!("       sos humanize <pseudocode-file> [--provider groq|ollama] [--model MODEL] [--out PATH] [--audit-out PATH]");
+    eprintln!("       sos humanize <pseudocode-file> [--plan] [--provider groq|ollama] [--model MODEL] [--max-units N] [--out PATH] [--audit-out PATH]");
     eprintln!("       sos benchmark <artifact> [--repeats N] [--out PATH]");
     ExitCode::from(2)
 }
@@ -2827,9 +3000,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        transaction_account_addresses, BenchmarkOptions, ExplainOptions, HumanizeOptions,
-        LiftOptions, LiftProvider, RemoteOptions,
+        run_humanization_units, transaction_account_addresses, BenchmarkOptions, ExplainOptions,
+        HumanizeOptions, LiftOptions, LiftProvider, RemoteOptions,
     };
+    use sos_ai::{AiError, ModelProvider, ModelRequest, ModelResponse};
 
     #[test]
     fn transaction_accounts_include_static_and_loaded_keys_without_duplicates() {
@@ -2962,6 +3136,11 @@ mod tests {
         assert_eq!(hosted.provider, LiftProvider::Groq);
         assert_eq!(hosted.model, "openai/gpt-oss-120b");
         assert_eq!(hosted.output, PathBuf::from("decompiler.readable.rs"));
+        assert_eq!(hosted.max_units, 16);
+        assert!(!hosted.plan_only);
+
+        let plan = HumanizeOptions::parse(vec!["decompiler.txt".into(), "--plan".into()]).unwrap();
+        assert!(plan.plan_only);
 
         let local = HumanizeOptions::parse(vec![
             "decompiler.txt".into(),
@@ -2978,6 +3157,53 @@ mod tests {
             "decompiler.txt".into(),
         ])
         .is_err());
+        assert!(HumanizeOptions::parse(vec![
+            "decompiler.txt".into(),
+            "--max-units".into(),
+            "513".into(),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn humanize_merges_every_automatically_partitioned_unit() {
+        #[derive(Clone)]
+        struct FakeHumanizer;
+        impl ModelProvider for FakeHumanizer {
+            fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
+                let function_id = request.evidence_pack.ir.functions[0].id.clone();
+                let operation_id = request.evidence_pack.ir.operations[0].id.clone();
+                Ok(ModelResponse {
+                    task: request.task,
+                    model: request.model,
+                    prompt_version: request.prompt_version,
+                    structured_output: serde_json::json!({
+                        "functions": [{
+                            "function_id": function_id,
+                            "pseudocode": format!("fn recovered_{operation_id}() {{}}"),
+                            "evidence": [{
+                                "source": "ir",
+                                "location": format!("operation:{operation_id}"),
+                                "detail": "first operation in bounded unit"
+                            }]
+                        }]
+                    }),
+                    evidence: Vec::new(),
+                })
+            }
+        }
+
+        let source = (1..=300)
+            .map(|line| format!("value_{line} = value_{line} + 1;"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let units = sos_ai::partition_pseudocode(&source).unwrap();
+        let run = run_humanization_units(FakeHumanizer, "test", &units);
+        assert_eq!(units.len(), 3);
+        assert_eq!(run.failures, 0);
+        assert_eq!(run.readable_fragments.len(), 3);
+        assert_eq!(run.unit_audits.len(), 3);
+        assert!(run.readable_fragments[1].contains("lines 129-256"));
     }
 
     #[test]
