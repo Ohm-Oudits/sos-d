@@ -32,6 +32,8 @@ jq -n \
 cargo run -q -p sos-cli -- analyze "$artifact" --out "$analysis_dir"
 cargo run -q -p sos-cli -- lift "$analysis_dir" \
   --provider groq \
+  --resume \
+  --cache-dir "$lift_dir/checkpoints" \
   --function fn_0 \
   --repair-rounds 2 \
   --out "$lift_dir"

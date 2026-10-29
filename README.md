@@ -209,6 +209,7 @@ Groq API key, keep it in the process environment, and run:
 export GROQ_API_KEY='...'
 cargo run -p sos-cli -- lift ./analysis \
   --provider groq \
+  --resume \
   --function fn_0 \
   --repair-rounds 2 \
   --out ./analysis/lifted-groq
@@ -221,9 +222,23 @@ export GROQ_API_KEY='...'
 sos inspect <PROGRAM_ADDRESS> \
   --rpc-url https://api.mainnet.solana.com \
   --provider groq \
-  --function fn_0 \
+  --resume \
   --out ./reports/<PROGRAM_ADDRESS>
 ```
+
+Without `--function`, address-first lifting processes the complete recovered
+call graph. Known callees are lifted before callers, and accepted callee
+reconstructions are supplied to the caller as bounded, explicitly untrusted
+context. Final source is still rendered in deterministic function-address
+order. Use `--function fn_ID` for a smaller first run.
+
+`--resume` writes a completed four-stage checkpoint per function. SOS rebuilds
+the scoped IR, Solana semantics, and callee context and then revalidates every
+stage's provider/model/prompt identity, input and output hashes, strict schema,
+anti-cheese rules, and evidence references before reuse. Invalid checkpoints
+are ignored. Choose a stable directory with `--cache-dir DIR`; no API key is
+stored. Fully cached Groq lifts can be reconstructed without loading a local
+model or setting `GROQ_API_KEY`.
 
 SOS never writes the key into an audit bundle and does not send raw `.so`
 bytes. It sends a bounded projection of canonical IR and recovered Solana

@@ -1200,6 +1200,20 @@ pub fn run_pipeline<P: ModelProvider>(
     analysis: &StaticAnalysis,
     semantics: &SemanticAnalysis,
 ) -> AiPipelineBundle {
+    run_pipeline_with_context(provider, config, analysis, semantics, &[])
+}
+
+/// Run the four bounded stages with caller-supplied, explicitly untrusted
+/// context from already accepted dependency functions. Deterministic facts in
+/// `analysis` and `semantics` remain authoritative and every response must cite
+/// evidence from the current function's bounded pack.
+pub fn run_pipeline_with_context<P: ModelProvider>(
+    provider: P,
+    config: AiPipelineConfig,
+    analysis: &StaticAnalysis,
+    semantics: &SemanticAnalysis,
+    initial_context: &[UntrustedEvidence],
+) -> AiPipelineBundle {
     let AiPipelineConfig {
         provider_name,
         model,
@@ -1210,7 +1224,7 @@ pub fn run_pipeline<P: ModelProvider>(
     } = config;
     let gateway = ModelGateway::new(provider, 4 * 1024 * 1024, 1024 * 1024);
     let mut stages = Vec::with_capacity(ModelTask::ALL.len());
-    let mut accepted_prior_stages = Vec::<UntrustedEvidence>::new();
+    let mut accepted_prior_stages = bounded_initial_context(initial_context);
 
     for task in ModelTask::ALL {
         let mut pack = EvidencePack::bounded_from_analysis(
@@ -1281,6 +1295,94 @@ pub fn run_pipeline<P: ModelProvider>(
         model,
         stages,
     }
+}
+
+fn bounded_initial_context(initial_context: &[UntrustedEvidence]) -> Vec<UntrustedEvidence> {
+    let mut bounded = initial_context
+        .iter()
+        .rev()
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>();
+    bounded.reverse();
+    for item in &mut bounded {
+        item.content = item.content.chars().take(16 * 1024).collect();
+    }
+    bounded
+}
+
+/// Rebuild and verify a persisted four-stage function bundle before reuse.
+/// Only fully accepted base pipelines are checkpointable; transient failures
+/// and later compiler-repair rounds must be rerun instead of becoming trusted
+/// cache state.
+pub fn validate_pipeline_bundle_with_context(
+    config: &AiPipelineConfig,
+    analysis: &StaticAnalysis,
+    semantics: &SemanticAnalysis,
+    initial_context: &[UntrustedEvidence],
+    bundle: &AiPipelineBundle,
+) -> Result<(), AiError> {
+    if bundle.schema_version != AI_BUNDLE_SCHEMA_VERSION
+        || bundle.artifact_sha256 != config.artifact_sha256
+        || bundle.provider != config.provider_name
+        || bundle.model != config.model
+        || bundle.stages.len() != ModelTask::ALL.len()
+    {
+        return Err(AiError::InvalidResponse(
+            "checkpointed pipeline bundle identity or stage count does not match the current request"
+                .into(),
+        ));
+    }
+
+    let mut accepted_prior_stages = bounded_initial_context(initial_context);
+    for (stage, expected_task) in bundle.stages.iter().zip(ModelTask::ALL) {
+        if stage.task != expected_task
+            || stage.status != AiStageStatus::Accepted
+            || stage.model != config.model
+            || stage.prompt_version != config.prompt_version
+            || stage.error.is_some()
+        {
+            return Err(AiError::InvalidResponse(format!(
+                "checkpointed {expected_task:?} stage is not a matching accepted result"
+            )));
+        }
+        let mut pack = EvidencePack::bounded_from_analysis(
+            expected_task,
+            config.artifact_sha256.clone(),
+            analysis,
+            semantics,
+            config.limits,
+        );
+        pack.untrusted_evidence
+            .extend(accepted_prior_stages.iter().cloned());
+        if stage.input_sha256 != sha256_json(&pack) {
+            return Err(AiError::InvalidResponse(format!(
+                "checkpointed {expected_task:?} input hash does not match current evidence"
+            )));
+        }
+        let response = stage.response.as_ref().ok_or_else(|| {
+            AiError::InvalidResponse(format!(
+                "checkpointed {expected_task:?} stage has no response"
+            ))
+        })?;
+        validate_model_response_for_pack(&config.model, &config.prompt_version, pack, response)?;
+        let output_sha256 = sha256_json(response);
+        if stage.output_sha256.as_deref() != Some(output_sha256.as_str()) {
+            return Err(AiError::InvalidResponse(format!(
+                "checkpointed {expected_task:?} output hash does not match its response"
+            )));
+        }
+        let prior = serde_json::to_string(&response.structured_output)
+            .unwrap_or_else(|_| "{}".into())
+            .chars()
+            .take(128 * 1024)
+            .collect::<String>();
+        accepted_prior_stages.push(UntrustedEvidence {
+            source: format!("accepted_model_stage:{expected_task:?}"),
+            content: prior,
+        });
+    }
+    Ok(())
 }
 
 /// Build the same auditable bundle when no provider is configured. This keeps
@@ -2679,6 +2781,87 @@ mod tests {
             &pack.semantics,
         );
         assert_eq!(*prior_counts.lock().unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn pipeline_passes_bounded_dependency_context_into_the_first_stage() {
+        let pack = empty_pack();
+        let prior_counts = Arc::new(Mutex::new(Vec::new()));
+        let context = (0..6)
+            .map(|index| UntrustedEvidence {
+                source: format!("accepted_callee:fn_{index:x}"),
+                content: "x".repeat(20 * 1024),
+            })
+            .collect::<Vec<_>>();
+        let _ = run_pipeline_with_context(
+            RecordingProvider {
+                prior_counts: prior_counts.clone(),
+            },
+            AiPipelineConfig {
+                provider_name: "test-provider".into(),
+                model: "test-model".into(),
+                prompt_version: "sos-v2".into(),
+                artifact_sha256: None,
+                limits: EvidencePackLimits::default(),
+                max_attempts: 1,
+            },
+            &pack.analysis,
+            &pack.semantics,
+            &context,
+        );
+        assert_eq!(*prior_counts.lock().unwrap(), vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn persisted_pipeline_bundle_is_revalidated_with_dependency_context() {
+        let pack = empty_pack();
+        let config = AiPipelineConfig {
+            provider_name: "test-provider".into(),
+            model: "test-model".into(),
+            prompt_version: "sos-v2".into(),
+            artifact_sha256: Some("artifact".into()),
+            limits: EvidencePackLimits::default(),
+            max_attempts: 1,
+        };
+        let context = vec![UntrustedEvidence {
+            source: "accepted_callee:fn_8".into(),
+            content: r#"{"functions":[]}"#.into(),
+        }];
+        let bundle = run_pipeline_with_context(
+            EchoProvider,
+            config.clone(),
+            &pack.analysis,
+            &pack.semantics,
+            &context,
+        );
+        assert!(validate_pipeline_bundle_with_context(
+            &config,
+            &pack.analysis,
+            &pack.semantics,
+            &context,
+            &bundle,
+        )
+        .is_ok());
+
+        let mut tampered = bundle.clone();
+        tampered.stages[0].output_sha256 = Some("00".repeat(32));
+        assert!(validate_pipeline_bundle_with_context(
+            &config,
+            &pack.analysis,
+            &pack.semantics,
+            &context,
+            &tampered,
+        )
+        .is_err());
+
+        assert!(validate_pipeline_bundle_with_context(
+            &config,
+            &pack.analysis,
+            &pack.semantics,
+            &[],
+            &bundle,
+        )
+        .is_err());
     }
 
     #[test]

@@ -80,6 +80,7 @@ export GROQ_API_KEY='...'
 cargo run -p sos-cli -- analyze ./program.so --out ./analysis
 cargo run -p sos-cli -- lift ./analysis \
   --provider groq \
+  --resume \
   --function fn_0 \
   --repair-rounds 2 \
   --out ./analysis/lifted-groq
@@ -92,9 +93,23 @@ model when `--provider groq` is selected:
 sos inspect <PROGRAM_ADDRESS> \
   --rpc-url https://api.mainnet.solana.com \
   --provider groq \
-  --function fn_0 \
+  --resume \
   --out ./reports/<PROGRAM_ADDRESS>
 ```
+
+For complete-program lifting, SOS derives a deterministic function call graph,
+processes known callees before callers, and supplies accepted direct-callee
+reconstructions as bounded untrusted context to the caller's structure stage.
+Recursive cycles retain stable address order. Rendering remains in address
+order, independent of processing order.
+
+`--resume` persists a fully accepted four-stage base bundle per function. On
+reuse, SOS rebuilds the function-scoped analysis, semantic facts, and callee
+context, then verifies request identity, all stage input/output hashes, strict
+schemas, anti-cheese constraints, and evidence references. A stale, edited, or
+partially failed bundle is never reused. `--cache-dir DIR` selects the durable
+sidecar location. Compiler-driven repair remains outside the base checkpoint
+and is rerun when required.
 
 Only a compact evidence projection is hosted: canonical operation/block IDs,
 bounded disassembly, and high-value Solana semantic facts. The raw ELF is not

@@ -176,6 +176,16 @@ pipeline bundle with separate status and input/output hashes for structure recov
 semantic labeling, explanation, and refinement; a failed stage cannot erase accepted
 results or alter deterministic facts.
 
+Complete-program lifting must use a deterministic call-graph dependency walk:
+known callees are processed before callers, recursive cycles use stable address
+order, and only accepted bounded callee output may enter a caller pack as
+untrusted context. Resumable lifts may persist only fully accepted base-stage
+function bundles. Before reuse, the implementation must rebuild the scoped
+analysis, semantic facts, and dependency context and revalidate provider/model/
+prompt identity, stage order, request and response hashes, schema constraints,
+anti-cheese rules, and evidence references. Credentials must never enter cache
+records.
+
 Validation is an external trust boundary. `sos validate` may compile accepted
 refinement snippets in a bounded, non-executing `rustc` subprocess and may compare
 observed replay traces when a trace is supplied. It emits `validation.json` with

@@ -9,13 +9,14 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sos_ai::{
     compile_refinement_output, evidence_pack_from_pseudocode_unit, partition_pseudocode,
-    run_pipeline, run_refinement_loop, scope_analysis_to_function, trusted_open_model,
-    unavailable_pipeline_bundle, validate_model_response_for_pack, AiPipelineBundle,
-    AiPipelineConfig, AiStageResult, AiStageStatus, CommandModelProvider, CompilationStatus,
-    EvidencePack, EvidencePackLimits, GroqModelProvider, HttpModelProvider, ModelGateway,
-    ModelProvider, ModelResponse, ModelTask, OllamaModelProvider, PseudocodeUnit,
-    RefinementFeedback, RefinementLoopResult, RefinementOutput, RefinementValidation,
-    StructureRecoveryOutput, UntrustedEvidence, VALIDATION_BUNDLE_SCHEMA_VERSION,
+    run_pipeline, run_pipeline_with_context, run_refinement_loop, scope_analysis_to_function,
+    trusted_open_model, unavailable_pipeline_bundle, validate_model_response_for_pack,
+    validate_pipeline_bundle_with_context, AiPipelineBundle, AiPipelineConfig, AiStageResult,
+    AiStageStatus, CommandModelProvider, CompilationStatus, EvidencePack, EvidencePackLimits,
+    GroqModelProvider, HttpModelProvider, ModelGateway, ModelProvider, ModelResponse, ModelTask,
+    OllamaModelProvider, PseudocodeUnit, RefinementFeedback, RefinementLoopResult,
+    RefinementOutput, RefinementValidation, StructureRecoveryOutput, UntrustedEvidence,
+    VALIDATION_BUNDLE_SCHEMA_VERSION,
 };
 use sos_analysis::{analyze_elf, build_canonical_ir};
 use sos_artifact::{
@@ -40,6 +41,9 @@ use sos_types::{ArtifactManifest, ProgramArtifact};
 const HUMANIZATION_PROMPT_VERSION: &str = "sos-v1";
 const HUMANIZATION_CACHE_SCHEMA_VERSION: u32 = 1;
 const HUMANIZATION_CACHE_RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v3";
+const LIFT_CACHE_SCHEMA_VERSION: u32 = 1;
+const LIFT_CACHE_RECORD_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -970,6 +974,16 @@ fn inspect_command(args: Vec<String>) -> ExitCode {
         eprintln!("error: inspect --validate/--repair requires --model");
         return ExitCode::from(2);
     }
+    if options.resume
+        && (options.model.is_none()
+            || options.model_command.is_some()
+            || options.model_endpoint.is_some())
+    {
+        eprintln!(
+            "error: inspect --resume requires a reviewed --provider ollama|groq lift, not a custom model adapter"
+        );
+        return ExitCode::from(2);
+    }
     let (artifact, manifest) = match resolve_remote(&options) {
         Ok(result) => result,
         Err(error) => {
@@ -1143,6 +1157,12 @@ fn inspect_command(args: Vec<String>) -> ExitCode {
                 None,
             ),
             (None, None) if trusted_open_model(model).is_some() => {
+                let checkpoint_cache = options
+                    .cache_dir
+                    .as_ref()
+                    .map(|directory| LiftCheckpointCache {
+                        directory: directory.clone(),
+                    });
                 match run_selected_lift_bundle(
                     &analysis,
                     &semantics,
@@ -1154,6 +1174,7 @@ fn inspect_command(args: Vec<String>) -> ExitCode {
                         context_tokens: options.context_tokens,
                         function_id: options.function_id.as_deref(),
                         repair_rounds: options.repair_rounds.min(4),
+                        checkpoint_cache: checkpoint_cache.as_ref(),
                     },
                 ) {
                     Ok((bundle, records)) => (bundle, Some(records)),
@@ -1736,15 +1757,15 @@ impl HumanizationCache {
 }
 
 #[derive(Clone)]
-struct UnavailableHumanizeProvider;
+struct UnavailableHostedProvider;
 
-impl ModelProvider for UnavailableHumanizeProvider {
+impl ModelProvider for UnavailableHostedProvider {
     fn generate_structured(
         &self,
         _request: sos_ai::ModelRequest,
     ) -> Result<ModelResponse, sos_ai::AiError> {
         Err(sos_ai::AiError::Provider(
-            "checkpoint miss requires GROQ_API_KEY for hosted inference".into(),
+            "validated checkpoint miss requires GROQ_API_KEY for hosted inference".into(),
         ))
     }
 }
@@ -2109,7 +2130,7 @@ fn humanize_command(args: Vec<String>) -> ExitCode {
                         "GROQ_API_KEY is not set; validating checkpoints and preserving cache misses as unresolved"
                     );
                 run_humanization_units(
-                    UnavailableHumanizeProvider,
+                    UnavailableHostedProvider,
                     &options.model,
                     &units,
                     cache.as_ref(),
@@ -2198,13 +2219,15 @@ struct LiftOptions {
     allow_unreviewed_model: bool,
     function_id: Option<String>,
     repair_rounds: usize,
+    resume: bool,
+    cache_dir: Option<PathBuf>,
 }
 
 impl LiftOptions {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let Some(directory) = args.first() else {
             return Err(
-                "usage: sos lift <analysis-directory> [--provider ollama|groq] [--function fn_ID] [--model MODEL] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]".into(),
+                "usage: sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq] [--function fn_ID] [--model MODEL] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]".into(),
             );
         };
         let mut options = Self {
@@ -2217,6 +2240,8 @@ impl LiftOptions {
             allow_unreviewed_model: false,
             function_id: None,
             repair_rounds: 2,
+            resume: false,
+            cache_dir: None,
         };
         let mut model_explicit = false;
         let mut index = 1;
@@ -2226,12 +2251,18 @@ impl LiftOptions {
                 index += 1;
                 continue;
             }
+            if args[index] == "--resume" {
+                options.resume = true;
+                index += 1;
+                continue;
+            }
             let flag = &args[index];
             let Some(value) = args.get(index + 1) else {
                 return Err(format!("missing value for {flag}"));
             };
             match flag.as_str() {
                 "--out" => options.output = PathBuf::from(value),
+                "--cache-dir" => options.cache_dir = Some(PathBuf::from(value)),
                 "--provider" => options.provider = LiftProvider::parse(value)?,
                 "--ollama-url" => options.ollama_url = value.clone(),
                 "--model" => {
@@ -2268,6 +2299,12 @@ impl LiftOptions {
                 options.model
             ));
         }
+        if options.cache_dir.is_some() && !options.resume {
+            return Err("--cache-dir requires --resume".into());
+        }
+        if options.resume && options.cache_dir.is_none() {
+            options.cache_dir = Some(options.output.join("checkpoints"));
+        }
         Ok(options)
     }
 }
@@ -2278,6 +2315,211 @@ struct LiftRunConfig<'a> {
     provider_name: &'a str,
     function_id: Option<&'a str>,
     repair_rounds: usize,
+    checkpoint_cache: Option<&'a LiftCheckpointCache>,
+}
+
+#[derive(Debug)]
+struct LiftCheckpointCache {
+    directory: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LiftCheckpointRecord {
+    schema_version: u32,
+    function_id: String,
+    request_sha256: String,
+    bundle: AiPipelineBundle,
+}
+
+impl LiftCheckpointCache {
+    fn record_path(&self, function_pc: usize) -> PathBuf {
+        self.directory.join(format!("fn_{function_pc:x}.json"))
+    }
+
+    fn request_sha256(
+        config: &AiPipelineConfig,
+        analysis: &sos_analysis::StaticAnalysis,
+        semantics: &sos_solana::SemanticAnalysis,
+        context: &[UntrustedEvidence],
+    ) -> Result<String, String> {
+        serde_json::to_vec(&(config, analysis, semantics, context))
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|error| format!("unable to hash lift checkpoint request: {error}"))
+    }
+
+    fn load(
+        &self,
+        function_pc: usize,
+        config: &AiPipelineConfig,
+        analysis: &sos_analysis::StaticAnalysis,
+        semantics: &sos_solana::SemanticAnalysis,
+        context: &[UntrustedEvidence],
+    ) -> Result<Option<AiPipelineBundle>, String> {
+        let path = self.record_path(function_pc);
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        };
+        if metadata.len() > LIFT_CACHE_RECORD_MAX_BYTES {
+            return Err(format!(
+                "{}: checkpoint is {} bytes, exceeding the {} byte limit",
+                path.display(),
+                metadata.len(),
+                LIFT_CACHE_RECORD_MAX_BYTES
+            ));
+        }
+        let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let record: LiftCheckpointRecord = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("{}: invalid checkpoint JSON: {error}", path.display()))?;
+        let function_id = format!("fn_{function_pc:x}");
+        let request_sha256 = Self::request_sha256(config, analysis, semantics, context)?;
+        if record.schema_version != LIFT_CACHE_SCHEMA_VERSION
+            || record.function_id != function_id
+            || record.request_sha256 != request_sha256
+        {
+            return Err(format!(
+                "{}: checkpoint identity does not match the current function evidence or dependency context",
+                path.display()
+            ));
+        }
+        validate_pipeline_bundle_with_context(config, analysis, semantics, context, &record.bundle)
+            .map_err(|error| {
+                format!("{}: checkpoint validation failed: {error}", path.display())
+            })?;
+        Ok(Some(record.bundle))
+    }
+
+    fn store(
+        &self,
+        function_pc: usize,
+        config: &AiPipelineConfig,
+        analysis: &sos_analysis::StaticAnalysis,
+        semantics: &sos_solana::SemanticAnalysis,
+        context: &[UntrustedEvidence],
+        bundle: &AiPipelineBundle,
+    ) -> Result<(), String> {
+        validate_pipeline_bundle_with_context(config, analysis, semantics, context, bundle)
+            .map_err(|error| format!("refusing to checkpoint invalid lift bundle: {error}"))?;
+        fs::create_dir_all(&self.directory)
+            .map_err(|error| format!("{}: {error}", self.directory.display()))?;
+        let path = self.record_path(function_pc);
+        let record = LiftCheckpointRecord {
+            schema_version: LIFT_CACHE_SCHEMA_VERSION,
+            function_id: format!("fn_{function_pc:x}"),
+            request_sha256: Self::request_sha256(config, analysis, semantics, context)?,
+            bundle: bundle.clone(),
+        };
+        let bytes = serde_json::to_vec_pretty(&record)
+            .map_err(|error| format!("unable to serialize lift checkpoint: {error}"))?;
+        let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
+        fs::write(&temporary, bytes)
+            .map_err(|error| format!("{}: {error}", temporary.display()))?;
+        fs::rename(&temporary, &path).map_err(|error| {
+            format!(
+                "unable to atomically publish {} as {}: {error}",
+                temporary.display(),
+                path.display()
+            )
+        })
+    }
+}
+
+fn lift_function_plan(
+    analysis: &sos_analysis::StaticAnalysis,
+) -> (Vec<sos_analysis::FunctionFact>, Vec<Vec<usize>>, Vec<usize>) {
+    fn visit(index: usize, dependencies: &[Vec<usize>], state: &mut [u8], order: &mut Vec<usize>) {
+        if state[index] == 2 {
+            return;
+        }
+        if state[index] == 1 {
+            // Keep recursive call groups deterministic without pretending a
+            // topological order exists inside the cycle.
+            return;
+        }
+        state[index] = 1;
+        for dependency in &dependencies[index] {
+            visit(*dependency, dependencies, state, order);
+        }
+        state[index] = 2;
+        order.push(index);
+    }
+
+    let mut functions = analysis.functions.clone();
+    functions.sort_by_key(|function| function.pc);
+    let by_pc = functions
+        .iter()
+        .enumerate()
+        .map(|(index, function)| (function.pc, index))
+        .collect::<BTreeMap<_, _>>();
+    let mut dependencies = vec![Vec::<usize>::new(); functions.len()];
+    for call in &analysis.calls {
+        let Some(target_index) = call.target_pc.and_then(|pc| by_pc.get(&pc).copied()) else {
+            continue;
+        };
+        let caller_index = call
+            .caller_pc
+            .and_then(|pc| by_pc.get(&pc).copied())
+            .or_else(|| {
+                functions
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, function)| function.pc <= call.call_pc)
+                    .map(|(index, _)| index)
+            });
+        let Some(caller_index) = caller_index else {
+            continue;
+        };
+        if caller_index != target_index {
+            dependencies[caller_index].push(target_index);
+        }
+    }
+    for items in &mut dependencies {
+        items.sort_unstable();
+        items.dedup();
+    }
+    let mut state = vec![0_u8; functions.len()];
+    let mut order = Vec::with_capacity(functions.len());
+    for index in 0..functions.len() {
+        visit(index, &dependencies, &mut state, &mut order);
+    }
+    (functions, dependencies, order)
+}
+
+fn accepted_lift_context(
+    function_pc: usize,
+    bundle: &AiPipelineBundle,
+) -> Option<UntrustedEvidence> {
+    let response = bundle.stages.iter().rev().find_map(|stage| {
+        if stage.status != AiStageStatus::Accepted {
+            return None;
+        }
+        let response = stage.response.as_ref()?;
+        let has_candidate = match stage.task {
+            ModelTask::Refinement => response
+                .structured_output
+                .get("patches")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|items| !items.is_empty()),
+            ModelTask::StructureRecovery => response
+                .structured_output
+                .get("functions")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|items| !items.is_empty()),
+            _ => false,
+        };
+        has_candidate.then_some(response)
+    })?;
+    let content = serde_json::to_string(&response.structured_output)
+        .unwrap_or_else(|_| "{}".into())
+        .chars()
+        .take(16 * 1024)
+        .collect();
+    Some(UntrustedEvidence {
+        source: format!("accepted_callee:fn_{function_pc:x}"),
+        content,
+    })
 }
 
 fn run_lift_bundle<P>(
@@ -2292,7 +2534,7 @@ where
     let config = AiPipelineConfig {
         provider_name: options.provider_name.into(),
         model: options.model.into(),
-        prompt_version: "sos-semantic-lift-v3".into(),
+        prompt_version: LIFT_PROMPT_VERSION.into(),
         artifact_sha256: options.artifact_sha256.clone(),
         limits: EvidencePackLimits::default(),
         max_attempts: 2,
@@ -2305,11 +2547,10 @@ where
         stages: Vec::new(),
     };
     let mut repair_records = Vec::<serde_json::Value>::new();
-    let mut functions = analysis.functions.clone();
-    functions.sort_by_key(|function| function.pc);
+    let (functions, dependencies, mut processing_order) = lift_function_plan(analysis);
     if let Some(function_id) = options.function_id {
-        functions.retain(|function| format!("fn_{:x}", function.pc) == function_id);
-        if functions.is_empty() {
+        processing_order.retain(|index| format!("fn_{:x}", functions[*index].pc) == function_id);
+        if processing_order.is_empty() {
             return Err(format!(
                 "function {function_id:?} does not exist in the analysis IR"
             ));
@@ -2318,23 +2559,106 @@ where
     if functions.is_empty() {
         bundle = run_pipeline(provider, config, analysis, global_semantics);
     } else {
-        for (index, function) in functions.iter().enumerate() {
+        let mut accepted_context = BTreeMap::<usize, UntrustedEvidence>::new();
+        for (position, function_index) in processing_order.iter().enumerate() {
+            let function = &functions[*function_index];
             eprintln!(
                 "lifting function {}/{}: fn_{:x}",
-                index + 1,
-                functions.len(),
+                position + 1,
+                processing_order.len(),
                 function.pc
             );
             let Some(scoped_analysis) = scope_analysis_to_function(analysis, function.pc) else {
                 continue;
             };
             let scoped_semantics = analyze_semantics(&scoped_analysis);
-            let mut partial = run_pipeline(
-                provider.clone(),
-                config.clone(),
-                &scoped_analysis,
-                &scoped_semantics,
-            );
+            let dependency_context = dependencies[*function_index]
+                .iter()
+                .filter_map(|dependency| accepted_context.get(&functions[*dependency].pc))
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut checkpoint_status = "disabled";
+            let mut reused_checkpoint = false;
+            let mut partial = if let Some(cache) = options.checkpoint_cache {
+                match cache.load(
+                    function.pc,
+                    &config,
+                    &scoped_analysis,
+                    &scoped_semantics,
+                    &dependency_context,
+                ) {
+                    Ok(Some(bundle)) => {
+                        eprintln!("reusing validated lift checkpoint for fn_{:x}", function.pc);
+                        checkpoint_status = "reused";
+                        reused_checkpoint = true;
+                        bundle
+                    }
+                    Ok(None) => {
+                        checkpoint_status = "missing";
+                        run_pipeline_with_context(
+                            provider.clone(),
+                            config.clone(),
+                            &scoped_analysis,
+                            &scoped_semantics,
+                            &dependency_context,
+                        )
+                    }
+                    Err(error) => {
+                        checkpoint_status = "invalid_ignored";
+                        eprintln!("warning: ignoring stale or invalid lift checkpoint: {error}");
+                        run_pipeline_with_context(
+                            provider.clone(),
+                            config.clone(),
+                            &scoped_analysis,
+                            &scoped_semantics,
+                            &dependency_context,
+                        )
+                    }
+                }
+            } else {
+                run_pipeline_with_context(
+                    provider.clone(),
+                    config.clone(),
+                    &scoped_analysis,
+                    &scoped_semantics,
+                    &dependency_context,
+                )
+            };
+            if !reused_checkpoint {
+                if let Some(cache) = options.checkpoint_cache {
+                    match cache.store(
+                        function.pc,
+                        &config,
+                        &scoped_analysis,
+                        &scoped_semantics,
+                        &dependency_context,
+                        &partial,
+                    ) {
+                        Ok(()) => checkpoint_status = "stored",
+                        Err(error) => {
+                            checkpoint_status = "not_stored";
+                            eprintln!(
+                                "warning: lift result for fn_{:x} was not checkpointed: {error}",
+                                function.pc
+                            );
+                        }
+                    }
+                }
+            }
+            if options.checkpoint_cache.is_some() {
+                repair_records.push(serde_json::json!({
+                    "kind": "pipeline_checkpoint",
+                    "function_id": format!("fn_{:x}", function.pc),
+                    "status": checkpoint_status,
+                }));
+            }
+            // Dependency context is derived from the checkpointed four-stage
+            // base bundle. Compiler-repair rounds are intentionally excluded
+            // so resumed callers see byte-identical context even when repair
+            // inference is unavailable.
+            if let Some(context) = accepted_lift_context(function.pc, &partial) {
+                accepted_context.insert(function.pc, context);
+            }
             if options.repair_rounds > 0 {
                 repair_failed_refinement(
                     &provider,
@@ -2360,6 +2684,7 @@ struct SelectedLiftConfig<'a> {
     context_tokens: usize,
     function_id: Option<&'a str>,
     repair_rounds: usize,
+    checkpoint_cache: Option<&'a LiftCheckpointCache>,
 }
 
 fn run_selected_lift_bundle(
@@ -2373,6 +2698,7 @@ fn run_selected_lift_bundle(
         provider_name,
         function_id: options.function_id,
         repair_rounds: options.repair_rounds,
+        checkpoint_cache: options.checkpoint_cache,
     };
     match options.provider {
         LiftProvider::Ollama => run_lift_bundle(
@@ -2383,16 +2709,33 @@ fn run_selected_lift_bundle(
             run("ollama_local_open_weights"),
         ),
         LiftProvider::Groq => {
-            let api_key = env::var("GROQ_API_KEY").map_err(|_| {
-                "GROQ_API_KEY is required for --provider groq; create a free Groq key and export it in this shell".to_owned()
-            })?;
-            let provider = GroqModelProvider::new(api_key).map_err(|error| error.to_string())?;
-            run_lift_bundle(
-                provider,
-                analysis,
-                semantics,
-                run("groq_hosted_open_weights"),
-            )
+            match env::var("GROQ_API_KEY") {
+                Ok(api_key) => {
+                    let provider =
+                        GroqModelProvider::new(api_key).map_err(|error| error.to_string())?;
+                    run_lift_bundle(
+                        provider,
+                        analysis,
+                        semantics,
+                        run("groq_hosted_open_weights"),
+                    )
+                }
+                Err(_) if options.checkpoint_cache.is_some() => {
+                    eprintln!(
+                        "GROQ_API_KEY is not set; validating lift checkpoints and preserving cache misses as unavailable"
+                    );
+                    run_lift_bundle(
+                        UnavailableHostedProvider,
+                        analysis,
+                        semantics,
+                        run("groq_hosted_open_weights"),
+                    )
+                }
+                Err(_) => Err(
+                    "GROQ_API_KEY is required for --provider groq; create a free Groq key and export it in this shell"
+                        .to_owned(),
+                ),
+            }
         }
     }
 }
@@ -2419,6 +2762,12 @@ fn lift_command(args: Vec<String>) -> ExitCode {
     let artifact_sha256 = read_json::<ArtifactManifest>(&options.directory.join("manifest.json"))
         .ok()
         .map(|manifest| manifest.elf_sha256);
+    let checkpoint_cache = options
+        .cache_dir
+        .as_ref()
+        .map(|directory| LiftCheckpointCache {
+            directory: directory.clone(),
+        });
     let (bundle, repair_records) = match run_selected_lift_bundle(
         &analysis,
         &global_semantics,
@@ -2430,6 +2779,7 @@ fn lift_command(args: Vec<String>) -> ExitCode {
             context_tokens: options.context_tokens,
             function_id: options.function_id.as_deref(),
             repair_rounds: options.repair_rounds,
+            checkpoint_cache: checkpoint_cache.as_ref(),
         },
     ) {
         Ok(result) => result,
@@ -2819,6 +3169,8 @@ struct RemoteOptions {
     repair_requested: bool,
     repair_rounds: usize,
     validation_trace: Option<PathBuf>,
+    resume: bool,
+    cache_dir: Option<PathBuf>,
 }
 
 struct BenchmarkOptions {
@@ -2994,6 +3346,8 @@ impl RemoteOptions {
             repair_requested: false,
             repair_rounds: 2,
             validation_trace: None,
+            resume: false,
+            cache_dir: None,
         };
         let mut provider_explicit = false;
         let mut index = 1;
@@ -3026,6 +3380,14 @@ impl RemoteOptions {
                 index += 1;
                 continue;
             }
+            if flag == "--resume" {
+                if command != "inspect" {
+                    return Err("--resume is only supported by inspect".into());
+                }
+                options.resume = true;
+                index += 1;
+                continue;
+            }
             let Some(value) = args.get(index + 1) else {
                 return Err(format!("missing value for {flag}"));
             };
@@ -3036,6 +3398,9 @@ impl RemoteOptions {
                 }
                 "--cluster" => options.cluster = Some(value.clone()),
                 "--out" => options.output = value.clone(),
+                "--cache-dir" if command == "inspect" => {
+                    options.cache_dir = Some(PathBuf::from(value))
+                }
                 "--commitment" => options.commitment = value.clone(),
                 "--history" => {
                     options.history_limit = value
@@ -3088,6 +3453,12 @@ impl RemoteOptions {
                 }
                 .into(),
             );
+        }
+        if options.cache_dir.is_some() && !options.resume {
+            return Err("--cache-dir requires --resume".into());
+        }
+        if options.resume && options.cache_dir.is_none() {
+            options.cache_dir = Some(PathBuf::from(&options.output).join("lift-checkpoints"));
         }
         if !options.rpc_explicit {
             if let Some(cluster) = options.cluster.as_deref() {
@@ -3298,7 +3669,7 @@ fn usage() -> ExitCode {
     eprintln!("usage: sos artifact-info <path-to-sbf-elf> [--json]");
     eprintln!("       sos manifest <path-to-sbf-elf>");
     eprintln!("       sos fetch <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--commitment LEVEL] [--json]");
-    eprintln!("       sos inspect <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--history N] [--replay] [--signature SIGNATURE] [--provider ollama|groq] [--model MODEL] [--function fn_ID] [--ollama-url URL] [--context-tokens N] [--model-command PATH|--model-endpoint URL] [--validate] [--repair --repair-rounds N] [--validation-trace PATH] [--commitment LEVEL] [--json]");
+    eprintln!("       sos inspect <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--history N] [--replay] [--signature SIGNATURE] [--provider ollama|groq] [--model MODEL] [--function fn_ID] [--resume] [--cache-dir DIR] [--ollama-url URL] [--context-tokens N] [--model-command PATH|--model-endpoint URL] [--validate] [--repair --repair-rounds N] [--validation-trace PATH] [--commitment LEVEL] [--json]");
     eprintln!("       sos analyze <path-to-sbf-elf> [--out DIR]");
     eprintln!("       sos detect <analysis-directory> [--format json|sarif] [--out PATH]");
     eprintln!("       sos validate <analysis-directory> [--compiler PATH|--no-compile] [--trace PATH] [--repair --model-command PATH --repair-rounds N] [--out PATH]");
@@ -3312,7 +3683,7 @@ fn usage() -> ExitCode {
     eprintln!(
         "       sos decompile <analysis-directory> [--format rust-like|c-like|json] [--out PATH]"
     );
-    eprintln!("       sos lift <analysis-directory> [--provider ollama|groq] [--function fn_ID] [--model MODEL] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]");
+    eprintln!("       sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq] [--function fn_ID] [--model MODEL] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]");
     eprintln!("       sos humanize <pseudocode-file> [--plan] [--resume] [--cache-dir DIR] [--provider groq|ollama] [--model MODEL] [--max-units N] [--out PATH] [--audit-out PATH]");
     eprintln!("       sos benchmark <artifact> [--repeats N] [--out PATH]");
     ExitCode::from(2)
@@ -3324,8 +3695,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        run_humanization_units, transaction_account_addresses, BenchmarkOptions, ExplainOptions,
-        HumanizationCache, HumanizeOptions, LiftOptions, LiftProvider, RemoteOptions,
+        run_humanization_units, run_lift_bundle, transaction_account_addresses, BenchmarkOptions,
+        ExplainOptions, HumanizationCache, HumanizeOptions, LiftCheckpointCache, LiftOptions,
+        LiftProvider, LiftRunConfig, RemoteOptions,
     };
     use sos_ai::{AiError, ModelProvider, ModelRequest, ModelResponse};
 
@@ -3411,6 +3783,19 @@ mod tests {
         .unwrap();
         assert_eq!(hosted.provider, LiftProvider::Groq);
         assert_eq!(hosted.model, "openai/gpt-oss-120b");
+
+        let resumed = LiftOptions::parse(vec![
+            "./analysis".into(),
+            "--resume".into(),
+            "--out".into(),
+            "./result".into(),
+        ])
+        .unwrap();
+        assert!(resumed.resume);
+        assert_eq!(
+            resumed.cache_dir,
+            Some(PathBuf::from("./result/checkpoints"))
+        );
     }
 
     #[test]
@@ -3452,6 +3837,24 @@ mod tests {
         .unwrap();
         assert_eq!(options.lift_provider, LiftProvider::Groq);
         assert_eq!(options.model.as_deref(), Some("openai/gpt-oss-120b"));
+
+        let resumed = RemoteOptions::parse(
+            vec![
+                "11111111111111111111111111111111".into(),
+                "--provider".into(),
+                "groq".into(),
+                "--resume".into(),
+                "--out".into(),
+                "./report".into(),
+            ],
+            "inspect",
+        )
+        .unwrap();
+        assert!(resumed.resume);
+        assert_eq!(
+            resumed.cache_dir,
+            Some(PathBuf::from("./report/lift-checkpoints"))
+        );
     }
 
     #[test]
@@ -3634,6 +4037,240 @@ mod tests {
             .any(|source| source == "accepted_humanization:unit_0002"));
         assert!(run.readable_fragments[0].contains("unit_0001"));
         assert!(run.readable_fragments[1].contains("unit_0002"));
+    }
+
+    #[test]
+    fn semantic_lift_processes_callees_first_and_passes_their_recovery_to_callers() {
+        type RecordedStructureRequests = Arc<Mutex<Vec<(usize, Vec<String>)>>>;
+
+        #[derive(Clone)]
+        struct DependencyAwareProvider {
+            requests: RecordedStructureRequests,
+        }
+
+        impl ModelProvider for DependencyAwareProvider {
+            fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
+                let function_id = request.evidence_pack.ir.functions[0].id.clone();
+                let operation_id = request.evidence_pack.ir.operations[0].id.clone();
+                if request.task == sos_ai::ModelTask::StructureRecovery {
+                    self.requests.lock().unwrap().push((
+                        request.evidence_pack.analysis.entrypoint,
+                        request
+                            .evidence_pack
+                            .untrusted_evidence
+                            .iter()
+                            .map(|item| item.source.clone())
+                            .collect(),
+                    ));
+                }
+                let structured_output = match request.task {
+                    sos_ai::ModelTask::StructureRecovery => serde_json::json!({
+                        "functions": [{
+                            "function_id": function_id,
+                            "pseudocode": format!("fn {function_id}() {{}}"),
+                            "evidence": [{
+                                "source": "ir",
+                                "location": format!("operation:{operation_id}"),
+                                "detail": "bounded function operation"
+                            }]
+                        }]
+                    }),
+                    sos_ai::ModelTask::SemanticLabeling => {
+                        serde_json::json!({"labels": []})
+                    }
+                    sos_ai::ModelTask::Explanation => serde_json::json!({
+                        "summary": "bounded function",
+                        "observations": []
+                    }),
+                    sos_ai::ModelTask::Refinement => serde_json::json!({
+                        "schema_version": 1,
+                        "patches": [{
+                            "function_id": function_id,
+                            "replacement": format!("fn {function_id}() {{}}"),
+                            "evidence": [{
+                                "source": "ir",
+                                "location": format!("operation:{operation_id}"),
+                                "detail": "bounded function operation"
+                            }]
+                        }],
+                        "observations": [],
+                        "validation": {"status": "unverified", "notes": []}
+                    }),
+                    sos_ai::ModelTask::PseudocodeHumanization => unreachable!(),
+                };
+                Ok(ModelResponse {
+                    task: request.task,
+                    model: request.model,
+                    prompt_version: request.prompt_version,
+                    structured_output,
+                    evidence: Vec::new(),
+                })
+            }
+        }
+
+        let analysis = sos_analysis::StaticAnalysis {
+            schema_version: 1,
+            sbpf_version: "V0".into(),
+            entrypoint: 0,
+            instructions: vec![
+                sos_analysis::InstructionFact {
+                    pc: 0,
+                    opcode: 0x85,
+                    dst: 0,
+                    src: 0,
+                    offset: 0,
+                    immediate: 1,
+                    assembly: "call 1".into(),
+                },
+                sos_analysis::InstructionFact {
+                    pc: 8,
+                    opcode: 0x95,
+                    dst: 0,
+                    src: 0,
+                    offset: 0,
+                    immediate: 0,
+                    assembly: "exit".into(),
+                },
+            ],
+            functions: vec![
+                sos_analysis::FunctionFact {
+                    pc: 0,
+                    symbol_hash: 0,
+                    name: "caller".into(),
+                },
+                sos_analysis::FunctionFact {
+                    pc: 8,
+                    symbol_hash: 8,
+                    name: "helper".into(),
+                },
+            ],
+            basic_blocks: vec![
+                sos_analysis::BasicBlockFact {
+                    start_pc: 0,
+                    end_instruction_index: 1,
+                    destinations: Vec::new(),
+                    label: "caller".into(),
+                },
+                sos_analysis::BasicBlockFact {
+                    start_pc: 8,
+                    end_instruction_index: 2,
+                    destinations: Vec::new(),
+                    label: "helper".into(),
+                },
+            ],
+            memory_accesses: Vec::new(),
+            stack_accesses: Vec::new(),
+            strings: Vec::new(),
+            public_key_candidates: Vec::new(),
+            immediate_constants: Vec::new(),
+            register_uses: Vec::new(),
+            calls: vec![sos_analysis::CallFact {
+                call_pc: 0,
+                caller_pc: Some(0),
+                kind: "direct_internal_call".into(),
+                target_pc: Some(8),
+                target_symbol_hash: Some(8),
+                status: "resolved".into(),
+            }],
+            relocations: Vec::new(),
+            sccs: Vec::new(),
+            dataflow_edges: Vec::new(),
+            verifier_diagnostics: Vec::new(),
+        };
+        let semantics = sos_solana::analyze(&analysis);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "sos-lift-resume-test-{}-{unique}",
+            std::process::id()
+        ));
+        let cache = LiftCheckpointCache {
+            directory: directory.clone(),
+        };
+        let (bundle, repairs) = run_lift_bundle(
+            DependencyAwareProvider {
+                requests: requests.clone(),
+            },
+            &analysis,
+            &semantics,
+            LiftRunConfig {
+                artifact_sha256: Some("fixture".into()),
+                model: "test",
+                provider_name: "test-provider",
+                function_id: None,
+                repair_rounds: 0,
+                checkpoint_cache: Some(&cache),
+            },
+        )
+        .unwrap();
+        assert_eq!(repairs.len(), 2);
+        assert!(repairs
+            .iter()
+            .all(|record| record["kind"] == "pipeline_checkpoint"));
+        assert_eq!(bundle.stages.len(), 8);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].0, 8);
+        assert!(requests[0].1.is_empty());
+        assert_eq!(requests[1].0, 0);
+        assert!(requests[1]
+            .1
+            .iter()
+            .any(|source| source == "accepted_callee:fn_8"));
+        drop(requests);
+
+        let resumed_requests = Arc::new(Mutex::new(Vec::new()));
+        let (resumed_bundle, resumed_audit) = run_lift_bundle(
+            DependencyAwareProvider {
+                requests: resumed_requests.clone(),
+            },
+            &analysis,
+            &semantics,
+            LiftRunConfig {
+                artifact_sha256: Some("fixture".into()),
+                model: "test",
+                provider_name: "test-provider",
+                function_id: None,
+                repair_rounds: 0,
+                checkpoint_cache: Some(&cache),
+            },
+        )
+        .unwrap();
+        assert_eq!(resumed_bundle.stages.len(), 8);
+        assert!(resumed_requests.lock().unwrap().is_empty());
+        assert!(resumed_audit
+            .iter()
+            .all(|record| record["status"] == "reused"));
+
+        let helper_path = directory.join("fn_8.json");
+        let mut tampered: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&helper_path).unwrap()).unwrap();
+        tampered["request_sha256"] = serde_json::json!("00".repeat(32));
+        std::fs::write(&helper_path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+        let recovery_requests = Arc::new(Mutex::new(Vec::new()));
+        let (_, recovery_audit) = run_lift_bundle(
+            DependencyAwareProvider {
+                requests: recovery_requests.clone(),
+            },
+            &analysis,
+            &semantics,
+            LiftRunConfig {
+                artifact_sha256: Some("fixture".into()),
+                model: "test",
+                provider_name: "test-provider",
+                function_id: None,
+                repair_rounds: 0,
+                checkpoint_cache: Some(&cache),
+            },
+        )
+        .unwrap();
+        assert_eq!(recovery_requests.lock().unwrap().len(), 1);
+        assert_eq!(recovery_audit[0]["status"], "stored");
+        assert_eq!(recovery_audit[1]["status"], "reused");
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

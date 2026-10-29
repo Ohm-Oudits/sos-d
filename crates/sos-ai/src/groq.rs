@@ -201,7 +201,7 @@ fn groq_transport_error(error: ureq::Error, endpoint: &str) -> AiError {
 /// validation.
 pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::Value {
     let (operation_limit, block_limit, prior_limit) = match pack.task {
-        ModelTask::StructureRecovery => (96, 48, 0),
+        ModelTask::StructureRecovery => (96, 48, 2),
         ModelTask::SemanticLabeling => (48, 24, 1),
         ModelTask::Explanation => (24, 12, 2),
         ModelTask::Refinement => (96, 48, 3),
@@ -399,6 +399,20 @@ mod tests {
                     .unwrap()
                     .len()
                     + 512
+        );
+
+        let mut structure_pack = pack;
+        structure_pack.task = ModelTask::StructureRecovery;
+        structure_pack
+            .untrusted_evidence
+            .push(crate::UntrustedEvidence {
+                source: "accepted_callee:fn_8".into(),
+                content: r#"{"functions":[]}"#.into(),
+            });
+        let projection = hosted_model_evidence(&structure_pack);
+        assert_eq!(
+            projection["prior_stage_output_untrusted"][0]["source"],
+            "accepted_callee:fn_8"
         );
     }
 

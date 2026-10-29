@@ -365,6 +365,10 @@ Rules:
 - preserve branch conditions and memory offsets;
 - identify uncertainty;
 - return byte ranges and IR node IDs supporting every statement.
+- process known callees before callers and pass only bounded, accepted callee
+  output as explicitly untrusted context;
+- persist function-level stage bundles only after validation, and rebuild the
+  scoped evidence pack plus dependency context before checkpoint reuse.
 
 #### Agent B: Semantic labeling
 

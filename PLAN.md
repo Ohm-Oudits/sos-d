@@ -73,6 +73,11 @@ Already implemented in this workspace:
 - Address-first `inspect --model` now orchestrates all four AI stages and writes a
   versioned audit bundle with per-stage acceptance, rejection/unavailability,
   prompt/model identity, input hashes, and output hashes.
+- Function-level lifting now follows resolved call dependencies, processes callees
+  before callers, and passes bounded accepted-callee output as untrusted context.
+  `lift` and address-first `inspect` support validated `--resume` checkpoints;
+  every cached four-stage bundle is rebuilt and revalidated against current scoped
+  evidence and dependency context before reuse.
 - Accepted AI output is also rendered to a separate `ai-report.md` projection;
   deterministic reports and pseudocode remain unchanged.
 - A fresh-validator address-first E2E script deploys the hello fixture and verifies
