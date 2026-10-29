@@ -1560,7 +1560,7 @@ fn run_ollama_lift_bundle(
     let config = AiPipelineConfig {
         provider_name: "ollama_local_open_weights".into(),
         model: options.model.into(),
-        prompt_version: "sos-semantic-lift-v2".into(),
+        prompt_version: "sos-semantic-lift-v3".into(),
         artifact_sha256: options.artifact_sha256.clone(),
         limits: EvidencePackLimits::default(),
         max_attempts: 2,
