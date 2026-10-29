@@ -155,12 +155,17 @@ is evidence for one path, not proof of complete behavior.
 
 ### 4.5 AI-assisted decompilation
 
-The AI subsystem is a constrained evidence consumer with four stages:
+The AI subsystem is a constrained evidence consumer with five stages:
 
-1. Structure recovery over bounded IR, producing generic identifiers.
-2. Semantic labeling using IR, strings, known fingerprints, and traces.
-3. Explanation and report generation from verified graph data.
-4. Bounded refinement using schema validation, compilation, and replay comparison.
+1. Signature recovery over bounded ABI, call-site, memory-layout, and type evidence.
+   Directly observed SBPF `r1`-`r5` live-ins must be mapped one-to-one to recovered
+   parameters and cite the exact first-use instruction; inferred names and types
+   remain hypotheses.
+2. Structure recovery over bounded IR, constrained by the signature hypothesis and
+   a required-effect coverage ledger.
+3. Semantic labeling using IR, strings, known fingerprints, and traces.
+4. Explanation and report generation from verified graph data.
+5. Bounded refinement using schema validation, compilation, and replay comparison.
 
 Each stage returns strict JSON. Inputs are tagged as untrusted data, and model output
 cannot alter facts, evidence references, or confidence values directly.
@@ -173,8 +178,8 @@ The local integration uses an explicitly configured subprocess protocol: one JSO
 the same provider-neutral request/response contract over bounded HTTP. The gateway validates
 task and prompt identity, output size, confidence ranges, and evidence references
 before accepting the response. Address-first inspection persists one versioned
-pipeline bundle with separate status and input/output hashes for structure recovery,
-semantic labeling, explanation, and refinement; a failed stage cannot erase accepted
+pipeline bundle with separate status and input/output hashes for signature recovery,
+structure recovery, semantic labeling, explanation, and refinement; a failed stage cannot erase accepted
 results or alter deterministic facts.
 
 Complete-program lifting must use a deterministic call-graph dependency walk:

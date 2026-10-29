@@ -47,8 +47,8 @@ const HUMANIZATION_PROMPT_VERSION: &str = "sos-v1";
 const DETERMINISTIC_HUMANIZER_ID: &str = "sos-deterministic-syntax-v1";
 const HUMANIZATION_CACHE_SCHEMA_VERSION: u32 = 1;
 const HUMANIZATION_CACHE_RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
-const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v3";
-const LIFT_CACHE_SCHEMA_VERSION: u32 = 4;
+const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v4";
+const LIFT_CACHE_SCHEMA_VERSION: u32 = 5;
 const LIFT_CACHE_RECORD_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 fn main() -> ExitCode {
@@ -5321,6 +5321,20 @@ mod tests {
             fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
                 let function_id = request.evidence_pack.ir.functions[0].id.clone();
                 let operation_id = request.evidence_pack.ir.operations[0].id.clone();
+                let required_effects =
+                    sos_ai::required_structure_effects(&request.evidence_pack, &function_id)
+                        .into_iter()
+                        .map(|effect| {
+                            serde_json::json!({
+                                "kind": effect.kind,
+                                "evidence": [{
+                                    "source": "ir",
+                                    "location": effect.location,
+                                    "detail": null
+                                }]
+                            })
+                        })
+                        .collect::<Vec<_>>();
                 if request.task == sos_ai::ModelTask::StructureRecovery {
                     self.requests.lock().unwrap().push((
                         request.evidence_pack.analysis.entrypoint,
@@ -5337,6 +5351,7 @@ mod tests {
                         "functions": [{
                             "function_id": function_id,
                             "pseudocode": format!("fn {function_id}() {{}}"),
+                            "effects": required_effects,
                             "evidence": [{
                                 "source": "ir",
                                 "location": format!("operation:{operation_id}"),
@@ -5500,7 +5515,10 @@ mod tests {
         assert_eq!(bundle.stages.len(), 10);
         let requests = requests.lock().unwrap();
         assert_eq!(requests[0].0, 8);
-        assert!(requests[0].1.is_empty());
+        assert!(requests[0]
+            .1
+            .iter()
+            .any(|source| source == "accepted_model_stage:SignatureRecovery"));
         assert_eq!(requests[1].0, 0);
         assert!(requests[1]
             .1

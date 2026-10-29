@@ -394,11 +394,24 @@ pub fn render_ai_markdown(bundle: &AiPipelineBundle) -> String {
                     response.structured_output.clone(),
                 ) {
                     for function in parsed.functions {
+                        let effects = function
+                            .effects
+                            .iter()
+                            .map(|effect| {
+                                format!(
+                                    "`{:?}` → {}",
+                                    effect.kind,
+                                    render_evidence_refs(&effect.evidence)
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ");
                         output.push_str(&format!(
-                            "### `{}`\n\n```text\n{}\n```\n\nEvidence: {}\n\n",
+                            "### `{}`\n\n```text\n{}\n```\n\nEvidence: {}\n\nEffect coverage: {}\n\n",
                             escape_inline(&function.function_id),
                             sanitize_code_block(&function.pseudocode),
-                            render_evidence_refs(&function.evidence)
+                            render_evidence_refs(&function.evidence),
+                            if effects.is_empty() { "none" } else { &effects }
                         ));
                     }
                 }
@@ -434,9 +447,13 @@ pub fn render_ai_markdown(bundle: &AiPipelineBundle) -> String {
                             .iter()
                             .map(|parameter| {
                                 format!(
-                                    "{}: {}{}",
+                                    "{}: {}{}{}",
                                     escape_inline(&parameter.name),
                                     escape_inline(&parameter.type_name),
+                                    parameter
+                                        .abi_register
+                                        .map(|register| format!(" [ABI r{register}]"))
+                                        .unwrap_or_default(),
                                     parameter
                                         .role
                                         .as_ref()

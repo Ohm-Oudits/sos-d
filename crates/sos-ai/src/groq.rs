@@ -305,6 +305,35 @@ pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::V
         .iter()
         .filter(|candidate| candidate.confidence >= 0.7)
         .collect::<Vec<_>>();
+    let required_effects = if pack.task == ModelTask::StructureRecovery {
+        pack.ir
+            .functions
+            .first()
+            .map(|function| crate::required_structure_effects(pack, &function.id))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let observed_abi_parameters = if pack.task == ModelTask::SignatureRecovery {
+        pack.ir
+            .functions
+            .first()
+            .map(|function| {
+                sos_analysis::observed_abi_parameters(&pack.analysis, function.entry_pc)
+                    .into_iter()
+                    .map(|parameter| {
+                        serde_json::json!({
+                            "register": parameter.register,
+                            "first_use": format!("instruction:0x{:x}", parameter.first_use_pc),
+                            "meaning": "incoming value read on a reachable path before overwrite"
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     serde_json::json!({
         "schema_version": pack.schema_version,
@@ -335,6 +364,8 @@ pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::V
             },
             "strings": pack.analysis.strings.iter().take(32).collect::<Vec<_>>(),
             "public_keys": pack.analysis.public_key_candidates.iter().take(16).collect::<Vec<_>>(),
+            "required_effects": required_effects,
+            "observed_abi_parameters": observed_abi_parameters,
         },
         "solana": {
             "deserializers": bounded_json_array(&pack.semantics.deserialization_candidates, 8),

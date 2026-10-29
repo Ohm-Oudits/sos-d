@@ -191,6 +191,15 @@ pipeline and merge accepted structure/refinement candidates into readable
 Rust-like output. The reviewed default is OpenAI's Apache-2.0 `gpt-oss:20b`
 weights running locally through Ollama:
 
+The stage order follows Patina's dependency discipline: recover the function
+signature first, then reconstruct the body under that interface. Structure
+responses must additionally cover every deterministic store, branch, recursive
+loop, call, and return with an exact IR evidence location. Signature recovery
+is also constrained by a conservative SBPF live-in analysis: every incoming
+`r1`-`r5` value read on a reachable path before overwrite must be mapped to one
+model parameter and cited at its first-use instruction. Names and types remain
+explicit hypotheses; the register mapping is deterministic evidence.
+
 ```bash
 ollama pull gpt-oss:20b
 cargo run -p sos-cli -- lift ./analysis \

@@ -37,7 +37,7 @@ pub use ollama::{trusted_open_model, OllamaModelProvider, OpenModelProfile, TRUS
 pub use openai::OpenAiModelProvider;
 
 pub const AI_SCHEMA_VERSION: u32 = 1;
-pub const AI_BUNDLE_SCHEMA_VERSION: u32 = 3;
+pub const AI_BUNDLE_SCHEMA_VERSION: u32 = 4;
 pub const MIN_STAGE_OUTPUT_TOKENS: usize = 128;
 pub const MAX_STAGE_OUTPUT_TOKENS: usize = 32_768;
 
@@ -54,8 +54,8 @@ pub enum ModelTask {
 
 impl ModelTask {
     pub const ALL: [Self; 5] = [
-        Self::StructureRecovery,
         Self::SignatureRecovery,
+        Self::StructureRecovery,
         Self::SemanticLabeling,
         Self::Explanation,
         Self::Refinement,
@@ -217,7 +217,92 @@ pub struct RecoveredFunction {
     pub function_id: String,
     pub pseudocode: String,
     #[serde(default)]
+    pub effects: Vec<RecoveredEffect>,
+    #[serde(default)]
     pub evidence: Vec<sos_types::EvidenceRef>,
+}
+
+/// Machine-checkable coverage ledger linking a readable reconstruction back
+/// to deterministic binary effects. This is intentionally coarser than a full
+/// MIR/dataflow proof, but unlike prose citations it lets the gateway reject a
+/// candidate that silently drops a branch, write, call, loop, or return.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveredEffect {
+    pub kind: RecoveredEffectKind,
+    #[serde(default)]
+    pub evidence: Vec<sos_types::EvidenceRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveredEffectKind {
+    MemoryWrite,
+    Branch,
+    Loop,
+    Call,
+    Return,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct RequiredEffect {
+    pub kind: RecoveredEffectKind,
+    pub location: String,
+}
+
+pub fn required_structure_effects(pack: &EvidencePack, function_id: &str) -> Vec<RequiredEffect> {
+    let function_blocks = pack
+        .ir
+        .blocks
+        .iter()
+        .filter(|block| block.function_id == function_id)
+        .map(|block| block.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut required = BTreeSet::new();
+    for operation in pack
+        .ir
+        .operations
+        .iter()
+        .filter(|operation| function_blocks.contains(operation.block_id.as_str()))
+    {
+        let kind = if operation
+            .memory_effect
+            .as_deref()
+            .is_some_and(|effect| effect.starts_with("store:"))
+        {
+            Some(RecoveredEffectKind::MemoryWrite)
+        } else if operation.assembly == "exit" {
+            Some(RecoveredEffectKind::Return)
+        } else if operation.kind.contains("call")
+            || operation.kind == "syscall"
+            || operation.assembly.starts_with("call ")
+            || operation.assembly.starts_with("callx ")
+            || operation.assembly.starts_with("syscall ")
+        {
+            Some(RecoveredEffectKind::Call)
+        } else if operation.kind == "control_flow" && operation.assembly.starts_with('j') {
+            Some(RecoveredEffectKind::Branch)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            required.insert(RequiredEffect {
+                kind,
+                location: format!("operation:{}", operation.id),
+            });
+        }
+    }
+    for scc in pack.ir.sccs.iter().filter(|scc| scc.recursive) {
+        for pc in &scc.block_starts {
+            let location = format!("block:bb_{pc:x}");
+            if function_blocks.contains(location.trim_start_matches("block:")) {
+                required.insert(RequiredEffect {
+                    kind: RecoveredEffectKind::Loop,
+                    location,
+                });
+            }
+        }
+    }
+    required.into_iter().collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -241,6 +326,11 @@ pub struct RecoveredParameter {
     pub name: String,
     pub type_name: String,
     pub role: Option<String>,
+    /// SBPF ABI argument register when this parameter maps to a directly
+    /// observed machine-level input. `None` preserves uncertainty for
+    /// source-level parameters that cannot be assigned to an ABI slot.
+    #[serde(default)]
+    pub abi_register: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1572,12 +1662,34 @@ pub fn scope_analysis_to_function(
         .position(|function| function.pc == function_pc)?;
     let next_pc = ordered.get(index + 1).map(|function| function.pc);
     let in_range = |pc: usize| pc >= function_pc && next_pc.is_none_or(|next| pc < next);
+    let instruction_index_base = analysis
+        .instructions
+        .iter()
+        .position(|instruction| instruction.pc >= function_pc)?;
+    let scoped_instruction_count = analysis
+        .instructions
+        .iter()
+        .filter(|instruction| in_range(instruction.pc))
+        .count();
 
     let mut scoped = analysis.clone();
     scoped.entrypoint = function_pc;
     scoped.functions = vec![ordered[index].clone()];
     scoped.instructions.retain(|item| in_range(item.pc));
-    scoped.basic_blocks.retain(|item| in_range(item.start_pc));
+    scoped.basic_blocks.retain_mut(|item| {
+        if !in_range(item.start_pc) {
+            return false;
+        }
+        // Static analysis stores an exclusive index into the whole-program
+        // instruction vector. Rebase it when producing a one-function slice;
+        // otherwise canonical IR construction can make each block consume the
+        // remainder of the function and duplicate operations across blocks.
+        item.end_instruction_index = item
+            .end_instruction_index
+            .saturating_sub(instruction_index_base)
+            .min(scoped_instruction_count);
+        true
+    });
     scoped.memory_accesses.retain(|item| in_range(item.pc));
     scoped.stack_accesses.retain(|item| in_range(item.pc));
     scoped.immediate_constants.retain(|item| in_range(item.pc));
@@ -2908,16 +3020,67 @@ fn validate_structured_consistency(
                         signature.function_id
                     )));
                 }
-                for parameter in signature.parameters {
+                let function_pc = request
+                    .evidence_pack
+                    .ir
+                    .functions
+                    .iter()
+                    .find(|function| function.id == signature.function_id)
+                    .map(|function| function.entry_pc)
+                    .ok_or_else(|| {
+                        AiError::InvalidResponse(format!(
+                            "signature recovery cannot resolve {} entry PC",
+                            signature.function_id
+                        ))
+                    })?;
+                let observed_parameters = sos_analysis::observed_abi_parameters(
+                    &request.evidence_pack.analysis,
+                    function_pc,
+                );
+                let mut mapped_registers = BTreeSet::new();
+                for parameter in &signature.parameters {
                     validate_signature_identifier(&parameter.name, "parameter name")?;
                     validate_signature_type(&parameter.type_name, "parameter type")?;
-                    if let Some(role) = parameter.role {
+                    if let Some(register) = parameter.abi_register {
+                        if !(1..=5).contains(&register) {
+                            return Err(AiError::InvalidResponse(format!(
+                                "signature parameter {} maps to invalid SBPF ABI register r{}",
+                                parameter.name, register
+                            )));
+                        }
+                        if !mapped_registers.insert(register) {
+                            return Err(AiError::InvalidResponse(format!(
+                                "signature for {} maps multiple parameters to r{}",
+                                signature.function_id, register
+                            )));
+                        }
+                    }
+                    if let Some(role) = &parameter.role {
                         if role.len() > 128 || role.chars().any(|character| character.is_control())
                         {
                             return Err(AiError::InvalidResponse(
                                 "signature parameter role is not bounded plain text".into(),
                             ));
                         }
+                    }
+                }
+                for observed in observed_parameters {
+                    if !mapped_registers.contains(&observed.register) {
+                        return Err(AiError::InvalidResponse(format!(
+                            "signature for {} omits observed SBPF ABI input r{}",
+                            signature.function_id, observed.register
+                        )));
+                    }
+                    let expected_location = format!("instruction:0x{:x}", observed.first_use_pc);
+                    if !signature
+                        .evidence
+                        .iter()
+                        .any(|evidence| evidence.location == expected_location)
+                    {
+                        return Err(AiError::InvalidResponse(format!(
+                            "signature for {} must cite {} for observed SBPF ABI input r{}",
+                            signature.function_id, expected_location, observed.register
+                        )));
                     }
                 }
             }
@@ -2990,6 +3153,34 @@ fn validate_structure_candidate(
         return Err(AiError::InvalidResponse(format!(
             "structure candidate for {} must preserve the IR identity with `{declaration}`",
             function.function_id
+        )));
+    }
+    let required_effects =
+        required_structure_effects(&request.evidence_pack, &function.function_id);
+    let mut covered_effects = BTreeSet::new();
+    for effect in &function.effects {
+        if effect.evidence.is_empty() {
+            return Err(AiError::InvalidResponse(format!(
+                "structure candidate for {} has an effect without evidence",
+                function.function_id
+            )));
+        }
+        for evidence in &effect.evidence {
+            if evidence.source == "ir" {
+                covered_effects.insert((effect.kind, evidence.location.clone()));
+            }
+        }
+    }
+    let missing_effects = required_effects
+        .iter()
+        .filter(|required| !covered_effects.contains(&(required.kind, required.location.clone())))
+        .map(|required| format!("{:?}:{}", required.kind, required.location))
+        .collect::<Vec<_>>();
+    if !missing_effects.is_empty() {
+        return Err(AiError::InvalidResponse(format!(
+            "structure candidate for {} omits required binary effects: {}",
+            function.function_id,
+            missing_effects.join(", ")
         )));
     }
     let function_blocks = request
@@ -3100,6 +3291,15 @@ fn structured_evidence_refs(
                     )));
                 }
                 validate_readable_candidate(&function.pseudocode, &function.function_id)?;
+                for effect in function.effects {
+                    if effect.evidence.is_empty() {
+                        return Err(AiError::InvalidResponse(format!(
+                            "recovered effect for {} has no evidence",
+                            function.function_id
+                        )));
+                    }
+                    references.extend(effect.evidence);
+                }
                 references.extend(function.evidence);
             }
         }
@@ -3920,14 +4120,14 @@ mod tests {
             *requests.lock().unwrap(),
             vec![
                 (
-                    ModelTask::StructureRecovery,
-                    "structure-model".into(),
-                    2_000
-                ),
-                (
                     ModelTask::SignatureRecovery,
                     "signature-model".into(),
                     1_000
+                ),
+                (
+                    ModelTask::StructureRecovery,
+                    "structure-model".into(),
+                    2_000
                 ),
                 (ModelTask::SemanticLabeling, "semantic-model".into(), 800),
                 (ModelTask::Explanation, "default-model".into(), 400),
@@ -4146,7 +4346,8 @@ mod tests {
                 "parameters": [{
                     "name": "instruction_data",
                     "type_name": "&[u8]",
-                    "role": "serialized instruction input"
+                    "role": "serialized instruction input",
+                    "abi_register": null
                 }],
                 "confidence": 0.6,
                 "evidence": [{"source": "ir", "location": "function:fn_0"}]
@@ -4160,6 +4361,57 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn signature_recovery_must_map_observed_abi_inputs() {
+        let mut analysis = empty_pack().analysis;
+        analysis.instructions[0] = InstructionFact {
+            pc: 0,
+            opcode: 0x79,
+            dst: 6,
+            src: 1,
+            offset: 0,
+            immediate: 0,
+            assembly: "ldxdw r6, [r1]".into(),
+        };
+        let semantics = sos_solana::analyze(&analysis);
+        let pack =
+            EvidencePack::from_analysis(ModelTask::SignatureRecovery, None, analysis, semantics);
+        let request = ModelRequest {
+            task: ModelTask::SignatureRecovery,
+            prompt_version: "v1".into(),
+            model: "test".into(),
+            evidence_pack: pack,
+            max_output_bytes: 10_000,
+            max_output_tokens: 1_200,
+        };
+        let mut output = serde_json::json!({
+            "signatures": [{
+                "function_id": "fn_0",
+                "function_name": "unknown_fn_0",
+                "return_type": "unknown_return",
+                "parameters": [{
+                    "name": "arg_r1",
+                    "type_name": "unknown_ptr",
+                    "role": null,
+                    "abi_register": 1
+                }],
+                "confidence": 0.4,
+                "evidence": [{
+                    "source": "analysis",
+                    "location": "instruction:0x0",
+                    "detail": null
+                }]
+            }]
+        });
+        assert!(validate_structured_consistency(&request, &output).is_ok());
+
+        output["signatures"][0]["parameters"][0]["abi_register"] = serde_json::Value::Null;
+        let error = validate_structured_consistency(&request, &output).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("omits observed SBPF ABI input r1"));
     }
 
     #[test]
@@ -4222,6 +4474,80 @@ mod tests {
             };
             assert!(validate_structured_consistency(&request, &output).is_err());
         }
+    }
+
+    #[test]
+    fn structure_recovery_must_cover_deterministic_effect_contract() {
+        let mut pack = empty_pack();
+        pack.task = ModelTask::StructureRecovery;
+        pack.ir.operations[0].kind = "store".into();
+        pack.ir.operations[0].assembly = "stxdw [r1+0x0], r2".into();
+        pack.ir.operations[0].memory_effect = Some("store:8:1+0".into());
+        pack.ir.operations.push(sos_analysis::IrOperation {
+            id: "op_1".into(),
+            block_id: "bb_0".into(),
+            pc: 1,
+            kind: "control_flow".into(),
+            assembly: "jne r3, 0, lbb_0".into(),
+            dst: 3,
+            src: 0,
+            offset: -1,
+            immediate: 0,
+            memory_effect: None,
+            call_target_pc: None,
+        });
+        pack.ir.operations.push(sos_analysis::IrOperation {
+            id: "op_2".into(),
+            block_id: "bb_0".into(),
+            pc: 2,
+            kind: "raw".into(),
+            assembly: "exit".into(),
+            dst: 0,
+            src: 0,
+            offset: 0,
+            immediate: 0,
+            memory_effect: None,
+            call_target_pc: None,
+        });
+        pack.ir.sccs = vec![sos_analysis::SccFact {
+            id: 0,
+            block_starts: vec![0],
+            recursive: true,
+        }];
+        let request = ModelRequest {
+            task: ModelTask::StructureRecovery,
+            prompt_version: "v1".into(),
+            model: "test".into(),
+            evidence_pack: pack,
+            max_output_bytes: 10_000,
+            max_output_tokens: 1_200,
+        };
+        let effect = |kind: &str, location: &str| {
+            serde_json::json!({
+                "kind": kind,
+                "evidence": [{"source": "ir", "location": location, "detail": null}]
+            })
+        };
+        let valid = serde_json::json!({"functions": [{
+            "function_id": "fn_0",
+            "pseudocode": "fn fn_0() { loop { unknown_memory_write(); if unknown_condition() { break; } } }",
+            "effects": [
+                effect("memory_write", "operation:op_0"),
+                effect("branch", "operation:op_1"),
+                effect("loop", "block:bb_0"),
+                effect("return", "operation:op_2")
+            ],
+            "evidence": [{"source": "ir", "location": "function:fn_0", "detail": null}]
+        }]});
+        assert!(validate_structured_consistency(&request, &valid).is_ok());
+
+        let mut missing_write = valid;
+        missing_write["functions"][0]["effects"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        let error = validate_structured_consistency(&request, &missing_write).unwrap_err();
+        assert!(error.to_string().contains("MemoryWrite:operation:op_0"));
     }
 
     #[test]
@@ -4537,6 +4863,11 @@ mod tests {
         assert_eq!(second.functions[0].name, "helper");
         assert_eq!(second.instructions.len(), 1);
         assert_eq!(second.instructions[0].pc, 8);
+        assert_eq!(second.basic_blocks[0].end_instruction_index, 1);
+        let second_ir = build_canonical_ir(&second);
+        assert_eq!(second_ir.operations.len(), 1);
+        assert_eq!(second_ir.operations[0].pc, 8);
+        assert_eq!(second_ir.operations[0].block_id, "bb_8");
     }
 
     #[test]

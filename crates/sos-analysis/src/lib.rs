@@ -1,7 +1,7 @@
 //! Deterministic analysis pipeline contracts.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashSet, VecDeque},
     fmt,
     ptr::NonNull,
     sync::Arc,
@@ -195,6 +195,16 @@ pub struct RegisterUseFact {
     pub value: Option<i64>,
     pub source_pc: Option<usize>,
     pub use_kind: String,
+}
+
+/// A conservative SBPF ABI observation: the function reads this incoming
+/// argument register on a reachable path before overwriting it. This proves a
+/// register-level input exists, but does not claim the original Rust source
+/// type or that optimized-away argument slots did not exist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbiParameterFact {
+    pub register: u8,
+    pub first_use_pc: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1171,6 +1181,195 @@ fn collect_register_uses(
     uses
 }
 
+/// Recover directly observed incoming SBPF argument registers for one function.
+///
+/// The analysis is a forward may-analysis over the function CFG. Registers
+/// r1-r5 begin as potential ABI inputs; a register remains live along a path
+/// until an instruction overwrites it. A direct read while live is evidence
+/// that the corresponding ABI slot is consumed by the function. Calls kill
+/// caller-saved registers but are not themselves treated as reading all five
+/// slots because the callee's arity may be smaller.
+pub fn observed_abi_parameters(
+    analysis: &StaticAnalysis,
+    function_pc: usize,
+) -> Vec<AbiParameterFact> {
+    let mut functions = analysis
+        .functions
+        .iter()
+        .map(|item| item.pc)
+        .collect::<Vec<_>>();
+    functions.sort_unstable();
+    let Some(function_index) = functions.iter().position(|pc| *pc == function_pc) else {
+        return Vec::new();
+    };
+    let next_function_pc = functions.get(function_index + 1).copied();
+    let in_function =
+        |pc: usize| pc >= function_pc && next_function_pc.is_none_or(|next_pc| pc < next_pc);
+
+    let mut block_starts = analysis
+        .basic_blocks
+        .iter()
+        .filter(|block| in_function(block.start_pc))
+        .map(|block| block.start_pc)
+        .collect::<Vec<_>>();
+    block_starts.sort_unstable();
+    block_starts.dedup();
+    if !block_starts.contains(&function_pc) {
+        return Vec::new();
+    }
+
+    let blocks = analysis
+        .basic_blocks
+        .iter()
+        .filter(|block| in_function(block.start_pc))
+        .map(|block| (block.start_pc, block))
+        .collect::<BTreeMap<_, _>>();
+    let mut incoming = BTreeMap::<usize, u8>::new();
+    let mut queue = VecDeque::new();
+    // Bits correspond directly to SBPF registers; r1-r5 are argument slots.
+    incoming.insert(function_pc, 0b00_111110);
+    queue.push_back(function_pc);
+    let mut first_uses = BTreeMap::<u8, usize>::new();
+
+    while let Some(block_pc) = queue.pop_front() {
+        let Some(block) = blocks.get(&block_pc) else {
+            continue;
+        };
+        let mut live = incoming.get(&block_pc).copied().unwrap_or_default();
+        let next_block_pc = block_starts
+            .iter()
+            .copied()
+            .find(|candidate| *candidate > block_pc);
+
+        for instruction in analysis.instructions.iter().filter(|instruction| {
+            instruction.pc >= block_pc
+                && next_block_pc.is_none_or(|next_pc| instruction.pc < next_pc)
+                && in_function(instruction.pc)
+        }) {
+            let (reads, writes, kills_callers) = instruction_register_effects(instruction);
+            for register in reads {
+                if (1..=5).contains(&register) && live & (1 << register) != 0 {
+                    first_uses
+                        .entry(register)
+                        .and_modify(|pc| *pc = (*pc).min(instruction.pc))
+                        .or_insert(instruction.pc);
+                }
+            }
+            for register in writes {
+                if register <= 5 {
+                    live &= !(1 << register);
+                }
+            }
+            if kills_callers {
+                live &= !0b00_111110;
+            }
+        }
+
+        for successor in block
+            .destinations
+            .iter()
+            .copied()
+            .filter(|pc| blocks.contains_key(pc))
+        {
+            let state = incoming.entry(successor).or_default();
+            let merged = *state | live;
+            if merged != *state {
+                *state = merged;
+                queue.push_back(successor);
+            }
+        }
+    }
+
+    first_uses
+        .into_iter()
+        .map(|(register, first_use_pc)| AbiParameterFact {
+            register,
+            first_use_pc,
+        })
+        .collect()
+}
+
+fn instruction_register_effects(instruction: &InstructionFact) -> (Vec<u8>, Vec<u8>, bool) {
+    use solana_sbpf::ebpf;
+
+    if let Some(access) = memory_access(instruction) {
+        return if access.kind == "load" {
+            (vec![access.base_register], vec![instruction.dst], false)
+        } else {
+            let mut reads = vec![access.base_register];
+            if let Some(register) = access.value_register {
+                reads.push(register);
+            }
+            (reads, Vec::new(), false)
+        };
+    }
+    if instruction.opcode == ebpf::LD_DW_IMM {
+        return (Vec::new(), vec![instruction.dst], false);
+    }
+
+    let class = instruction.opcode & ebpf::BPF_CLS_MASK;
+    let operation = instruction.opcode & ebpf::BPF_ALU_OP_MASK;
+    let register_source = instruction.opcode & ebpf::BPF_X != 0;
+    match class {
+        ebpf::BPF_LDX => (vec![instruction.src], vec![instruction.dst], false),
+        ebpf::BPF_ST => (vec![instruction.dst], Vec::new(), false),
+        ebpf::BPF_STX => (vec![instruction.dst, instruction.src], Vec::new(), false),
+        ebpf::BPF_ALU32_LOAD | ebpf::BPF_ALU64_STORE => {
+            let mut reads = Vec::new();
+            if operation != ebpf::BPF_MOV {
+                reads.push(instruction.dst);
+            }
+            if register_source {
+                reads.push(instruction.src);
+            }
+            (reads, vec![instruction.dst], false)
+        }
+        ebpf::BPF_JMP64 => jump_register_effects(instruction, operation, register_source),
+        // In current SBPF this class is shared by 32-bit jumps and PQR
+        // arithmetic. The disassembler spelling safely separates the two for
+        // this conservative use analysis.
+        ebpf::BPF_JMP32 => {
+            if instruction.assembly.starts_with('j') {
+                jump_register_effects(instruction, operation, register_source)
+            } else {
+                let mut reads = vec![instruction.dst];
+                if register_source {
+                    reads.push(instruction.src);
+                }
+                (reads, vec![instruction.dst], false)
+            }
+        }
+        _ => (Vec::new(), Vec::new(), false),
+    }
+}
+
+fn jump_register_effects(
+    instruction: &InstructionFact,
+    operation: u8,
+    register_source: bool,
+) -> (Vec<u8>, Vec<u8>, bool) {
+    use solana_sbpf::ebpf;
+
+    match operation {
+        ebpf::BPF_JA => (Vec::new(), Vec::new(), false),
+        ebpf::BPF_CALL => (Vec::new(), Vec::new(), true),
+        ebpf::BPF_EXIT => {
+            if instruction.assembly.starts_with("syscall ") {
+                (Vec::new(), vec![0], true)
+            } else {
+                (vec![0], Vec::new(), false)
+            }
+        }
+        _ => {
+            let mut reads = vec![instruction.dst];
+            if register_source {
+                reads.push(instruction.src);
+            }
+            (reads, Vec::new(), false)
+        }
+    }
+}
+
 fn writes_register(opcode: u8) -> bool {
     matches!(opcode & 0x07, 0x01 | 0x04 | 0x06 | 0x07)
 }
@@ -1722,6 +1921,77 @@ mod static_tests {
         assert_eq!(ir.blocks[0].id, "bb_0");
         assert_eq!(ir.blocks[0].successors, vec!["bb_0"]);
         assert_eq!(ir.operations[0].id, "op_0");
+    }
+
+    #[test]
+    fn observes_reachable_abi_reads_before_overwrite() {
+        use solana_sbpf::ebpf;
+
+        let instruction = |pc, opcode, dst, src, assembly: &str| InstructionFact {
+            pc,
+            opcode,
+            dst,
+            src,
+            offset: 0,
+            immediate: 0,
+            assembly: assembly.into(),
+        };
+        let analysis = StaticAnalysis {
+            schema_version: sos_types::ANALYSIS_SCHEMA_VERSION,
+            sbpf_version: "V0".into(),
+            entrypoint: 0,
+            instructions: vec![
+                instruction(0, ebpf::MOV64_REG, 6, 1, "mov64 r6, r1"),
+                instruction(1, ebpf::MOV64_IMM, 2, 0, "mov64 r2, 0"),
+                instruction(2, ebpf::JA, 0, 0, "ja +0"),
+                instruction(3, ebpf::ST_DW_REG, 3, 2, "stxdw [r3], r2"),
+                instruction(4, ebpf::EXIT, 0, 0, "exit"),
+            ],
+            functions: vec![FunctionFact {
+                pc: 0,
+                symbol_hash: 0,
+                name: "helper".into(),
+            }],
+            basic_blocks: vec![
+                BasicBlockFact {
+                    start_pc: 0,
+                    end_instruction_index: 3,
+                    destinations: vec![3],
+                    label: "entry".into(),
+                },
+                BasicBlockFact {
+                    start_pc: 3,
+                    end_instruction_index: 5,
+                    destinations: vec![],
+                    label: "next".into(),
+                },
+            ],
+            memory_accesses: vec![],
+            stack_accesses: vec![],
+            strings: vec![],
+            public_key_candidates: vec![],
+            immediate_constants: vec![],
+            register_uses: vec![],
+            calls: vec![],
+            relocations: vec![],
+            sccs: vec![],
+            dataflow_edges: vec![],
+            verifier_diagnostics: vec![],
+        };
+
+        assert_eq!(
+            observed_abi_parameters(&analysis, 0),
+            vec![
+                AbiParameterFact {
+                    register: 1,
+                    first_use_pc: 0,
+                },
+                AbiParameterFact {
+                    register: 3,
+                    first_use_pc: 3,
+                },
+            ]
+        );
     }
 
     #[test]

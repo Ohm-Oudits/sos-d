@@ -30,7 +30,8 @@ The design adapts two public reverse-engineering workflows:
 ```text
 ELF/SBPF facts
   -> canonical IR and Solana semantics
-  -> structure recovery (readable control flow)
+  -> signature recovery (bounded interface hypothesis)
+  -> structure recovery (readable control flow + required-effect coverage)
   -> semantic labeling (accounts, types, CPI, PDA, checks)
   -> security-oriented explanation
   -> source refinement
@@ -41,7 +42,22 @@ ELF/SBPF facts
 Accepted output from one model stage is passed to the next as explicitly tagged
 untrusted context. It never replaces deterministic evidence. Every generated
 function must target a known IR function and cite valid instruction, block,
-operation, memory, or read-only-data evidence.
+operation, memory, or read-only-data evidence. Signature recovery runs before
+body reconstruction, following Patina's key dependency: the body agent receives
+the accepted interface hypothesis instead of inventing an interface while
+rewriting control flow. Structure output also includes a machine-checkable
+effect ledger. Every deterministic store, branch, recursive CFG loop, call, and
+return in the scoped IR must be covered by a matching exact IR location; prose
+citations alone cannot satisfy this contract.
+
+Before accepting a signature, SOS runs a conservative forward live-in analysis
+over the scoped SBPF CFG. Argument registers `r1` through `r5` begin as possible
+inputs; a direct read on a reachable path before overwrite creates an observed
+ABI obligation. The model must map each obligation to exactly one parameter and
+cite its first-use instruction. Calls are treated as clobbering caller-saved
+registers but are not assumed to consume all five arguments, avoiding invented
+arity. This is a lower bound on the machine ABI, not proof of the original Rust
+signature or its source-level types.
 
 ## Reviewed open-weight model
 
@@ -104,7 +120,7 @@ The default `--model` can be overridden independently with
 validation rejects any bundle created with a different stage assignment.
 The parallel `--structure-tokens`, `--signature-tokens`, `--semantic-tokens`,
 `--explanation-tokens`, and `--refinement-tokens` flags bound generated output;
-the selected budget is sent to the provider, recorded in AI bundle schema v3,
+the selected budget is sent to the provider, recorded in AI bundle schema v4,
 and included in checkpoint validation.
 The local GPT-OSS adapter selects Ollama's `low` reasoning mode so reasoning
 tokens leave room for final schema-constrained JSON. Structure and signature
