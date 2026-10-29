@@ -22,15 +22,19 @@ use sos_analysis::{
 use sos_solana::SemanticAnalysis;
 use sos_types::{EvidenceItem, EvidenceStatus, ANALYSIS_SCHEMA_VERSION};
 
+mod anthropic;
 mod cloudflare;
 mod groq;
 mod huggingface;
 mod ollama;
+mod openai;
 
+pub use anthropic::{AnthropicModelProvider, ANTHROPIC_API_VERSION};
 pub use cloudflare::{CloudflareModelProvider, CLOUDFLARE_GPT_OSS_120B};
 pub use groq::{GroqModelProvider, GROQ_GPT_OSS_120B};
 pub use huggingface::{HuggingFaceModelProvider, HUGGING_FACE_GPT_OSS_120B};
 pub use ollama::{trusted_open_model, OllamaModelProvider, OpenModelProfile, TRUSTED_OPEN_MODELS};
+pub use openai::OpenAiModelProvider;
 
 pub const AI_SCHEMA_VERSION: u32 = 1;
 pub const AI_BUNDLE_SCHEMA_VERSION: u32 = 1;
@@ -193,6 +197,28 @@ pub struct PseudocodeUnit {
     pub source: String,
     pub function_name: Option<String>,
     pub referenced_functions: Vec<String>,
+}
+
+/// Evidence-preserving syntax normalization used when semantic model inference
+/// is unavailable or rejected. This deliberately does not claim recovered
+/// types or behavior: it only rewrites recognized decompiler syntax and keeps
+/// every unrecognized source line visible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeterministicHumanization {
+    pub schema_version: u32,
+    pub pseudocode: String,
+    pub transformed_lines: usize,
+    pub preserved_lines: usize,
+    pub line_mappings: Vec<DeterministicLineMapping>,
+    pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeterministicLineMapping {
+    pub source_line: usize,
+    pub kind: String,
+    pub source: String,
+    pub output: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -725,6 +751,566 @@ fn contains_pseudocode_call(source: &str, function_name: &str) -> bool {
     source.contains(&needle) || source.contains(&spaced)
 }
 
+/// Produce a deterministic pseudo-Rust baseline without invoking a model.
+/// Recognized syntax is normalized, while unknown syntax is retained as an
+/// explicit comment. Every emitted line carries its original global line
+/// number and the audit mapping retains the exact source text.
+pub fn deterministic_humanize_pseudocode_unit(
+    unit: &PseudocodeUnit,
+) -> Result<DeterministicHumanization, AiError> {
+    if unit.start_line == 0 || unit.end_line < unit.start_line {
+        return Err(AiError::InvalidResponse(
+            "pseudocode unit has an invalid line range".into(),
+        ));
+    }
+    let lines = unit
+        .source
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect::<Vec<_>>();
+    if lines.len() != unit.end_line - unit.start_line + 1 {
+        return Err(AiError::InvalidResponse(
+            "pseudocode unit line range does not match its source".into(),
+        ));
+    }
+
+    let mut output = vec![
+        "// SOS deterministic syntax normalization; not original source.".to_owned(),
+        "// Types and pointer helpers are unverified readability aids; inspect source-line evidence.".to_owned(),
+    ];
+    let mut line_mappings = Vec::with_capacity(lines.len());
+    let mut transformed_lines = 0_usize;
+    let mut preserved_lines = 0_usize;
+    for (index, source) in lines.iter().enumerate() {
+        let source_line = unit.start_line + index;
+        let normalized = normalize_pseudocode_line(source);
+        if normalized.transformed {
+            transformed_lines += 1;
+        } else if normalized.kind == "untranslated" {
+            preserved_lines += 1;
+        }
+        if normalized.output.is_empty() {
+            output.push(String::new());
+        } else {
+            output.push(format!(
+                "{} // source line {}",
+                normalized.output, source_line
+            ));
+        }
+        line_mappings.push(DeterministicLineMapping {
+            source_line,
+            kind: normalized.kind.into(),
+            source: (*source).into(),
+            output: normalized.output,
+        });
+    }
+
+    Ok(DeterministicHumanization {
+        schema_version: 1,
+        pseudocode: output.join("\n"),
+        transformed_lines,
+        preserved_lines,
+        line_mappings,
+        limitations: vec![
+            "syntax normalization does not prove recovered types, names, control flow, or behavior"
+                .into(),
+            "read_*/write_* helpers describe decompiler pointer syntax and are not runtime implementations"
+                .into(),
+            "untranslated lines remain comments so source evidence is never silently discarded".into(),
+        ],
+    })
+}
+
+struct LineNormalization {
+    kind: &'static str,
+    output: String,
+    transformed: bool,
+}
+
+fn normalize_pseudocode_line(source: &str) -> LineNormalization {
+    let indentation = source
+        .chars()
+        .take_while(|character| character.is_whitespace())
+        .map(|character| if character == '\t' { "    " } else { " " })
+        .collect::<String>();
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return normalized_line("blank", String::new(), false);
+    }
+    if trimmed == "{" || trimmed == "}" || trimmed == "};" {
+        return normalized_line(
+            "brace",
+            format!("{indentation}{}", trimmed.trim_end_matches(';')),
+            true,
+        );
+    }
+    if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with("* ") {
+        return normalized_line(
+            "comment",
+            format!("{indentation}// {}", trimmed.trim_start_matches('/').trim()),
+            true,
+        );
+    }
+    if let Some(signature) = normalize_function_signature(trimmed) {
+        return normalized_line(
+            "function_signature",
+            format!("{indentation}{signature}"),
+            true,
+        );
+    }
+    if let Some(declaration) = normalize_local_declaration(trimmed) {
+        return normalized_line(
+            "local_declaration",
+            format!("{indentation}{declaration}"),
+            true,
+        );
+    }
+    if let Some(control) = normalize_parenthesized_control(trimmed, "if") {
+        return normalized_line("guard", format!("{indentation}{control}"), true);
+    }
+    if let Some(control) = normalize_parenthesized_control(trimmed, "while") {
+        return normalized_line("loop_guard", format!("{indentation}{control}"), true);
+    }
+    if trimmed == "else" || trimmed == "else {" || trimmed == "} else {" {
+        return normalized_line("control", format!("{indentation}{trimmed}"), true);
+    }
+    if let Some(value) = trimmed.strip_prefix("return") {
+        let value = value.trim();
+        if value.is_empty() || value == ";" {
+            return normalized_line("return", format!("{indentation}return;"), true);
+        }
+        return normalized_line(
+            "return",
+            format!(
+                "{indentation}return {};",
+                normalize_pseudocode_expression(value.trim_end_matches(';').trim())
+            ),
+            true,
+        );
+    }
+    if trimmed.starts_with("goto ")
+        || trimmed.starts_with("switch")
+        || (trimmed.ends_with(':') && !trimmed.contains("::"))
+    {
+        return normalized_line(
+            "untranslated",
+            format!("{indentation}// untranslated control flow: {trimmed}"),
+            false,
+        );
+    }
+    if let Some(statement) = normalize_assignment_or_call(trimmed) {
+        return normalized_line("statement", format!("{indentation}{statement}"), true);
+    }
+    normalized_line(
+        "untranslated",
+        format!("{indentation}// untranslated: {trimmed}"),
+        false,
+    )
+}
+
+fn normalized_line(kind: &'static str, output: String, transformed: bool) -> LineNormalization {
+    LineNormalization {
+        kind,
+        output,
+        transformed,
+    }
+}
+
+fn normalize_function_signature(source: &str) -> Option<String> {
+    let open = source.find('(')?;
+    let close = matching_parenthesis(source, open)?;
+    let trailing = source[close + 1..].trim();
+    if !trailing.is_empty() && trailing != "{" {
+        return None;
+    }
+    let prefix = source[..open].trim();
+    if prefix.contains('=') {
+        return None;
+    }
+    let name_start = trailing_identifier_start(prefix)?;
+    let name = prefix[name_start..].trim();
+    if !is_identifier(name)
+        || matches!(
+            name.to_ascii_lowercase().as_str(),
+            "if" | "for" | "while" | "switch" | "match" | "catch"
+        )
+    {
+        return None;
+    }
+    let return_type = prefix[..name_start].trim();
+    if return_type.is_empty() {
+        return None;
+    }
+    let arguments = split_top_level(&source[open + 1..close], ',')
+        .into_iter()
+        .filter(|argument| !argument.trim().is_empty() && argument.trim() != "void")
+        .map(normalize_function_argument)
+        .collect::<Option<Vec<_>>>()?;
+    let result = normalize_declared_type(return_type)
+        .unwrap_or_else(|| sanitize_type_identifier(return_type));
+    let result = if result == "void" {
+        String::new()
+    } else {
+        format!(" -> {result}")
+    };
+    Some(format!(
+        "pub unsafe fn {name}({}){result}{}",
+        arguments.join(", "),
+        if trailing == "{" { " {" } else { "" }
+    ))
+}
+
+fn normalize_function_argument(argument: &str) -> Option<String> {
+    let argument = argument.trim();
+    let name_start = trailing_identifier_start(argument)?;
+    let name = argument[name_start..].trim();
+    if !is_identifier(name) {
+        return None;
+    }
+    let raw_type = argument[..name_start].trim();
+    let pointer_depth = raw_type.matches('*').count();
+    let base = normalize_declared_type(raw_type)
+        .unwrap_or_else(|| sanitize_type_identifier(raw_type.trim_matches('*').trim()));
+    let normalized_type = (0..pointer_depth).fold(base, |inner, _| format!("*mut {inner}"));
+    Some(format!("{name}: {normalized_type}"))
+}
+
+fn normalize_local_declaration(source: &str) -> Option<String> {
+    let body = source.strip_suffix(';')?.trim();
+    let assignment = top_level_assignment(body);
+    let declaration = assignment.map_or(body, |index| body[..index].trim());
+    let name_start = trailing_identifier_start(declaration)?;
+    let name = declaration[name_start..].trim();
+    if !is_identifier(name) {
+        return None;
+    }
+    let raw_type = declaration[..name_start].trim();
+    let pointer_depth = raw_type.matches('*').count();
+    let base = normalize_declared_type(raw_type)?;
+    let normalized_type = (0..pointer_depth).fold(base, |inner, _| format!("*mut {inner}"));
+    let initializer = assignment.map(|index| body[index + 1..].trim());
+    Some(match initializer {
+        Some(value) => format!(
+            "let mut {name}: {normalized_type} = {};",
+            normalize_pseudocode_expression(value)
+        ),
+        None => format!("let mut {name}: {normalized_type};"),
+    })
+}
+
+fn normalize_parenthesized_control(source: &str, keyword: &str) -> Option<String> {
+    let rest = source.strip_prefix(keyword)?.trim_start();
+    if !rest.starts_with('(') {
+        return None;
+    }
+    let close = matching_parenthesis(rest, 0)?;
+    let trailing = rest[close + 1..].trim();
+    if !trailing.is_empty() && trailing != "{" {
+        return None;
+    }
+    Some(format!(
+        "{keyword} {}{}",
+        normalize_pseudocode_expression(rest[1..close].trim()),
+        if trailing == "{" { " {" } else { "" }
+    ))
+}
+
+fn normalize_assignment_or_call(source: &str) -> Option<String> {
+    let body = source.strip_suffix(';')?.trim();
+    if let Some(index) = top_level_assignment(body) {
+        let left = body[..index].trim();
+        let right = body[index + 1..].trim();
+        if let Some(dereference) = parse_cast_dereference(left, 0) {
+            if dereference.end == left.len() {
+                return Some(format!(
+                    "write_{}({}, {});",
+                    dereference.type_name,
+                    normalize_pseudocode_expression(&dereference.address),
+                    normalize_pseudocode_expression(right)
+                ));
+            }
+        }
+        return Some(format!(
+            "{} = {};",
+            normalize_pseudocode_expression(left),
+            normalize_pseudocode_expression(right)
+        ));
+    }
+    if body.contains('(') && body.ends_with(')') {
+        return Some(format!("{};", normalize_pseudocode_expression(body)));
+    }
+    None
+}
+
+fn normalize_pseudocode_expression(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut cursor = 0_usize;
+    while let Some(start) = find_unquoted(source, cursor, "*(") {
+        output.push_str(&source[cursor..start]);
+        if let Some(dereference) = parse_cast_dereference(source, start) {
+            output.push_str(&format!(
+                "read_{}({})",
+                dereference.type_name,
+                normalize_pseudocode_expression(&dereference.address)
+            ));
+            cursor = dereference.end;
+        } else {
+            output.push_str("*(");
+            cursor = start + 2;
+        }
+    }
+    output.push_str(&source[cursor..]);
+    replace_simple_pointer_reads(&output).replace("sol_log_(", "sol_log(")
+}
+
+struct ParsedDereference {
+    end: usize,
+    type_name: String,
+    address: String,
+}
+
+fn parse_cast_dereference(source: &str, start: usize) -> Option<ParsedDereference> {
+    if source.get(start..start + 2)? != "*(" {
+        return None;
+    }
+    let cast_close = matching_parenthesis(source, start + 1)?;
+    let cast = source[start + 2..cast_close].trim();
+    let raw_type = cast.strip_suffix('*')?.trim();
+    let mut address_open = cast_close + 1;
+    while source[address_open..]
+        .chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+    {
+        address_open += source[address_open..].chars().next()?.len_utf8();
+    }
+    if source.get(address_open..address_open + 1)? != "(" {
+        return None;
+    }
+    let address_close = matching_parenthesis(source, address_open)?;
+    let type_name =
+        normalize_declared_type(raw_type).unwrap_or_else(|| sanitize_type_identifier(raw_type));
+    Some(ParsedDereference {
+        end: address_close + 1,
+        type_name,
+        address: source[address_open + 1..address_close].trim().into(),
+    })
+}
+
+fn replace_simple_pointer_reads(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut cursor = 0_usize;
+    while let Some(star) = find_unquoted(source, cursor, "*") {
+        output.push_str(&source[cursor..star]);
+        let next = star + 1;
+        let Some(first) = source[next..].chars().next() else {
+            output.push('*');
+            cursor = next;
+            break;
+        };
+        let previous = source[..star]
+            .chars()
+            .rev()
+            .find(|character| !character.is_whitespace());
+        let unary_context = previous.is_none_or(|character| {
+            matches!(
+                character,
+                '(' | '=' | '!' | '<' | '>' | ',' | '+' | '-' | ':' | '['
+            )
+        });
+        if unary_context && (first.is_ascii_alphabetic() || first == '_') {
+            let identifier_start = next;
+            let scan_start = next + first.len_utf8();
+            let mut end = scan_start;
+            for (offset, character) in source[scan_start..].char_indices() {
+                if character.is_ascii_alphanumeric() || character == '_' {
+                    end = scan_start + offset + character.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            output.push_str(&format!("read_value({})", &source[identifier_start..end]));
+            cursor = end;
+        } else {
+            output.push('*');
+            cursor = next;
+        }
+    }
+    output.push_str(&source[cursor..]);
+    output
+}
+
+fn find_unquoted(source: &str, from: usize, needle: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (relative, character) in source.get(from..)?.char_indices() {
+        let index = from + relative;
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if character == '"' || character == '\'' {
+            quote = Some(character);
+        } else if source[index..].starts_with(needle) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn matching_parenthesis(source: &str, open: usize) -> Option<usize> {
+    if source.get(open..)?.chars().next()? != '(' {
+        return None;
+    }
+    let mut depth = 0_usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (relative, character) in source[open..].char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if character == '"' || character == '\'' {
+            quote = Some(character);
+        } else if character == '(' {
+            depth += 1;
+        } else if character == ')' {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(open + relative);
+            }
+        }
+    }
+    None
+}
+
+fn split_top_level(source: &str, delimiter: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0_usize;
+    let mut depth = 0_usize;
+    for (index, character) in source.char_indices() {
+        match character {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ if character == delimiter && depth == 0 => {
+                parts.push(&source[start..index]);
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&source[start..]);
+    parts
+}
+
+fn top_level_assignment(source: &str) -> Option<usize> {
+    let mut depth = 0_usize;
+    let bytes = source.as_bytes();
+    for (index, character) in source.char_indices() {
+        match character {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '=' if depth == 0 => {
+                let previous = index
+                    .checked_sub(1)
+                    .and_then(|prior| bytes.get(prior))
+                    .copied();
+                let next = bytes.get(index + 1).copied();
+                if !matches!(previous, Some(b'=' | b'!' | b'<' | b'>')) && next != Some(b'=') {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn trailing_identifier_start(source: &str) -> Option<usize> {
+    let trimmed = source.trim_end();
+    let mut start = trimmed.len();
+    for (index, character) in trimmed.char_indices().rev() {
+        if character.is_ascii_alphanumeric() || character == '_' {
+            start = index;
+        } else {
+            break;
+        }
+    }
+    (start < trimmed.len()).then_some(start)
+}
+
+fn is_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+fn normalize_declared_type(raw: &str) -> Option<String> {
+    let normalized = raw
+        .replace('*', " ")
+        .split_whitespace()
+        .filter(|part| !matches!(part.to_ascii_lowercase().as_str(), "const" | "volatile"))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    Some(
+        match normalized.as_str() {
+            "void" => "void",
+            "bool" | "boolean" => "bool",
+            "byte" | "uchar" | "unsigned char" | "uint8_t" | "undefined1" => "u8",
+            "char" | "signed char" | "int8_t" => "i8",
+            "ushort" | "unsigned short" | "uint16_t" | "undefined2" => "u16",
+            "short" | "signed short" | "int16_t" => "i16",
+            "uint" | "unsigned int" | "uint32_t" | "undefined4" => "u32",
+            "int" | "signed int" | "int32_t" => "i32",
+            "ulong" | "unsigned long" | "unsigned long long" | "uint64_t" | "undefined8" => "u64",
+            "long" | "signed long" | "long long" | "signed long long" | "int64_t" => "i64",
+            "size_t" | "usize" => "usize",
+            "ssize_t" | "isize" => "isize",
+            _ => return None,
+        }
+        .into(),
+    )
+}
+
+fn sanitize_type_identifier(raw: &str) -> String {
+    let mut output = raw
+        .trim_matches('*')
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    while output.contains("__") {
+        output = output.replace("__", "_");
+    }
+    let output = output.trim_matches('_');
+    if output.is_empty() {
+        "unknown_type".into()
+    } else {
+        output.into()
+    }
+}
+
 pub fn evidence_pack_from_pseudocode(source: &str) -> Result<EvidencePack, AiError> {
     let units = partition_pseudocode(source)?;
     if units.len() != 1 {
@@ -905,6 +1491,20 @@ pub struct HttpModelProvider {
     bearer_token: Option<String>,
     agent: ureq::Agent,
     max_response_bytes: usize,
+}
+
+impl fmt::Debug for HttpModelProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpModelProvider")
+            .field("endpoint", &self.endpoint)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("max_response_bytes", &self.max_response_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HttpModelProvider {
@@ -3120,6 +3720,17 @@ mod tests {
     }
 
     #[test]
+    fn http_provider_debug_redacts_bearer_token() {
+        let debug = format!(
+            "{:?}",
+            HttpModelProvider::new("https://model.invalid")
+                .with_bearer_token("provider-neutral-secret")
+        );
+        assert!(!debug.contains("provider-neutral-secret"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
     fn gateway_rejects_response_over_output_budget() {
         let gateway = ModelGateway::new(LargeResponseProvider, 10_000, 32);
         let result = gateway.submit(ModelTask::Explanation, "test", "v1", empty_pack());
@@ -3434,5 +4045,98 @@ mod tests {
         assert!(second.ir.operations[0]
             .assembly
             .starts_with("line_0129_part_01:"));
+    }
+
+    #[test]
+    fn deterministic_humanization_normalizes_common_ghidra_constructs() {
+        let source = "undefined8 process_account(long ctx, byte *instruction_data, ulong instruction_len)\n{\n  long account;\n  ulong amount;\n  if (instruction_len < 9) {\n    return 0x100000002;\n  }\n  account = *(long *)(ctx + 0x20);\n  if (*(byte *)(account + 0x08) == 0) {\n    return 5;\n  }\n  if (*instruction_data != 0x2a) {\n    return 0x100000003;\n  }\n  amount = *(ulong *)(instruction_data + 1);\n  *(ulong *)(account + 0x50) = *(ulong *)(account + 0x50) + amount;\n  sol_log_(\"account updated\", 15);\n  return 0;\n}";
+        let unit = partition_pseudocode(source).unwrap().remove(0);
+        let fallback = deterministic_humanize_pseudocode_unit(&unit).unwrap();
+
+        assert!(fallback.pseudocode.contains(
+            "pub unsafe fn process_account(ctx: i64, instruction_data: *mut u8, instruction_len: u64) -> u64"
+        ));
+        assert!(fallback
+            .pseudocode
+            .contains("let mut account: i64; // source line 3"));
+        assert!(fallback
+            .pseudocode
+            .contains("account = read_i64(ctx + 0x20);"));
+        assert!(fallback
+            .pseudocode
+            .contains("if read_u8(account + 0x08) == 0 {"));
+        assert!(fallback
+            .pseudocode
+            .contains("if read_value(instruction_data) != 0x2a {"));
+        assert!(fallback
+            .pseudocode
+            .contains("write_u64(account + 0x50, read_u64(account + 0x50) + amount);"));
+        assert!(fallback
+            .pseudocode
+            .contains("sol_log(\"account updated\", 15);"));
+        assert_eq!(fallback.line_mappings.len(), source.lines().count());
+        assert_eq!(fallback.preserved_lines, 0);
+    }
+
+    #[test]
+    fn deterministic_humanization_preserves_unknown_lines_as_evidence() {
+        let source = "mystery opcode syntax ???";
+        let unit = partition_pseudocode(source).unwrap().remove(0);
+        let fallback = deterministic_humanize_pseudocode_unit(&unit).unwrap();
+        assert!(fallback
+            .pseudocode
+            .contains("// untranslated: mystery opcode syntax ??? // source line 1"));
+        assert_eq!(fallback.transformed_lines, 0);
+        assert_eq!(fallback.preserved_lines, 1);
+        assert_eq!(fallback.line_mappings[0].source, source);
+    }
+
+    #[test]
+    fn deterministic_humanization_matches_checked_account_guard_golden() {
+        let source = include_str!("../../../fixtures/pseudocode/account_guard.txt");
+        let unit = partition_pseudocode(source).unwrap().remove(0);
+        let fallback = deterministic_humanize_pseudocode_unit(&unit).unwrap();
+        assert_eq!(
+            fallback.pseudocode,
+            include_str!("../../../fixtures/pseudocode/account_guard.deterministic.rs")
+        );
+    }
+
+    #[test]
+    fn deterministic_humanization_is_total_over_malformed_textual_units() {
+        let corpus = [
+            "*(u64 *)",
+            "if (unterminated",
+            "λ_value = *(ulong *)(ptr + 1);",
+            "*",
+            "switch(value) {\ncase 1:\n  goto LAB_001;\n}",
+            "void FUN_001(char *message) {\n  mystery<syntax> ???;\n}",
+            "quoted = \"not *(u64 *)(an expression)\";",
+        ];
+        for source in corpus {
+            let units = partition_pseudocode(source).unwrap();
+            for unit in units {
+                let fallback = deterministic_humanize_pseudocode_unit(&unit).unwrap();
+                assert_eq!(
+                    fallback.line_mappings.len(),
+                    unit.end_line - unit.start_line + 1
+                );
+                assert_eq!(
+                    fallback
+                        .line_mappings
+                        .iter()
+                        .map(|mapping| mapping.source.as_str())
+                        .collect::<Vec<_>>(),
+                    unit.source.split('\n').collect::<Vec<_>>()
+                );
+            }
+        }
+        let quoted = partition_pseudocode("quoted = \"not *(u64 *)(an expression)\";")
+            .unwrap()
+            .remove(0);
+        let fallback = deterministic_humanize_pseudocode_unit(&quoted).unwrap();
+        assert!(fallback
+            .pseudocode
+            .contains("quoted = \"not *(u64 *)(an expression)\";"));
     }
 }

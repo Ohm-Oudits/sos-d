@@ -2,6 +2,8 @@
 
 Open-source, read-only Solana program reverse engineering from a deployed program
 address. The architecture is documented in [ARCHITECTURE.md](ARCHITECTURE.md).
+Model-agent credentials, providers, and trust boundaries are documented in
+[docs/AGENT_PROVIDERS.md](docs/AGENT_PROVIDERS.md).
 
 This repository contains native Rust/SBF, low-level native-ABI, and Pinocchio
 fixtures that can be used to test the pipeline across implementation styles:
@@ -283,6 +285,30 @@ Create `HF_TOKEN` with Inference Providers permission. The fixed router is
 `https://router.huggingface.co/v1/chat/completions`; the reviewed default model
 route is `openai/gpt-oss-120b:fireworks-ai`.
 
+OpenAI Responses API and Anthropic Messages API adapters are available when an
+operator wants to supply another agent model. SOS does not choose a mutable
+default for these providers; pass the exact model identity or set its model
+environment variable:
+
+```bash
+export OPENAI_API_KEY='...'
+export SOS_OPENAI_MODEL='your-explicit-model-id'
+sos humanize ./decompiler-output.txt --provider openai --resume
+
+export ANTHROPIC_API_KEY='...'
+export SOS_ANTHROPIC_MODEL='your-explicit-model-id'
+sos inspect <PROGRAM_ADDRESS> \
+  --provider anthropic \
+  --resume \
+  --out ./reports/<PROGRAM_ADDRESS>
+```
+
+These transports are not silently classified as reviewed open weights. Their
+outputs pass the same local schemas, evidence-reference checks, anti-cheese
+rules, and checkpoint validation. See
+[docs/AGENT_PROVIDERS.md](docs/AGENT_PROVIDERS.md) and the empty
+[.env.example](.env.example) placeholders.
+
 Without `--function`, address-first lifting processes the complete recovered
 call graph. Known callees are lifted before callers, and accepted callee
 reconstructions are supplied to the caller as bounded, explicitly untrusted
@@ -295,7 +321,7 @@ stage's provider/model/prompt identity, input and output hashes, strict schema,
 anti-cheese rules, and evidence references before reuse. Invalid checkpoints
 are ignored. Choose a stable directory with `--cache-dir DIR`; no API key is
 stored. Fully cached hosted lifts can be reconstructed without loading a local
-model or setting `GROQ_API_KEY`, `HF_TOKEN`, or Cloudflare credentials.
+model or setting the selected provider credential.
 
 SOS never writes the key into an audit bundle and does not send raw `.so`
 bytes. It sends a bounded projection of canonical IR and recovered Solana
@@ -306,6 +332,17 @@ paces requests for the free developer-tier token limits.
 
 If pseudocode already exists from SOS, Ghidra, IDA, Binary Ninja, or another
 decompiler, use the one-stage humanizer instead of re-running binary analysis:
+
+```bash
+# Guaranteed no model load and no network request:
+sos humanize ./decompiler-output.txt \
+  --deterministic \
+  --out ./readable.rs \
+  --audit-out ./humanize.json
+```
+
+Use a reviewed hosted GPT-OSS provider when semantic renaming and higher-level
+restructuring are desired:
 
 ```bash
 export GROQ_API_KEY='...'
@@ -330,15 +367,24 @@ explicitly untrusted context; deterministic line evidence remains authoritative.
 Dependency units are processed before callers even when file order is reversed,
 then merged back into original source order.
 
+If inference is unavailable or a response fails validation, SOS now emits an
+evidence-preserving deterministic fallback instead of an empty `UNRESOLVED`
+region. The fallback normalizes common Ghidra/IDA C types, guards, returns,
+pointer reads and writes, and calls into explicitly unverified pseudo-Rust. Every
+output line cites its original global line number; unsupported control flow or
+syntax is retained verbatim as an `untranslated` comment and recorded in the
+audit. A checked example is
+[`fixtures/pseudocode/account_guard.deterministic.rs`](fixtures/pseudocode/account_guard.deterministic.rs).
+
 `--resume` writes each accepted unit to a checkpoint directory (by default,
 next to the audit output). On restart, SOS verifies the source, provider, model,
 prompt, unit hash, complete staged evidence-pack hash, output schema,
 anti-cheese rules, and every evidence reference before reuse. Stale or edited
 checkpoints are ignored and recomputed. Use `--cache-dir DIR` with `--resume`
 to choose a stable location. A fully cached hosted run can be reconstructed
-without `GROQ_API_KEY`, `HF_TOKEN`, or Cloudflare credentials; any cache miss
-remains explicitly unresolved until the selected credentials are available. API
-keys and account identifiers are never written to checkpoints.
+without the selected provider credential; any cache miss
+uses the deterministic syntax-only fallback until the selected credentials are
+available. API keys and account identifiers are never written to checkpoints.
 
 Preview decomposition without loading or contacting any model:
 
@@ -346,10 +392,11 @@ Preview decomposition without loading or contacting any model:
 sos humanize ./decompiler-output.txt --plan --audit-out ./humanize-plan.json
 ```
 
-The command writes `readable.rs`, `model.json`, and `ai-report.md`. Generated
-source remains evidence-linked hypothesis material; functions without an accepted
-candidate are marked unresolved. The research basis, trust boundary, and staged
-GoonFi/Patina-derived design are documented in
+`sos humanize` writes the readable source and its JSON audit; address-first
+`sos inspect` additionally writes `model.json` and `ai-report.md`. Generated
+source remains evidence-linked hypothesis material. Functions without an
+accepted model candidate use a clearly labeled deterministic fallback. The
+research basis, trust boundary, and staged GoonFi/Patina-derived design are documented in
 [docs/SEMANTIC_LIFTING.md](docs/SEMANTIC_LIFTING.md).
 
 Run the complete checked fixture demonstration—C/SBF `.so` analysis, scoped
@@ -372,6 +419,8 @@ Ghidra-style pseudocode fixture directly. The provider-independent alternative
 with a daily free allocation is `./scripts/demo-humanize-cloudflare.sh`, using
 Workers AI credentials and no local model. Another fallback is
 `./scripts/demo-humanize-huggingface.sh`, using `HF_TOKEN` and no local model.
+For a completely offline, no-model run use
+`./scripts/demo-humanize-deterministic.sh`.
 
 Hosted providers can implement the same provider-neutral JSON protocol through an
 HTTP endpoint:

@@ -68,6 +68,14 @@ Already implemented in this workspace:
   `@cf/openai/gpt-oss-120b`, with environment-only credentials, native JSON mode,
   bounded hosted evidence, local schema/evidence revalidation, resumable
   provider-bound checkpoints, and access to the documented daily free allocation.
+- Explicit OpenAI Responses API and Anthropic Messages API agent transports with
+  environment-only credentials, operator-selected model IDs, strict structured
+  output, bounded responses, redacted debug state, and the same local evidence
+  and anti-cheese validation used by reviewed open-weight providers.
+- Deterministic no-model pseudocode humanizer for common Ghidra/IDA C syntax,
+  including evidence-linked type spelling, guards, returns, pointer reads/writes,
+  calls, explicit untranslated-line preservation, and an audited fallback path
+  for unavailable or rejected hosted inference.
 - Local model subprocesses have bounded wall-clock execution and convert stalls into
   explicit unavailable stage results.
 - AI gateway exposes bounded retry for transient provider and validation failures;

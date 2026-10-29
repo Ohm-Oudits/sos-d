@@ -8,16 +8,18 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sos_ai::{
-    compile_refinement_output, evidence_pack_from_pseudocode_unit, partition_pseudocode,
-    run_pipeline, run_pipeline_with_context, run_refinement_loop, scope_analysis_to_function,
-    trusted_open_model, unavailable_pipeline_bundle, validate_model_response_for_pack,
+    compile_refinement_output, deterministic_humanize_pseudocode_unit,
+    evidence_pack_from_pseudocode_unit, partition_pseudocode, run_pipeline,
+    run_pipeline_with_context, run_refinement_loop, scope_analysis_to_function, trusted_open_model,
+    unavailable_pipeline_bundle, validate_model_response_for_pack,
     validate_pipeline_bundle_with_context, AiPipelineBundle, AiPipelineConfig, AiStageResult,
-    AiStageStatus, CloudflareModelProvider, CommandModelProvider, CompilationStatus, EvidencePack,
-    EvidencePackLimits, GroqModelProvider, HttpModelProvider, HuggingFaceModelProvider,
-    ModelGateway, ModelProvider, ModelResponse, ModelTask, OllamaModelProvider, PseudocodeUnit,
-    RefinementFeedback, RefinementLoopResult, RefinementOutput, RefinementValidation,
-    StructureRecoveryOutput, UntrustedEvidence, CLOUDFLARE_GPT_OSS_120B, GROQ_GPT_OSS_120B,
-    HUGGING_FACE_GPT_OSS_120B, VALIDATION_BUNDLE_SCHEMA_VERSION,
+    AiStageStatus, AnthropicModelProvider, CloudflareModelProvider, CommandModelProvider,
+    CompilationStatus, EvidencePack, EvidencePackLimits, GroqModelProvider, HttpModelProvider,
+    HuggingFaceModelProvider, ModelGateway, ModelProvider, ModelResponse, ModelTask,
+    OllamaModelProvider, OpenAiModelProvider, PseudocodeUnit, RefinementFeedback,
+    RefinementLoopResult, RefinementOutput, RefinementValidation, StructureRecoveryOutput,
+    UntrustedEvidence, CLOUDFLARE_GPT_OSS_120B, GROQ_GPT_OSS_120B, HUGGING_FACE_GPT_OSS_120B,
+    VALIDATION_BUNDLE_SCHEMA_VERSION,
 };
 use sos_analysis::{analyze_elf, build_canonical_ir, compare_binary_analyses};
 use sos_artifact::{
@@ -40,6 +42,7 @@ use sos_storage::MetadataStore;
 use sos_types::{ArtifactManifest, ProgramArtifact};
 
 const HUMANIZATION_PROMPT_VERSION: &str = "sos-v1";
+const DETERMINISTIC_HUMANIZER_ID: &str = "sos-deterministic-syntax-v1";
 const HUMANIZATION_CACHE_SCHEMA_VERSION: u32 = 1;
 const HUMANIZATION_CACHE_RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v3";
@@ -1128,7 +1131,7 @@ fn inspect_command(args: Vec<String>) -> ExitCode {
             || options.model_endpoint.is_some())
     {
         eprintln!(
-            "error: inspect --resume requires a reviewed --provider ollama|groq|cloudflare|huggingface lift, not a custom model adapter"
+            "error: inspect --resume requires --provider ollama|groq|cloudflare|huggingface|openai|anthropic, not a custom model adapter"
         );
         return ExitCode::from(2);
     }
@@ -1304,7 +1307,10 @@ fn inspect_command(args: Vec<String>) -> ExitCode {
                 ),
                 None,
             ),
-            (None, None) if trusted_open_model(model).is_some() => {
+            (None, None)
+                if trusted_open_model(model).is_some()
+                    || options.lift_provider.is_external_api() =>
+            {
                 let checkpoint_cache = options
                     .cache_dir
                     .as_ref()
@@ -1344,7 +1350,7 @@ fn inspect_command(args: Vec<String>) -> ExitCode {
                     },
                     &analysis,
                     &semantics,
-                    "provide --model-command PATH, --model-endpoint URL, or a reviewed open-weight model with --provider ollama|groq|cloudflare|huggingface",
+                    "provide --model-command PATH, --model-endpoint URL, a reviewed open-weight provider, or an explicit openai/anthropic provider and model",
                 ),
                 None,
             ),
@@ -1651,6 +1657,8 @@ enum LiftProvider {
     Groq,
     HuggingFace,
     Cloudflare,
+    OpenAi,
+    Anthropic,
 }
 
 impl LiftProvider {
@@ -1660,15 +1668,57 @@ impl LiftProvider {
             "groq" => Ok(Self::Groq),
             "huggingface" | "hf" => Ok(Self::HuggingFace),
             "cloudflare" | "workers-ai" => Ok(Self::Cloudflare),
+            "openai" => Ok(Self::OpenAi),
+            "anthropic" | "claude" => Ok(Self::Anthropic),
             _ => Err(format!(
-                "unsupported lift provider {value:?}; use ollama, groq, huggingface, or cloudflare"
+                "unsupported lift provider {value:?}; use ollama, groq, huggingface, cloudflare, openai, or anthropic"
             )),
+        }
+    }
+
+    fn is_external_api(self) -> bool {
+        matches!(self, Self::OpenAi | Self::Anthropic)
+    }
+
+    fn default_model(self) -> Option<&'static str> {
+        match self {
+            Self::Ollama => Some("gpt-oss:20b"),
+            Self::Groq => Some(GROQ_GPT_OSS_120B),
+            Self::HuggingFace => Some(HUGGING_FACE_GPT_OSS_120B),
+            Self::Cloudflare => Some(CLOUDFLARE_GPT_OSS_120B),
+            Self::OpenAi | Self::Anthropic => None,
+        }
+    }
+
+    fn model_env_name(self) -> Option<&'static str> {
+        match self {
+            Self::OpenAi => Some("SOS_OPENAI_MODEL"),
+            Self::Anthropic => Some("SOS_ANTHROPIC_MODEL"),
+            _ => None,
+        }
+    }
+
+    fn configured_model(self) -> Option<String> {
+        self.default_model().map(str::to_owned).or_else(|| {
+            let name = self.model_env_name()?;
+            env::var(name).ok().filter(|model| !model.trim().is_empty())
+        })
+    }
+
+    fn audit_name(self) -> &'static str {
+        match self {
+            Self::Ollama => "ollama_local_open_weights",
+            Self::Groq => "groq_hosted_open_weights",
+            Self::HuggingFace => "huggingface_inference_open_weights",
+            Self::Cloudflare => "cloudflare_workers_ai_open_weights",
+            Self::OpenAi => "openai_responses_api",
+            Self::Anthropic => "anthropic_messages_api",
         }
     }
 
     fn validate_model(self, model: &str) -> Result<(), String> {
         let required = match self {
-            Self::Ollama => return Ok(()),
+            Self::Ollama | Self::OpenAi | Self::Anthropic => return Ok(()),
             Self::Groq => GROQ_GPT_OSS_120B,
             Self::HuggingFace => HUGGING_FACE_GPT_OSS_120B,
             Self::Cloudflare => CLOUDFLARE_GPT_OSS_120B,
@@ -1682,7 +1732,7 @@ impl LiftProvider {
                     Self::Groq => "Groq",
                     Self::HuggingFace => "Hugging Face",
                     Self::Cloudflare => "Cloudflare Workers AI",
-                    Self::Ollama => unreachable!(),
+                    Self::Ollama | Self::OpenAi | Self::Anthropic => unreachable!(),
                 }
             ))
         }
@@ -1701,6 +1751,7 @@ struct HumanizeOptions {
     allow_unreviewed_model: bool,
     max_units: usize,
     plan_only: bool,
+    deterministic_only: bool,
     resume: bool,
 }
 
@@ -1708,7 +1759,7 @@ impl HumanizeOptions {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let Some(input) = args.first().map(PathBuf::from) else {
             return Err(
-                "usage: sos humanize <pseudocode-file> [--plan] [--resume] [--cache-dir DIR] [--provider groq|cloudflare|huggingface|ollama] [--model MODEL] [--max-units N] [--out PATH] [--audit-out PATH]".into(),
+                "usage: sos humanize <pseudocode-file> [--deterministic|--plan] [--resume] [--cache-dir DIR] [--provider groq|cloudflare|huggingface|ollama|openai|anthropic] [--model MODEL] [--max-units N] [--out PATH] [--audit-out PATH]".into(),
             );
         };
         let mut output = input.clone();
@@ -1726,9 +1777,11 @@ impl HumanizeOptions {
             allow_unreviewed_model: false,
             max_units: 16,
             plan_only: false,
+            deterministic_only: false,
             resume: false,
         };
         let mut model_explicit = false;
+        let mut provider_explicit = false;
         let mut index = 1;
         while index < args.len() {
             if args[index] == "--allow-unreviewed-model" {
@@ -1738,6 +1791,11 @@ impl HumanizeOptions {
             }
             if args[index] == "--plan" {
                 options.plan_only = true;
+                index += 1;
+                continue;
+            }
+            if args[index] == "--deterministic" {
+                options.deterministic_only = true;
                 index += 1;
                 continue;
             }
@@ -1751,7 +1809,10 @@ impl HumanizeOptions {
                 return Err(format!("missing value for {flag}"));
             };
             match flag.as_str() {
-                "--provider" => options.provider = LiftProvider::parse(value)?,
+                "--provider" => {
+                    options.provider = LiftProvider::parse(value)?;
+                    provider_explicit = true;
+                }
                 "--model" => {
                     options.model = value.clone();
                     model_explicit = true;
@@ -1772,22 +1833,46 @@ impl HumanizeOptions {
             }
             index += 2;
         }
-        if !model_explicit {
-            options.model = match options.provider {
-                LiftProvider::Groq => GROQ_GPT_OSS_120B,
-                LiftProvider::HuggingFace => HUGGING_FACE_GPT_OSS_120B,
-                LiftProvider::Cloudflare => CLOUDFLARE_GPT_OSS_120B,
-                LiftProvider::Ollama => "gpt-oss:20b",
+        if options.deterministic_only {
+            if options.plan_only {
+                return Err("--deterministic and --plan are mutually exclusive".into());
             }
-            .into();
+            if provider_explicit || model_explicit || options.allow_unreviewed_model {
+                return Err(
+                    "--deterministic cannot be combined with model or provider selection".into(),
+                );
+            }
+            if options.resume || options.cache_dir.is_some() {
+                return Err("--deterministic does not use model checkpoints".into());
+            }
+            options.model = DETERMINISTIC_HUMANIZER_ID.into();
+        } else if !model_explicit {
+            let Some(default_model) = options.provider.configured_model() else {
+                return Err(format!(
+                    "--provider {} requires --model MODEL or {}; SOS does not choose external API models",
+                    match options.provider {
+                        LiftProvider::OpenAi => "openai",
+                        LiftProvider::Anthropic => "anthropic",
+                        _ => unreachable!(),
+                    },
+                    options.provider.model_env_name().expect("external provider")
+                ));
+            };
+            options.model = default_model;
         }
-        if trusted_open_model(&options.model).is_none() && !options.allow_unreviewed_model {
+        if !options.deterministic_only
+            && !options.provider.is_external_api()
+            && trusted_open_model(&options.model).is_none()
+            && !options.allow_unreviewed_model
+        {
             return Err(format!(
                 "model {:?} is not in SOS's reviewed open-weight registry; pass --allow-unreviewed-model to override",
                 options.model
             ));
         }
-        options.provider.validate_model(&options.model)?;
+        if !options.deterministic_only {
+            options.provider.validate_model(&options.model)?;
+        }
         if options.output == options.input || options.audit_output == options.input {
             return Err("humanize output paths must not overwrite the input pseudocode".into());
         }
@@ -1951,6 +2036,8 @@ struct HumanizationRun {
     readable_fragments: Vec<String>,
     unit_audits: Vec<serde_json::Value>,
     failures: usize,
+    deterministic_fallback_units: usize,
+    model_failures: usize,
     reused_units: usize,
 }
 
@@ -2035,6 +2122,110 @@ fn build_humanization_plan(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn record_deterministic_humanization(
+    run: &mut HumanizationRun,
+    accepted_context: &mut Vec<UntrustedEvidence>,
+    unit_index: usize,
+    unit: &PseudocodeUnit,
+    processing_position: usize,
+    trigger: &str,
+    checkpoint_status: &str,
+    error: &str,
+    model_failed: bool,
+    evidence_pack: Option<&EvidencePack>,
+    response: Option<&ModelResponse>,
+) {
+    if model_failed {
+        run.model_failures += 1;
+    }
+    match deterministic_humanize_pseudocode_unit(unit) {
+        Ok(fallback) => {
+            run.deterministic_fallback_units += 1;
+            let context = fallback.pseudocode.chars().take(4_096).collect::<String>();
+            accepted_context.push(UntrustedEvidence {
+                source: format!("deterministic_humanization:{}", unit.id),
+                content: context,
+            });
+            run.readable_fragments[unit_index] = format!(
+                "// {}: deterministic fallback for original lines {}-{} ({trigger})\n{}",
+                unit.id,
+                unit.start_line,
+                unit.end_line,
+                fallback.pseudocode.trim()
+            );
+            run.unit_audits[unit_index] = serde_json::json!({
+                "unit": unit,
+                "processing_position": processing_position,
+                "status": "deterministic_fallback",
+                "trigger": trigger,
+                "checkpoint": checkpoint_status,
+                "detail": error,
+                "model_failed": model_failed,
+                "evidence_pack": evidence_pack,
+                "response": response,
+                "fallback": fallback,
+            });
+        }
+        Err(fallback_error) => {
+            run.failures += 1;
+            run.readable_fragments[unit_index] = format!(
+                "// UNRESOLVED {} (lines {}-{}): {}; deterministic fallback also failed: {}",
+                unit.id, unit.start_line, unit.end_line, error, fallback_error
+            );
+            run.unit_audits[unit_index] = serde_json::json!({
+                "unit": unit,
+                "processing_position": processing_position,
+                "status": "rejected",
+                "trigger": trigger,
+                "checkpoint": checkpoint_status,
+                "error": error,
+                "fallback_error": fallback_error.to_string(),
+                "evidence_pack": evidence_pack,
+                "response": response,
+            });
+        }
+    }
+}
+
+fn run_deterministic_humanization(units: &[PseudocodeUnit]) -> HumanizationRun {
+    let mut run = HumanizationRun {
+        readable_fragments: vec![String::new(); units.len()],
+        unit_audits: vec![serde_json::Value::Null; units.len()],
+        failures: 0,
+        deterministic_fallback_units: 0,
+        model_failures: 0,
+        reused_units: 0,
+    };
+    let mut context = Vec::new();
+    for (processing_index, unit_index) in humanization_processing_order(units).iter().enumerate() {
+        let unit = &units[*unit_index];
+        eprintln!(
+            "normalizing unit {}/{} without a model: {} (lines {}-{})",
+            processing_index + 1,
+            units.len(),
+            unit.id,
+            unit.start_line,
+            unit.end_line
+        );
+        let pack = evidence_pack_from_pseudocode_unit(unit).ok();
+        record_deterministic_humanization(
+            &mut run,
+            &mut context,
+            *unit_index,
+            unit,
+            processing_index + 1,
+            "explicit_deterministic_mode",
+            "disabled",
+            "model inference was explicitly disabled",
+            false,
+            pack.as_ref(),
+            None,
+        );
+    }
+    run
+}
+
 fn run_humanization_units<P>(
     provider: P,
     model: &str,
@@ -2048,6 +2239,8 @@ where
         readable_fragments: vec![String::new(); units.len()],
         unit_audits: vec![serde_json::Value::Null; units.len()],
         failures: 0,
+        deterministic_fallback_units: 0,
+        model_failures: 0,
         reused_units: 0,
     };
     let mut accepted_context = Vec::<UntrustedEvidence>::new();
@@ -2065,17 +2258,19 @@ where
         let mut pack = match evidence_pack_from_pseudocode_unit(unit) {
             Ok(pack) => pack,
             Err(error) => {
-                run.failures += 1;
-                run.readable_fragments[*unit_index] = format!(
-                    "// UNRESOLVED {} (lines {}-{}): {}",
-                    unit.id, unit.start_line, unit.end_line, error
+                record_deterministic_humanization(
+                    &mut run,
+                    &mut accepted_context,
+                    *unit_index,
+                    unit,
+                    processing_index + 1,
+                    "evidence_pack_rejected",
+                    "not_started",
+                    &error.to_string(),
+                    false,
+                    None,
+                    None,
                 );
-                run.unit_audits[*unit_index] = serde_json::json!({
-                    "unit": unit,
-                    "processing_position": processing_index + 1,
-                    "status": "rejected",
-                    "error": error.to_string(),
-                });
                 continue;
             }
         };
@@ -2180,39 +2375,38 @@ where
                         "response": response,
                     });
                 } else {
-                    run.failures += 1;
                     let error = format!(
                         "model returned no candidate for expected function {expected_function}"
                     );
-                    run.readable_fragments[*unit_index] = format!(
-                        "// UNRESOLVED {} (lines {}-{}): {}",
-                        unit.id, unit.start_line, unit.end_line, error
+                    record_deterministic_humanization(
+                        &mut run,
+                        &mut accepted_context,
+                        *unit_index,
+                        unit,
+                        processing_index + 1,
+                        "model_candidate_rejected",
+                        checkpoint_status,
+                        &error,
+                        true,
+                        Some(&pack),
+                        Some(&response),
                     );
-                    run.unit_audits[*unit_index] = serde_json::json!({
-                        "unit": unit,
-                        "processing_position": processing_index + 1,
-                        "status": "rejected",
-                        "checkpoint": checkpoint_status,
-                        "error": error,
-                        "evidence_pack": pack,
-                        "response": response,
-                    });
                 }
             }
             Err(error) => {
-                run.failures += 1;
-                run.readable_fragments[*unit_index] = format!(
-                    "// UNRESOLVED {} (lines {}-{}): {}",
-                    unit.id, unit.start_line, unit.end_line, error
+                record_deterministic_humanization(
+                    &mut run,
+                    &mut accepted_context,
+                    *unit_index,
+                    unit,
+                    processing_index + 1,
+                    "model_not_available",
+                    checkpoint_status,
+                    &error.to_string(),
+                    true,
+                    Some(&pack),
+                    None,
                 );
-                run.unit_audits[*unit_index] = serde_json::json!({
-                    "unit": unit,
-                    "processing_position": processing_index + 1,
-                    "status": "not_available",
-                    "checkpoint": checkpoint_status,
-                    "error": error,
-                    "evidence_pack": pack,
-                });
             }
         }
     }
@@ -2243,7 +2437,7 @@ fn humanize_command(args: Vec<String>) -> ExitCode {
     };
     if units.len() > options.max_units {
         eprintln!(
-            "error: pseudocode requires {} hosted units, exceeding --max-units {}; review the partition or raise the limit explicitly",
+            "error: pseudocode requires {} bounded units, exceeding --max-units {}; review the partition or raise the limit explicitly",
             units.len(),
             options.max_units
         );
@@ -2277,11 +2471,10 @@ fn humanize_command(args: Vec<String>) -> ExitCode {
         println!("humanization_plan={}", options.audit_output.display());
         return ExitCode::SUCCESS;
     }
-    let provider_name = match options.provider {
-        LiftProvider::Groq => "groq_hosted_open_weights",
-        LiftProvider::HuggingFace => "huggingface_inference_open_weights",
-        LiftProvider::Cloudflare => "cloudflare_workers_ai_open_weights",
-        LiftProvider::Ollama => "ollama_local_open_weights",
+    let provider_name = if options.deterministic_only {
+        "deterministic_syntax_normalizer"
+    } else {
+        options.provider.audit_name()
     };
     let cache = options
         .cache_dir
@@ -2292,99 +2485,157 @@ fn humanize_command(args: Vec<String>) -> ExitCode {
             provider: provider_name.into(),
             model: options.model.clone(),
         });
-    let run = match options.provider {
-        LiftProvider::Groq => match env::var("GROQ_API_KEY") {
-            Ok(api_key) => {
-                let provider = match GroqModelProvider::new(api_key) {
-                    Ok(provider) => provider,
-                    Err(error) => {
-                        eprintln!("error: {error}");
-                        return ExitCode::from(2);
-                    }
-                };
-                run_humanization_units(provider, &options.model, &units, cache.as_ref())
-            }
-            Err(_) if options.resume => {
-                eprintln!(
-                        "GROQ_API_KEY is not set; validating checkpoints and preserving cache misses as unresolved"
+    let run = if options.deterministic_only {
+        run_deterministic_humanization(&units)
+    } else {
+        match options.provider {
+            LiftProvider::Groq => match env::var("GROQ_API_KEY") {
+                Ok(api_key) => {
+                    let provider = match GroqModelProvider::new(api_key) {
+                        Ok(provider) => provider,
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            return ExitCode::from(2);
+                        }
+                    };
+                    run_humanization_units(provider, &options.model, &units, cache.as_ref())
+                }
+                Err(_) if options.resume => {
+                    eprintln!(
+                        "GROQ_API_KEY is not set; validating checkpoints and using deterministic fallbacks for cache misses"
                     );
-                run_humanization_units(
-                    UnavailableHostedProvider,
-                    &options.model,
-                    &units,
-                    cache.as_ref(),
-                )
-            }
-            Err(_) => {
-                eprintln!("error: GROQ_API_KEY is required for --provider groq");
-                return ExitCode::from(2);
-            }
-        },
-        LiftProvider::HuggingFace => match env::var("HF_TOKEN") {
-            Ok(token) => {
-                let provider = match HuggingFaceModelProvider::new(token) {
-                    Ok(provider) => provider,
-                    Err(error) => {
-                        eprintln!("error: {error}");
-                        return ExitCode::from(2);
-                    }
-                };
-                run_humanization_units(provider, &options.model, &units, cache.as_ref())
-            }
-            Err(_) if options.resume => {
-                eprintln!(
-                    "HF_TOKEN is not set; validating checkpoints and preserving cache misses as unresolved"
+                    run_humanization_units(
+                        UnavailableHostedProvider,
+                        &options.model,
+                        &units,
+                        cache.as_ref(),
+                    )
+                }
+                Err(_) => {
+                    eprintln!("error: GROQ_API_KEY is required for --provider groq");
+                    return ExitCode::from(2);
+                }
+            },
+            LiftProvider::HuggingFace => match env::var("HF_TOKEN") {
+                Ok(token) => {
+                    let provider = match HuggingFaceModelProvider::new(token) {
+                        Ok(provider) => provider,
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            return ExitCode::from(2);
+                        }
+                    };
+                    run_humanization_units(provider, &options.model, &units, cache.as_ref())
+                }
+                Err(_) if options.resume => {
+                    eprintln!(
+                    "HF_TOKEN is not set; validating checkpoints and using deterministic fallbacks for cache misses"
                 );
-                run_humanization_units(
-                    UnavailableHostedProvider,
-                    &options.model,
-                    &units,
-                    cache.as_ref(),
-                )
-            }
-            Err(_) => {
-                eprintln!("error: HF_TOKEN is required for --provider huggingface");
-                return ExitCode::from(2);
-            }
-        },
-        LiftProvider::Cloudflare => match (
-            env::var("CLOUDFLARE_ACCOUNT_ID"),
-            env::var("CLOUDFLARE_API_TOKEN"),
-        ) {
-            (Ok(account_id), Ok(api_token)) => {
-                let provider = match CloudflareModelProvider::new(account_id, api_token) {
-                    Ok(provider) => provider,
-                    Err(error) => {
-                        eprintln!("error: {error}");
-                        return ExitCode::from(2);
-                    }
-                };
-                run_humanization_units(provider, &options.model, &units, cache.as_ref())
-            }
-            _ if options.resume => {
-                eprintln!(
-                    "Cloudflare credentials are not set; validating checkpoints and preserving cache misses as unresolved"
+                    run_humanization_units(
+                        UnavailableHostedProvider,
+                        &options.model,
+                        &units,
+                        cache.as_ref(),
+                    )
+                }
+                Err(_) => {
+                    eprintln!("error: HF_TOKEN is required for --provider huggingface");
+                    return ExitCode::from(2);
+                }
+            },
+            LiftProvider::Cloudflare => match (
+                env::var("CLOUDFLARE_ACCOUNT_ID"),
+                env::var("CLOUDFLARE_API_TOKEN"),
+            ) {
+                (Ok(account_id), Ok(api_token)) => {
+                    let provider = match CloudflareModelProvider::new(account_id, api_token) {
+                        Ok(provider) => provider,
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            return ExitCode::from(2);
+                        }
+                    };
+                    run_humanization_units(provider, &options.model, &units, cache.as_ref())
+                }
+                _ if options.resume => {
+                    eprintln!(
+                    "Cloudflare credentials are not set; validating checkpoints and using deterministic fallbacks for cache misses"
                 );
-                run_humanization_units(
-                    UnavailableHostedProvider,
-                    &options.model,
-                    &units,
-                    cache.as_ref(),
-                )
-            }
-            _ => {
-                eprintln!(
+                    run_humanization_units(
+                        UnavailableHostedProvider,
+                        &options.model,
+                        &units,
+                        cache.as_ref(),
+                    )
+                }
+                _ => {
+                    eprintln!(
                     "error: CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are required for --provider cloudflare"
                 );
-                return ExitCode::from(2);
-            }
-        },
-        LiftProvider::Ollama => run_humanization_units(
-            OllamaModelProvider::new(&options.ollama_url),
-            &options.model,
-            &units,
-            cache.as_ref(),
-        ),
+                    return ExitCode::from(2);
+                }
+            },
+            LiftProvider::Ollama => run_humanization_units(
+                OllamaModelProvider::new(&options.ollama_url),
+                &options.model,
+                &units,
+                cache.as_ref(),
+            ),
+            LiftProvider::OpenAi => match env::var("OPENAI_API_KEY") {
+                Ok(api_key) => {
+                    let provider = match OpenAiModelProvider::new(api_key) {
+                        Ok(provider) => provider,
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            return ExitCode::from(2);
+                        }
+                    };
+                    run_humanization_units(provider, &options.model, &units, cache.as_ref())
+                }
+                Err(_) if options.resume => {
+                    eprintln!(
+                        "OPENAI_API_KEY is not set; validating checkpoints and using deterministic fallbacks for cache misses"
+                    );
+                    run_humanization_units(
+                        UnavailableHostedProvider,
+                        &options.model,
+                        &units,
+                        cache.as_ref(),
+                    )
+                }
+                Err(_) => {
+                    eprintln!("error: OPENAI_API_KEY is required for --provider openai");
+                    return ExitCode::from(2);
+                }
+            },
+            LiftProvider::Anthropic => match env::var("ANTHROPIC_API_KEY") {
+                Ok(api_key) => {
+                    let provider = match anthropic_provider(api_key) {
+                        Ok(provider) => provider,
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            return ExitCode::from(2);
+                        }
+                    };
+                    run_humanization_units(provider, &options.model, &units, cache.as_ref())
+                }
+                Err(_) if options.resume => {
+                    eprintln!(
+                        "ANTHROPIC_API_KEY is not set; validating checkpoints and using deterministic fallbacks for cache misses"
+                    );
+                    run_humanization_units(
+                        UnavailableHostedProvider,
+                        &options.model,
+                        &units,
+                        cache.as_ref(),
+                    )
+                }
+                Err(_) => {
+                    eprintln!("error: ANTHROPIC_API_KEY is required for --provider anthropic");
+                    return ExitCode::from(2);
+                }
+            },
+        }
     };
     if let Some(parent) = options
         .output
@@ -2397,7 +2648,7 @@ fn humanize_command(args: Vec<String>) -> ExitCode {
         }
     }
     let readable = format!(
-        "// SOS model-assisted reconstruction. Unverified; not original source.\n\n{}\n",
+        "// SOS hybrid reconstruction. Unverified; not original source.\n// Accepted model output is preferred; deterministic syntax-only fallbacks remain explicitly labeled.\n\n{}\n",
         run.readable_fragments.join("\n\n")
     );
     if let Err(error) = fs::write(&options.output, readable) {
@@ -2411,6 +2662,8 @@ fn humanize_command(args: Vec<String>) -> ExitCode {
         "source_sha256": sha256_hex(source.as_bytes()),
         "unit_count": units.len(),
         "failed_units": run.failures,
+        "deterministic_fallback_units": run.deterministic_fallback_units,
+        "model_failed_or_rejected_units": run.model_failures,
         "reused_checkpoint_units": run.reused_units,
         "checkpoint_directory": options.cache_dir,
         "units": run.unit_audits,
@@ -2434,6 +2687,13 @@ fn humanize_command(args: Vec<String>) -> ExitCode {
     }
     println!("readable_source={}", options.output.display());
     println!("audit={}", options.audit_output.display());
+    if run.deterministic_fallback_units > 0 {
+        eprintln!(
+            "warning: {} of {} units used the deterministic syntax-only fallback; inspect the audit before treating types or behavior as recovered",
+            run.deterministic_fallback_units,
+            units.len()
+        );
+    }
     if run.failures == 0 {
         ExitCode::SUCCESS
     } else {
@@ -2465,7 +2725,7 @@ impl LiftOptions {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let Some(directory) = args.first() else {
             return Err(
-                "usage: sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq|cloudflare|huggingface] [--function fn_ID] [--model MODEL] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]".into(),
+                "usage: sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq|cloudflare|huggingface|openai|anthropic] [--function fn_ID] [--model MODEL] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]".into(),
             );
         };
         let mut options = Self {
@@ -2529,15 +2789,23 @@ impl LiftOptions {
             index += 2;
         }
         if !model_explicit {
-            options.model = match options.provider {
-                LiftProvider::Ollama => "gpt-oss:20b",
-                LiftProvider::Groq => GROQ_GPT_OSS_120B,
-                LiftProvider::HuggingFace => HUGGING_FACE_GPT_OSS_120B,
-                LiftProvider::Cloudflare => CLOUDFLARE_GPT_OSS_120B,
-            }
-            .into();
+            let Some(default_model) = options.provider.configured_model() else {
+                return Err(format!(
+                    "--provider {} requires --model MODEL or {}; SOS does not choose external API models",
+                    match options.provider {
+                        LiftProvider::OpenAi => "openai",
+                        LiftProvider::Anthropic => "anthropic",
+                        _ => unreachable!(),
+                    },
+                    options.provider.model_env_name().expect("external provider")
+                ));
+            };
+            options.model = default_model;
         }
-        if trusted_open_model(&options.model).is_none() && !options.allow_unreviewed_model {
+        if !options.provider.is_external_api()
+            && trusted_open_model(&options.model).is_none()
+            && !options.allow_unreviewed_model
+        {
             return Err(format!(
                 "model {:?} is not in SOS's reviewed open-weight registry; use gpt-oss:20b, openai/gpt-oss-120b, or explicitly pass --allow-unreviewed-model",
                 options.model
@@ -2932,6 +3200,16 @@ struct SelectedLiftConfig<'a> {
     checkpoint_cache: Option<&'a LiftCheckpointCache>,
 }
 
+fn anthropic_provider(api_key: String) -> Result<AnthropicModelProvider, String> {
+    let provider = AnthropicModelProvider::new(api_key).map_err(|error| error.to_string())?;
+    match env::var("ANTHROPIC_WORKSPACE_ID") {
+        Ok(workspace_id) if !workspace_id.trim().is_empty() => provider
+            .with_workspace_id(workspace_id)
+            .map_err(|error| error.to_string()),
+        _ => Ok(provider),
+    }
+}
+
 fn run_selected_lift_bundle(
     analysis: &sos_analysis::StaticAnalysis,
     semantics: &sos_solana::SemanticAnalysis,
@@ -3038,6 +3316,50 @@ fn run_selected_lift_bundle(
                 "CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are required for --provider cloudflare"
                     .to_owned(),
             ),
+        },
+        LiftProvider::OpenAi => match env::var("OPENAI_API_KEY") {
+            Ok(api_key) => {
+                let provider =
+                    OpenAiModelProvider::new(api_key).map_err(|error| error.to_string())?;
+                run_lift_bundle(
+                    provider,
+                    analysis,
+                    semantics,
+                    run("openai_responses_api"),
+                )
+            }
+            Err(_) if options.checkpoint_cache.is_some() => {
+                eprintln!(
+                    "OPENAI_API_KEY is not set; validating lift checkpoints and preserving cache misses as unavailable"
+                );
+                run_lift_bundle(
+                    UnavailableHostedProvider,
+                    analysis,
+                    semantics,
+                    run("openai_responses_api"),
+                )
+            }
+            Err(_) => Err("OPENAI_API_KEY is required for --provider openai".to_owned()),
+        },
+        LiftProvider::Anthropic => match env::var("ANTHROPIC_API_KEY") {
+            Ok(api_key) => run_lift_bundle(
+                anthropic_provider(api_key)?,
+                analysis,
+                semantics,
+                run("anthropic_messages_api"),
+            ),
+            Err(_) if options.checkpoint_cache.is_some() => {
+                eprintln!(
+                    "ANTHROPIC_API_KEY is not set; validating lift checkpoints and preserving cache misses as unavailable"
+                );
+                run_lift_bundle(
+                    UnavailableHostedProvider,
+                    analysis,
+                    semantics,
+                    run("anthropic_messages_api"),
+                )
+            }
+            Err(_) => Err("ANTHROPIC_API_KEY is required for --provider anthropic".to_owned()),
         },
     }
 }
@@ -3748,15 +4070,21 @@ impl RemoteOptions {
             index += 2;
         }
         if command == "inspect" && provider_explicit && options.model.is_none() {
-            options.model = Some(
-                match options.lift_provider {
-                    LiftProvider::Ollama => "gpt-oss:20b",
-                    LiftProvider::Groq => GROQ_GPT_OSS_120B,
-                    LiftProvider::HuggingFace => HUGGING_FACE_GPT_OSS_120B,
-                    LiftProvider::Cloudflare => CLOUDFLARE_GPT_OSS_120B,
-                }
-                .into(),
-            );
+            let Some(default_model) = options.lift_provider.configured_model() else {
+                return Err(format!(
+                    "--provider {} requires --model MODEL or {}; SOS does not choose external API models",
+                    match options.lift_provider {
+                        LiftProvider::OpenAi => "openai",
+                        LiftProvider::Anthropic => "anthropic",
+                        _ => unreachable!(),
+                    },
+                    options
+                        .lift_provider
+                        .model_env_name()
+                        .expect("external provider")
+                ));
+            };
+            options.model = Some(default_model);
         }
         if command == "inspect" && provider_explicit {
             options
@@ -3978,7 +4306,7 @@ fn usage() -> ExitCode {
     eprintln!("usage: sos artifact-info <path-to-sbf-elf> [--json]");
     eprintln!("       sos manifest <path-to-sbf-elf>");
     eprintln!("       sos fetch <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--commitment LEVEL] [--json]");
-    eprintln!("       sos inspect <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--history N] [--replay] [--signature SIGNATURE] [--provider ollama|groq|cloudflare|huggingface] [--model MODEL] [--function fn_ID] [--resume] [--cache-dir DIR] [--ollama-url URL] [--context-tokens N] [--model-command PATH|--model-endpoint URL] [--validate] [--repair --repair-rounds N] [--validation-trace PATH] [--commitment LEVEL] [--json]");
+    eprintln!("       sos inspect <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--history N] [--replay] [--signature SIGNATURE] [--provider ollama|groq|cloudflare|huggingface|openai|anthropic] [--model MODEL] [--function fn_ID] [--resume] [--cache-dir DIR] [--ollama-url URL] [--context-tokens N] [--model-command PATH|--model-endpoint URL] [--validate] [--repair --repair-rounds N] [--validation-trace PATH] [--commitment LEVEL] [--json]");
     eprintln!("       sos analyze <path-to-sbf-elf> [--out DIR]");
     eprintln!("       sos detect <analysis-directory> [--format json|sarif] [--out PATH]");
     eprintln!("       sos validate <analysis-directory> [--compiler PATH|--no-compile] [--trace PATH] [--repair --model-command PATH --repair-rounds N] [--out PATH]");
@@ -3992,8 +4320,8 @@ fn usage() -> ExitCode {
     eprintln!(
         "       sos decompile <analysis-directory> [--format rust-like|c-like|json] [--out PATH]"
     );
-    eprintln!("       sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq|cloudflare|huggingface] [--function fn_ID] [--model MODEL] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]");
-    eprintln!("       sos humanize <pseudocode-file> [--plan] [--resume] [--cache-dir DIR] [--provider groq|cloudflare|huggingface|ollama] [--model MODEL] [--max-units N] [--out PATH] [--audit-out PATH]");
+    eprintln!("       sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq|cloudflare|huggingface|openai|anthropic] [--function fn_ID] [--model MODEL] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]");
+    eprintln!("       sos humanize <pseudocode-file> [--deterministic|--plan] [--resume] [--cache-dir DIR] [--provider groq|cloudflare|huggingface|ollama|openai|anthropic] [--model MODEL] [--max-units N] [--out PATH] [--audit-out PATH]");
     eprintln!("       sos benchmark <artifact> [--repeats N] [--out PATH]");
     eprintln!("       sos judge <original-sbf-elf> <candidate-sbf-elf> [--minimum-score 0..1] [--require-exact] [--out PATH]");
     ExitCode::from(2)
@@ -4005,10 +4333,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        run_humanization_units, run_lift_bundle, transaction_account_addresses, BenchmarkOptions,
-        ExplainOptions, HumanizationCache, HumanizeOptions, JudgeOptions, LiftCheckpointCache,
-        LiftOptions, LiftProvider, LiftRunConfig, RemoteOptions, GROQ_GPT_OSS_120B,
-        HUGGING_FACE_GPT_OSS_120B,
+        run_deterministic_humanization, run_humanization_units, run_lift_bundle,
+        transaction_account_addresses, BenchmarkOptions, ExplainOptions, HumanizationCache,
+        HumanizeOptions, JudgeOptions, LiftCheckpointCache, LiftOptions, LiftProvider,
+        LiftRunConfig, RemoteOptions, UnavailableHostedProvider, DETERMINISTIC_HUMANIZER_ID,
+        GROQ_GPT_OSS_120B, HUGGING_FACE_GPT_OSS_120B,
     };
     use sos_ai::{AiError, ModelProvider, ModelRequest, ModelResponse};
 
@@ -4112,6 +4441,26 @@ mod tests {
         .unwrap();
         assert_eq!(cloudflare.provider, LiftProvider::Cloudflare);
         assert_eq!(cloudflare.model, "@cf/openai/gpt-oss-120b");
+        let openai = LiftOptions::parse(vec![
+            "./analysis".into(),
+            "--provider".into(),
+            "openai".into(),
+            "--model".into(),
+            "openai-test-model".into(),
+        ])
+        .unwrap();
+        assert_eq!(openai.provider, LiftProvider::OpenAi);
+        assert_eq!(openai.model, "openai-test-model");
+        let anthropic = LiftOptions::parse(vec![
+            "./analysis".into(),
+            "--provider".into(),
+            "claude".into(),
+            "--model".into(),
+            "anthropic-test-model".into(),
+        ])
+        .unwrap();
+        assert_eq!(anthropic.provider, LiftProvider::Anthropic);
+        assert_eq!(anthropic.model, "anthropic-test-model");
         assert!(LiftOptions::parse(vec![
             "./analysis".into(),
             "--provider".into(),
@@ -4235,6 +4584,32 @@ mod tests {
         .unwrap();
         assert_eq!(cloudflare.lift_provider, LiftProvider::Cloudflare);
         assert_eq!(cloudflare.model.as_deref(), Some("@cf/openai/gpt-oss-120b"));
+        let openai = RemoteOptions::parse(
+            vec![
+                "11111111111111111111111111111111".into(),
+                "--provider".into(),
+                "openai".into(),
+                "--model".into(),
+                "openai-test-model".into(),
+            ],
+            "inspect",
+        )
+        .unwrap();
+        assert_eq!(openai.lift_provider, LiftProvider::OpenAi);
+        assert_eq!(openai.model.as_deref(), Some("openai-test-model"));
+        let anthropic = RemoteOptions::parse(
+            vec![
+                "11111111111111111111111111111111".into(),
+                "--provider".into(),
+                "anthropic".into(),
+                "--model".into(),
+                "anthropic-test-model".into(),
+            ],
+            "inspect",
+        )
+        .unwrap();
+        assert_eq!(anthropic.lift_provider, LiftProvider::Anthropic);
+        assert_eq!(anthropic.model.as_deref(), Some("anthropic-test-model"));
         assert!(RemoteOptions::parse(
             vec![
                 "11111111111111111111111111111111".into(),
@@ -4256,11 +4631,31 @@ mod tests {
         assert_eq!(hosted.output, PathBuf::from("decompiler.readable.rs"));
         assert_eq!(hosted.max_units, 16);
         assert!(!hosted.plan_only);
+        assert!(!hosted.deterministic_only);
         assert!(!hosted.resume);
         assert!(hosted.cache_dir.is_none());
 
         let plan = HumanizeOptions::parse(vec!["decompiler.txt".into(), "--plan".into()]).unwrap();
         assert!(plan.plan_only);
+
+        let deterministic =
+            HumanizeOptions::parse(vec!["decompiler.txt".into(), "--deterministic".into()])
+                .unwrap();
+        assert!(deterministic.deterministic_only);
+        assert_eq!(deterministic.model, DETERMINISTIC_HUMANIZER_ID);
+        assert!(HumanizeOptions::parse(vec![
+            "decompiler.txt".into(),
+            "--deterministic".into(),
+            "--provider".into(),
+            "cloudflare".into(),
+        ])
+        .is_err());
+        assert!(HumanizeOptions::parse(vec![
+            "decompiler.txt".into(),
+            "--deterministic".into(),
+            "--resume".into(),
+        ])
+        .is_err());
 
         let resumed = HumanizeOptions::parse(vec![
             "decompiler.txt".into(),
@@ -4304,6 +4699,28 @@ mod tests {
         .unwrap();
         assert_eq!(cloudflare.provider, LiftProvider::Cloudflare);
         assert_eq!(cloudflare.model, "@cf/openai/gpt-oss-120b");
+
+        let openai = HumanizeOptions::parse(vec![
+            "decompiler.txt".into(),
+            "--provider".into(),
+            "openai".into(),
+            "--model".into(),
+            "openai-test-model".into(),
+        ])
+        .unwrap();
+        assert_eq!(openai.provider, LiftProvider::OpenAi);
+        assert_eq!(openai.model, "openai-test-model");
+
+        let anthropic = HumanizeOptions::parse(vec![
+            "decompiler.txt".into(),
+            "--provider".into(),
+            "anthropic".into(),
+            "--model".into(),
+            "anthropic-test-model".into(),
+        ])
+        .unwrap();
+        assert_eq!(anthropic.provider, LiftProvider::Anthropic);
+        assert_eq!(anthropic.model, "anthropic-test-model");
 
         assert!(HumanizeOptions::parse(vec![
             "decompiler.txt".into(),
@@ -4381,6 +4798,33 @@ mod tests {
         assert!(contexts[1]
             .iter()
             .any(|source| source == "accepted_humanization:unit_0001"));
+    }
+
+    #[test]
+    fn humanize_uses_evidence_preserving_fallback_without_a_model() {
+        let source = "undefined8 process_account(long ctx, byte *data, ulong len)\n{\n  if (len < 1) {\n    return 5;\n  }\n  return *data;\n}";
+        let units = sos_ai::partition_pseudocode(source).unwrap();
+        let run =
+            run_humanization_units(UnavailableHostedProvider, GROQ_GPT_OSS_120B, &units, None);
+
+        assert_eq!(run.failures, 0);
+        assert_eq!(run.model_failures, 1);
+        assert_eq!(run.deterministic_fallback_units, 1);
+        assert!(run.readable_fragments[0].contains("pub unsafe fn process_account"));
+        assert!(run.readable_fragments[0].contains("return read_value(data);"));
+        assert_eq!(
+            run.unit_audits[0]["status"],
+            serde_json::Value::String("deterministic_fallback".into())
+        );
+
+        let explicit = run_deterministic_humanization(&units);
+        assert_eq!(explicit.failures, 0);
+        assert_eq!(explicit.model_failures, 0);
+        assert_eq!(explicit.deterministic_fallback_units, 1);
+        assert_eq!(
+            explicit.unit_audits[0]["trigger"],
+            serde_json::Value::String("explicit_deterministic_mode".into())
+        );
     }
 
     #[test]

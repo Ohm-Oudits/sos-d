@@ -92,6 +92,12 @@ projection used by Groq.
 - current pricing: <https://huggingface.co/docs/inference-providers/en/pricing>
 - reviewed weights: <https://huggingface.co/openai/gpt-oss-120b>
 
+Direct OpenAI Responses API and Anthropic Messages API transports are also
+available for operator-selected agents. They require an explicit model ID and
+are not silently treated as reviewed open weights. Credentials, model
+placeholders, request boundaries, and Patina-inspired stage isolation are
+documented in [AGENT_PROVIDERS.md](AGENT_PROVIDERS.md).
+
 ## Running a lift
 
 ### Hosted (recommended on lower-memory machines)
@@ -172,6 +178,17 @@ SOS can apply the same evidence-constrained model boundary to textual output
 from another decompiler:
 
 ```bash
+sos humanize ./decompiler-output.txt \
+  --deterministic \
+  --out ./readable.rs \
+  --audit-out ./humanize.json
+```
+
+This explicit mode never constructs a model provider or performs a network
+request. It produces the same line-addressed fallback used when hosted inference
+is unavailable or rejected. For the model-assisted path:
+
+```bash
 export GROQ_API_KEY='...'
 sos humanize ./decompiler-output.txt \
   --provider groq \
@@ -218,9 +235,14 @@ unit hash, full staged request hash, anti-cheese constraints, and evidence
 references. Invalid or stale records are warned about and recomputed rather
 than trusted. The default directory is derived from `--audit-out`; specify
 `--cache-dir DIR` for a stable path. Checkpoints contain no API credentials.
-If every unit is cached, SOS can validate and reconstruct the output without a
-selected provider token; missing units stay unresolved until hosted inference is
-available.
+If every unit is cached, SOS can validate and reconstruct the accepted model
+output without a selected provider token. If a unit is not cached or an
+inference response is unavailable or rejected, the humanizer emits a
+deterministic syntax-only pseudo-Rust fallback. It normalizes
+common decompiler types, guards, returns, pointer reads/writes, and calls while
+retaining unsupported lines verbatim as comments. Each emitted line references
+its original source line, and the audit distinguishes `deterministic_fallback`
+from `accepted_unverified` model output.
 
 Use `--plan` to write the source hash, detected line ranges, synthetic function
 IDs, operation counts, and per-unit hashes without requiring an API key or
