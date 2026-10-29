@@ -215,6 +215,10 @@ pub struct AbiEffectDependencyFact {
     pub pc: usize,
     pub kind: String,
     pub input_registers: Vec<u8>,
+    #[serde(default)]
+    pub target_input_registers: Vec<u8>,
+    #[serde(default)]
+    pub value_input_registers: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1343,7 +1347,7 @@ pub fn abi_effect_dependencies(
     let mut incoming = BTreeMap::<usize, [u8; 11]>::new();
     incoming.insert(function_pc, entry);
     let mut queue = VecDeque::from([function_pc]);
-    let mut effects = BTreeMap::<(usize, String), u8>::new();
+    let mut effects = BTreeMap::<(usize, String), (u8, u8, u8)>::new();
 
     while let Some(block_pc) = queue.pop_front() {
         let Some(block) = blocks.get(&block_pc) else {
@@ -1359,10 +1363,13 @@ pub fn abi_effect_dependencies(
                 && next_block_pc.is_none_or(|next_pc| instruction.pc < next_pc)
                 && in_function(instruction.pc)
         }) {
-            if let Some((kind, dependencies)) =
+            if let Some((kind, dependencies, target_dependencies, value_dependencies)) =
                 instruction_effect_dependencies(instruction, &origins)
             {
-                *effects.entry((instruction.pc, kind)).or_default() |= dependencies;
+                let effect = effects.entry((instruction.pc, kind)).or_default();
+                effect.0 |= dependencies;
+                effect.1 |= target_dependencies;
+                effect.2 |= value_dependencies;
             }
             transfer_dependency_origins(instruction, &mut origins);
         }
@@ -1387,27 +1394,39 @@ pub fn abi_effect_dependencies(
 
     effects
         .into_iter()
-        .map(|((pc, kind), dependencies)| AbiEffectDependencyFact {
-            pc,
-            kind,
-            input_registers: dependency_registers(dependencies),
-        })
+        .map(
+            |((pc, kind), (dependencies, target_dependencies, value_dependencies))| {
+                AbiEffectDependencyFact {
+                    pc,
+                    kind,
+                    input_registers: dependency_registers(dependencies),
+                    target_input_registers: dependency_registers(target_dependencies),
+                    value_input_registers: dependency_registers(value_dependencies),
+                }
+            },
+        )
         .collect()
 }
 
 fn instruction_effect_dependencies(
     instruction: &InstructionFact,
     origins: &[u8; 11],
-) -> Option<(String, u8)> {
+) -> Option<(String, u8, u8, u8)> {
     use solana_sbpf::ebpf;
 
     if let Some(access) = memory_access(instruction) {
         if access.kind == "store" {
-            let mut dependencies = origins[access.base_register as usize];
-            if let Some(register) = access.value_register {
-                dependencies |= origins[register as usize];
-            }
-            return Some(("memory_write".into(), dependencies));
+            let target_dependencies = origins[access.base_register as usize];
+            let value_dependencies = access
+                .value_register
+                .map(|register| origins[register as usize])
+                .unwrap_or_default();
+            return Some((
+                "memory_write".into(),
+                target_dependencies | value_dependencies,
+                target_dependencies,
+                value_dependencies,
+            ));
         }
         return None;
     }
@@ -1417,18 +1436,18 @@ fn instruction_effect_dependencies(
         || (class == ebpf::BPF_JMP32 && instruction.assembly.starts_with('j'))
     {
         return match operation {
-            ebpf::BPF_CALL => Some(("call".into(), 0)),
+            ebpf::BPF_CALL => Some(("call".into(), 0, 0, 0)),
             ebpf::BPF_EXIT if instruction.assembly.starts_with("syscall ") => {
-                Some(("call".into(), 0))
+                Some(("call".into(), 0, 0, 0))
             }
-            ebpf::BPF_EXIT => Some(("return".into(), origins[0])),
-            ebpf::BPF_JA => Some(("branch".into(), 0)),
+            ebpf::BPF_EXIT => Some(("return".into(), origins[0], 0, 0)),
+            ebpf::BPF_JA => Some(("branch".into(), 0, 0, 0)),
             _ => {
                 let mut dependencies = origins[instruction.dst as usize];
                 if instruction.opcode & ebpf::BPF_X != 0 {
                     dependencies |= origins[instruction.src as usize];
                 }
-                Some(("branch".into(), dependencies))
+                Some(("branch".into(), dependencies, 0, 0))
             }
         };
     }
@@ -2262,16 +2281,22 @@ mod static_tests {
                     pc: 2,
                     kind: "branch".into(),
                     input_registers: vec![3],
+                    target_input_registers: vec![],
+                    value_input_registers: vec![],
                 },
                 AbiEffectDependencyFact {
                     pc: 3,
                     kind: "memory_write".into(),
                     input_registers: vec![1, 2],
+                    target_input_registers: vec![1],
+                    value_input_registers: vec![2],
                 },
                 AbiEffectDependencyFact {
                     pc: 4,
                     kind: "return".into(),
                     input_registers: vec![1],
+                    target_input_registers: vec![],
+                    value_input_registers: vec![],
                 },
             ]
         );

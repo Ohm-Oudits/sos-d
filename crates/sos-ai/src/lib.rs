@@ -232,6 +232,10 @@ pub struct RecoveredEffect {
     #[serde(default)]
     pub input_registers: Vec<u8>,
     #[serde(default)]
+    pub target_input_registers: Vec<u8>,
+    #[serde(default)]
+    pub value_input_registers: Vec<u8>,
+    #[serde(default)]
     pub evidence: Vec<sos_types::EvidenceRef>,
 }
 
@@ -250,6 +254,8 @@ pub struct RequiredEffect {
     pub kind: RecoveredEffectKind,
     pub location: String,
     pub input_registers: Vec<u8>,
+    pub target_input_registers: Vec<u8>,
+    pub value_input_registers: Vec<u8>,
 }
 
 pub fn required_structure_effects(pack: &EvidencePack, function_id: &str) -> Vec<RequiredEffect> {
@@ -265,8 +271,16 @@ pub fn required_structure_effects(pack: &EvidencePack, function_id: &str) -> Vec
     let dependency_map = dependency_facts
         .iter()
         .filter_map(|fact| {
-            recovered_effect_kind(&fact.kind)
-                .map(|kind| ((fact.pc, kind), fact.input_registers.clone()))
+            recovered_effect_kind(&fact.kind).map(|kind| {
+                (
+                    (fact.pc, kind),
+                    (
+                        fact.input_registers.clone(),
+                        fact.target_input_registers.clone(),
+                        fact.value_input_registers.clone(),
+                    ),
+                )
+            })
         })
         .collect::<BTreeMap<_, _>>();
     let function_blocks = pack
@@ -309,7 +323,15 @@ pub fn required_structure_effects(pack: &EvidencePack, function_id: &str) -> Vec
                 location: format!("operation:{}", operation.id),
                 input_registers: dependency_map
                     .get(&(operation.pc, kind))
-                    .cloned()
+                    .map(|dependencies| dependencies.0.clone())
+                    .unwrap_or_default(),
+                target_input_registers: dependency_map
+                    .get(&(operation.pc, kind))
+                    .map(|dependencies| dependencies.1.clone())
+                    .unwrap_or_default(),
+                value_input_registers: dependency_map
+                    .get(&(operation.pc, kind))
+                    .map(|dependencies| dependencies.2.clone())
                     .unwrap_or_default(),
             });
         }
@@ -326,7 +348,9 @@ pub fn required_structure_effects(pack: &EvidencePack, function_id: &str) -> Vec
             .iter()
             .filter(|operation| scc_blocks.contains(&operation.block_id))
             .filter_map(|operation| {
-                dependency_map.get(&(operation.pc, RecoveredEffectKind::Branch))
+                dependency_map
+                    .get(&(operation.pc, RecoveredEffectKind::Branch))
+                    .map(|dependencies| &dependencies.0)
             })
             .flatten()
             .copied()
@@ -340,6 +364,8 @@ pub fn required_structure_effects(pack: &EvidencePack, function_id: &str) -> Vec
                     kind: RecoveredEffectKind::Loop,
                     location,
                     input_registers: loop_inputs.clone(),
+                    target_input_registers: Vec::new(),
+                    value_input_registers: Vec::new(),
                 });
             }
         }
@@ -490,6 +516,10 @@ pub struct MirFunctionSummary {
 pub struct MirEffectDependency {
     pub kind: RecoveredEffectKind,
     pub input_parameters: Vec<u8>,
+    #[serde(default)]
+    pub target_input_parameters: Vec<u8>,
+    #[serde(default)]
+    pub value_input_parameters: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -521,6 +551,12 @@ pub struct MirDependencyMismatch {
     pub required_input_registers: Vec<u8>,
     pub observed_input_parameters: Vec<u8>,
     pub missing_input_dependencies: Vec<u8>,
+    pub required_target_input_registers: Vec<u8>,
+    pub observed_target_input_parameters: Vec<u8>,
+    pub missing_target_input_dependencies: Vec<u8>,
+    pub required_value_input_registers: Vec<u8>,
+    pub observed_value_input_parameters: Vec<u8>,
+    pub missing_value_input_dependencies: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2679,6 +2715,13 @@ fn summarize_mir_effect_dependencies(
     parameter_count: usize,
     has_loop: bool,
 ) -> Vec<MirEffectDependency> {
+    #[derive(Clone, Copy, Default)]
+    struct DependencyMasks {
+        all: u8,
+        target: u8,
+        value: u8,
+    }
+
     let Some(entry_block) = blocks.keys().next().copied() else {
         return Vec::new();
     };
@@ -2689,7 +2732,7 @@ fn summarize_mir_effect_dependencies(
     let mut incoming = BTreeMap::<usize, BTreeMap<usize, u8>>::new();
     incoming.insert(entry_block, entry);
     let mut queue = std::collections::VecDeque::from([entry_block]);
-    let mut effects = BTreeMap::<RecoveredEffectKind, u8>::new();
+    let mut effects = BTreeMap::<RecoveredEffectKind, DependencyMasks>::new();
     while let Some(block) = queue.pop_front() {
         let mut origins = incoming.get(&block).cloned().unwrap_or_default();
         for line in blocks.get(&block).into_iter().flatten() {
@@ -2700,23 +2743,26 @@ fn summarize_mir_effect_dependencies(
             if let Some((left, right)) = line.split_once(" = ") {
                 let right_dependencies = mir_local_dependencies(right, &origins);
                 if mir_is_projected_place(left) {
-                    *effects.entry(RecoveredEffectKind::MemoryWrite).or_default() |=
-                        right_dependencies | mir_local_dependencies(left, &origins);
+                    let target_dependencies = mir_local_dependencies(left, &origins);
+                    let effect = effects.entry(RecoveredEffectKind::MemoryWrite).or_default();
+                    effect.all |= right_dependencies | target_dependencies;
+                    effect.target |= target_dependencies;
+                    effect.value |= right_dependencies;
                 } else if let Some(local) = parse_plain_mir_local(left) {
                     origins.insert(local, right_dependencies);
                 }
             }
             if is_call {
-                *effects.entry(RecoveredEffectKind::Call).or_default() |=
+                effects.entry(RecoveredEffectKind::Call).or_default().all |=
                     mir_local_dependencies(line, &origins);
             } else if line.starts_with("switchInt(") || line.starts_with("assert(") {
-                *effects.entry(RecoveredEffectKind::Branch).or_default() |=
+                effects.entry(RecoveredEffectKind::Branch).or_default().all |=
                     mir_local_dependencies(line, &origins);
             } else if line.starts_with("goto ->") {
                 effects.entry(RecoveredEffectKind::Branch).or_default();
             }
             if line == "return;" {
-                *effects.entry(RecoveredEffectKind::Return).or_default() |=
+                effects.entry(RecoveredEffectKind::Return).or_default().all |=
                     origins.get(&0).copied().unwrap_or_default();
             }
         }
@@ -2741,15 +2787,23 @@ fn summarize_mir_effect_dependencies(
     if has_loop {
         let branch_dependencies = effects
             .get(&RecoveredEffectKind::Branch)
-            .copied()
+            .map(|dependencies| dependencies.all)
             .unwrap_or_default();
-        effects.insert(RecoveredEffectKind::Loop, branch_dependencies);
+        effects.insert(
+            RecoveredEffectKind::Loop,
+            DependencyMasks {
+                all: branch_dependencies,
+                ..DependencyMasks::default()
+            },
+        );
     }
     effects
         .into_iter()
         .map(|(kind, dependencies)| MirEffectDependency {
             kind,
-            input_parameters: dependency_registers_from_mask(dependencies),
+            input_parameters: dependency_registers_from_mask(dependencies.all),
+            target_input_parameters: dependency_registers_from_mask(dependencies.target),
+            value_input_parameters: dependency_registers_from_mask(dependencies.value),
         })
         .collect()
 }
@@ -2831,6 +2885,13 @@ pub fn compare_mir_effects(
     pack: &EvidencePack,
     summary: Option<&MirProgramSummary>,
 ) -> MirEffectComparison {
+    #[derive(Default)]
+    struct RequiredDependencies {
+        all: BTreeSet<u8>,
+        target: BTreeSet<u8>,
+        value: BTreeSet<u8>,
+    }
+
     let Some(summary) = summary else {
         return MirEffectComparison {
             schema_version: MIR_EFFECT_COMPARISON_SCHEMA_VERSION,
@@ -2860,24 +2921,24 @@ pub fn compare_mir_effects(
         let dependency_mismatches = required_structure_effects(pack, &function.id)
             .into_iter()
             .fold(
-                BTreeMap::<RecoveredEffectKind, BTreeSet<u8>>::new(),
+                BTreeMap::<RecoveredEffectKind, RequiredDependencies>::new(),
                 |mut dependencies, effect| {
-                    dependencies
-                        .entry(effect.kind)
-                        .or_default()
-                        .extend(effect.input_registers);
+                    let required = dependencies.entry(effect.kind).or_default();
+                    required.all.extend(effect.input_registers);
+                    required.target.extend(effect.target_input_registers);
+                    required.value.extend(effect.value_input_registers);
                     dependencies
                 },
             )
             .into_iter()
-            .filter_map(|(kind, required_inputs)| {
-                let observed_inputs = candidate
-                    .and_then(|candidate| {
-                        candidate
-                            .effect_dependencies
-                            .iter()
-                            .find(|dependency| dependency.kind == kind)
-                    })
+            .filter_map(|(kind, required)| {
+                let observed_dependency = candidate.and_then(|candidate| {
+                    candidate
+                        .effect_dependencies
+                        .iter()
+                        .find(|dependency| dependency.kind == kind)
+                });
+                let observed_inputs = observed_dependency
                     .map(|dependency| {
                         dependency
                             .input_parameters
@@ -2886,15 +2947,53 @@ pub fn compare_mir_effects(
                             .collect::<BTreeSet<_>>()
                     })
                     .unwrap_or_default();
-                let missing_inputs = required_inputs
+                let observed_targets = observed_dependency
+                    .map(|dependency| {
+                        dependency
+                            .target_input_parameters
+                            .iter()
+                            .copied()
+                            .collect::<BTreeSet<_>>()
+                    })
+                    .unwrap_or_default();
+                let observed_values = observed_dependency
+                    .map(|dependency| {
+                        dependency
+                            .value_input_parameters
+                            .iter()
+                            .copied()
+                            .collect::<BTreeSet<_>>()
+                    })
+                    .unwrap_or_default();
+                let missing_inputs = required
+                    .all
                     .difference(&observed_inputs)
                     .copied()
                     .collect::<Vec<_>>();
-                (!missing_inputs.is_empty()).then(|| MirDependencyMismatch {
+                let missing_targets = required
+                    .target
+                    .difference(&observed_targets)
+                    .copied()
+                    .collect::<Vec<_>>();
+                let missing_values = required
+                    .value
+                    .difference(&observed_values)
+                    .copied()
+                    .collect::<Vec<_>>();
+                (!missing_inputs.is_empty()
+                    || !missing_targets.is_empty()
+                    || !missing_values.is_empty())
+                .then(|| MirDependencyMismatch {
                     kind,
-                    required_input_registers: required_inputs.into_iter().collect(),
+                    required_input_registers: required.all.into_iter().collect(),
                     observed_input_parameters: observed_inputs.into_iter().collect(),
                     missing_input_dependencies: missing_inputs,
+                    required_target_input_registers: required.target.into_iter().collect(),
+                    observed_target_input_parameters: observed_targets.into_iter().collect(),
+                    missing_target_input_dependencies: missing_targets,
+                    required_value_input_registers: required.value.into_iter().collect(),
+                    observed_value_input_parameters: observed_values.into_iter().collect(),
+                    missing_value_input_dependencies: missing_values,
                 })
             })
             .collect::<Vec<_>>();
@@ -2922,6 +3021,7 @@ pub fn compare_mir_effects(
         functions,
         limitations: vec![
             "MIR effect coverage checks category presence, not semantic equivalence or one-to-one instruction lowering".into(),
+            "memory-write target and value dependencies are role-checked after aggregation by effect class; individual SBPF stores are not yet paired one-to-one with MIR assignments".into(),
             "rustc textual MIR is parsed into a versioned SOS summary because the upstream text format is not stable".into(),
         ],
     }
@@ -3765,13 +3865,36 @@ fn validate_structure_candidate(
         let mut normalized_inputs = effect.input_registers.clone();
         normalized_inputs.sort_unstable();
         normalized_inputs.dedup();
-        if normalized_inputs != effect.input_registers
-            || normalized_inputs
-                .iter()
-                .any(|register| !(1..=5).contains(register))
+        let mut normalized_targets = effect.target_input_registers.clone();
+        normalized_targets.sort_unstable();
+        normalized_targets.dedup();
+        let mut normalized_values = effect.value_input_registers.clone();
+        normalized_values.sort_unstable();
+        normalized_values.dedup();
+        let role_union = normalized_targets
+            .iter()
+            .chain(&normalized_values)
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if [
+            (&normalized_inputs, &effect.input_registers),
+            (&normalized_targets, &effect.target_input_registers),
+            (&normalized_values, &effect.value_input_registers),
+        ]
+        .iter()
+        .any(|(normalized, supplied)| {
+            normalized != supplied
+                || normalized
+                    .iter()
+                    .any(|register| !(1..=5).contains(register))
+        }) || effect.kind != RecoveredEffectKind::MemoryWrite
+            && (!normalized_targets.is_empty() || !normalized_values.is_empty())
+            || effect.kind == RecoveredEffectKind::MemoryWrite && role_union != normalized_inputs
         {
             return Err(AiError::InvalidResponse(format!(
-                "structure candidate for {} has invalid or non-canonical effect input registers",
+                "structure candidate for {} has invalid, non-canonical, or inapplicable effect dependency roles",
                 function.function_id
             )));
         }
@@ -3781,6 +3904,8 @@ fn validate_structure_candidate(
                     effect.kind,
                     evidence.location.clone(),
                     normalized_inputs.clone(),
+                    normalized_targets.clone(),
+                    normalized_values.clone(),
                 ));
             }
         }
@@ -3792,12 +3917,18 @@ fn validate_structure_candidate(
                 required.kind,
                 required.location.clone(),
                 required.input_registers.clone(),
+                required.target_input_registers.clone(),
+                required.value_input_registers.clone(),
             ))
         })
         .map(|required| {
             format!(
-                "{:?}:{}<-{:?}",
-                required.kind, required.location, required.input_registers
+                "{:?}:{}<-all:{:?},target:{:?},value:{:?}",
+                required.kind,
+                required.location,
+                required.input_registers,
+                required.target_input_registers,
+                required.value_input_registers
             )
         })
         .collect::<Vec<_>>();
@@ -4667,6 +4798,8 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
         assert!(function.effect_dependencies.iter().any(|dependency| {
             dependency.kind == RecoveredEffectKind::MemoryWrite
                 && dependency.input_parameters == vec![1, 2, 3]
+                && dependency.target_input_parameters == vec![1, 3]
+                && dependency.value_input_parameters == vec![2]
         }));
 
         let mut pack = empty_pack();
@@ -4734,6 +4867,8 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
                 effect_dependencies: vec![MirEffectDependency {
                     kind: RecoveredEffectKind::Return,
                     input_parameters: Vec::new(),
+                    target_input_parameters: Vec::new(),
+                    value_input_parameters: Vec::new(),
                 }],
             }],
         };
@@ -4746,7 +4881,7 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
     }
 
     #[test]
-    fn mir_effect_comparison_rejects_dropped_input_dependencies() {
+    fn mir_effect_comparison_rejects_swapped_memory_dependency_roles() {
         let mut analysis = empty_pack().analysis;
         analysis.instructions[0] = InstructionFact {
             pc: 0,
@@ -4783,7 +4918,9 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
                 has_loop: false,
                 effect_dependencies: vec![MirEffectDependency {
                     kind: RecoveredEffectKind::MemoryWrite,
-                    input_parameters: vec![1],
+                    input_parameters: vec![1, 2],
+                    target_input_parameters: vec![2],
+                    value_input_parameters: vec![1],
                 }],
             }],
         };
@@ -4791,8 +4928,15 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
         let comparison = compare_mir_effects(&pack, Some(&summary));
         assert_eq!(comparison.status, MirEffectComparisonStatus::Mismatch);
         assert!(comparison.functions[0].missing.is_empty());
+        assert!(comparison.functions[0].dependency_mismatches[0]
+            .missing_input_dependencies
+            .is_empty());
         assert_eq!(
-            comparison.functions[0].dependency_mismatches[0].missing_input_dependencies,
+            comparison.functions[0].dependency_mismatches[0].missing_target_input_dependencies,
+            vec![1]
+        );
+        assert_eq!(
+            comparison.functions[0].dependency_mismatches[0].missing_value_input_dependencies,
             vec![2]
         );
     }
@@ -5276,6 +5420,25 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
     fn structure_recovery_must_cover_deterministic_effect_contract() {
         let mut pack = empty_pack();
         pack.task = ModelTask::StructureRecovery;
+        pack.analysis.instructions[0] = InstructionFact {
+            pc: 0,
+            opcode: 0x7b,
+            dst: 1,
+            src: 2,
+            offset: 0,
+            immediate: 0,
+            assembly: "stxdw [r1], r2".into(),
+        };
+        pack.analysis.memory_accesses = vec![sos_analysis::MemoryAccessFact {
+            pc: 0,
+            kind: "store".into(),
+            width: 8,
+            base_register: 1,
+            value_register: Some(2),
+            offset: 0,
+            immediate: None,
+            assembly: "stxdw [r1], r2".into(),
+        }];
         pack.ir.operations[0].kind = "store".into();
         pack.ir.operations[0].assembly = "stxdw [r1+0x0], r2".into();
         pack.ir.operations[0].memory_effect = Some("store:8:1+0".into());
@@ -5319,9 +5482,16 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
             max_output_tokens: 1_200,
         };
         let effect = |kind: &str, location: &str| {
+            let (inputs, targets, values) = if kind == "memory_write" {
+                (vec![1, 2], vec![1], vec![2])
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
             serde_json::json!({
                 "kind": kind,
-                "input_registers": [],
+                "input_registers": inputs,
+                "target_input_registers": targets,
+                "value_input_registers": values,
                 "evidence": [{"source": "ir", "location": location, "detail": null}]
             })
         };
@@ -5342,6 +5512,13 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
         wrong_dependencies["functions"][0]["effects"][0]["input_registers"] =
             serde_json::json!([1]);
         assert!(validate_structured_consistency(&request, &wrong_dependencies).is_err());
+
+        let mut swapped_roles = valid.clone();
+        swapped_roles["functions"][0]["effects"][0]["target_input_registers"] =
+            serde_json::json!([2]);
+        swapped_roles["functions"][0]["effects"][0]["value_input_registers"] =
+            serde_json::json!([1]);
+        assert!(validate_structured_consistency(&request, &swapped_roles).is_err());
 
         let mut missing_write = valid;
         missing_write["functions"][0]["effects"]

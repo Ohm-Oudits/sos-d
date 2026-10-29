@@ -405,7 +405,8 @@ structural effect coverage, not semantic equivalence. Replay proves behavior
 only for the selected paths. Deterministic function-level recompilation scoring
 and automatic pinned candidate rebuilding are implemented. The rebuild gate
 rejects toolchain drift, requires a lockfile, captures bounded build provenance,
-and prevents stale candidate reuse. The remaining judge work is type-layout
-verification, deeper memory/alias dependency correspondence,
+and prevents stale candidate reuse. Memory-write dependencies now distinguish
+destination-address inputs from stored-value inputs across SBPF and MIR. The
+remaining judge work is type-layout verification, per-store alias/offset pairing,
 stronger call-graph non-regression constraints, and multi-transaction path
 coverage.

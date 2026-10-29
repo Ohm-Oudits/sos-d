@@ -204,7 +204,10 @@ candidate MIR. A model cannot satisfy this gate merely by returning an effect
 ledger while omitting the corresponding write, branch, loop, call, or return
 from its code. SOS also propagates incoming SBPF `r1`-`r5` identities through
 register operations and CFG joins, then requires candidate MIR effects to retain
-those positional input dependencies. MIR coverage is still a structural
+those positional input dependencies. Memory writes separately preserve which
+inputs influence the destination address and which influence the stored value,
+so swapping an account pointer with its data is rejected even when the same
+inputs remain present overall. MIR coverage is still a structural
 non-regression check, not a claim of semantic equivalence.
 
 ### Local open-weight semantic lifting

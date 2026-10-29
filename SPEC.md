@@ -214,6 +214,12 @@ also emit a bounded set of evidence-linked observations (`log_contains`, `cpi_ta
 can promote those observations to `behaviorally_validated`. A repair pass receives
 only capped compiler/mismatch feedback and is limited by `--repair-rounds`.
 
+For every SBPF memory write, the deterministic dependency contract must keep
+destination-address inputs separate from stored-value inputs. The structure
+ledger and compiler-produced MIR summary must preserve both roles in addition
+to their union. A candidate that uses the correct parameters but swaps pointer
+and value roles is a mismatch and must be returned to bounded repair.
+
 `sos judge <original.so> <candidate.so>` is the deterministic recompilation
 gate. Both inputs must pass the normal ELF/SBPF analyzer. The judge must pair
 functions without trusting recovered source names and emit a versioned JSON

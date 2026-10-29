@@ -49,8 +49,8 @@ const HUMANIZATION_PROMPT_VERSION: &str = "sos-v1";
 const DETERMINISTIC_HUMANIZER_ID: &str = "sos-deterministic-syntax-v1";
 const HUMANIZATION_CACHE_SCHEMA_VERSION: u32 = 1;
 const HUMANIZATION_CACHE_RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
-const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v6";
-const LIFT_CACHE_SCHEMA_VERSION: u32 = 7;
+const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v7";
+const LIFT_CACHE_SCHEMA_VERSION: u32 = 8;
 const LIFT_CACHE_RECORD_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 fn main() -> ExitCode {
@@ -717,10 +717,12 @@ fn validate_command_inner(args: Vec<String>, announce_output: bool) -> ExitCode 
                         let missing_dependencies =
                             function.dependency_mismatches.iter().map(|mismatch| {
                                 format!(
-                                    "candidate MIR for {} {:?} effect omits input dependencies {:?}",
+                                    "candidate MIR for {} {:?} effect omits dependencies all={:?}, write_target={:?}, write_value={:?}",
                                     function.function_id,
                                     mismatch.kind,
-                                    mismatch.missing_input_dependencies
+                                    mismatch.missing_input_dependencies,
+                                    mismatch.missing_target_input_dependencies,
+                                    mismatch.missing_value_input_dependencies
                                 )
                             });
                         missing_effects.chain(missing_dependencies)
@@ -5372,6 +5374,8 @@ mod tests {
                             serde_json::json!({
                                 "kind": effect.kind,
                                 "input_registers": effect.input_registers,
+                                "target_input_registers": effect.target_input_registers,
+                                "value_input_registers": effect.value_input_registers,
                                 "evidence": [{
                                     "source": "ir",
                                     "location": effect.location,
