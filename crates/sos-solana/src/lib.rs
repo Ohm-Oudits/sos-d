@@ -269,6 +269,10 @@ pub struct ValidationCheckCandidate {
     pub offset: i16,
     pub width: u8,
     pub comparison: String,
+    #[serde(default)]
+    pub compared_value: Option<i64>,
+    #[serde(default)]
+    pub nearby_runtime_error: Option<String>,
     pub interpretations: Vec<String>,
     pub status: EvidenceStatus,
     pub evidence: Vec<EvidenceRef>,
@@ -1223,11 +1227,10 @@ fn validation_checks(
         .map(|(index, instruction)| (instruction.pc, index))
         .collect::<BTreeMap<_, _>>();
     let mut checks = Vec::new();
-    for load in analysis
-        .memory_accesses
-        .iter()
-        .filter(|access| access.kind == "load" && access.base_register == 1)
-    {
+    for load in analysis.memory_accesses.iter().filter(|access| {
+        access.kind == "load"
+            && (access.base_register == 1 || access.base_register == ebpf::FRAME_PTR_REG as u8)
+    }) {
         let Some(value_register) = load.value_register else {
             continue;
         };
@@ -1250,10 +1253,12 @@ fn validation_checks(
                 continue;
             }
             let comparison = comparison_name(branch);
-            let mut interpretations = vec![
-                "runtime_input_validation_candidate".into(),
-                "conditional_guard_candidate".into(),
-            ];
+            let mut interpretations = vec!["conditional_guard_candidate".into()];
+            if load.base_register == 1 {
+                interpretations.push("runtime_input_validation_candidate".into());
+            } else {
+                interpretations.push("stack_materialized_runtime_field_candidate".into());
+            }
             if load.width == 1 {
                 interpretations.extend([
                     "duplicate_marker_candidate".into(),
@@ -1268,7 +1273,24 @@ fn validation_checks(
                     "lamports_or_runtime_scalar_candidate".into(),
                 ]);
             }
-            let evidence_refs = vec![memory_ref(load), instruction_ref(branch)];
+            let compared_value = is_dispatch_immediate_compare(branch).then_some(branch.immediate);
+            let nearby_error = analysis
+                .immediate_constants
+                .iter()
+                .filter(|constant| constant.pc >= load_block.start_pc && constant.pc <= branch.pc)
+                .filter_map(|constant| {
+                    let value = u64::try_from(constant.value).ok()?;
+                    Some((constant, solana_builtin_error_name(value)?))
+                })
+                .max_by_key(|(constant, _)| constant.pc);
+            let nearby_runtime_error = nearby_error.map(|(_, name)| name.to_owned());
+            if let Some(name) = nearby_runtime_error.as_deref() {
+                interpretations.push(format!("nearby_return_candidate:{name}"));
+            }
+            let mut evidence_refs = vec![memory_ref(load), instruction_ref(branch)];
+            if let Some((constant, _)) = nearby_error {
+                evidence_refs.push(constant_ref(constant));
+            }
             let check = ValidationCheckCandidate {
                 load_pc: load.pc,
                 branch_pc: branch.pc,
@@ -1276,6 +1298,8 @@ fn validation_checks(
                 offset: load.offset,
                 width: load.width,
                 comparison,
+                compared_value,
+                nearby_runtime_error,
                 interpretations,
                 status: EvidenceStatus::Hypothesis,
                 evidence: evidence_refs.clone(),
@@ -1289,6 +1313,8 @@ fn validation_checks(
                     "offset": load.offset,
                     "width": load.width,
                     "comparison": check.comparison,
+                    "compared_value": check.compared_value,
+                    "nearby_runtime_error": check.nearby_runtime_error,
                     "interpretations": check.interpretations,
                 }),
                 confidence: Some(0.45),
@@ -2373,6 +2399,88 @@ mod tests {
         assert!(result.validation_checks[0]
             .interpretations
             .contains(&"signer_flag_candidate".into()));
+    }
+
+    #[test]
+    fn recovers_stack_materialized_flag_guard_with_nearby_runtime_error() {
+        let analysis = StaticAnalysis {
+            schema_version: sos_types::ANALYSIS_SCHEMA_VERSION,
+            sbpf_version: "V0".into(),
+            entrypoint: 0,
+            instructions: vec![
+                InstructionFact {
+                    pc: 0,
+                    opcode: ebpf::LD_DW_IMM,
+                    dst: 0,
+                    src: 0,
+                    offset: 0,
+                    immediate: 0x8_0000_0000,
+                    assembly: "lddw r0, 0x800000000".into(),
+                },
+                InstructionFact {
+                    pc: 2,
+                    opcode: ebpf::LD_B_REG,
+                    dst: 1,
+                    src: ebpf::FRAME_PTR_REG as u8,
+                    offset: -64,
+                    immediate: 0,
+                    assembly: "ldxb r1, [r10-64]".into(),
+                },
+                InstructionFact {
+                    pc: 3,
+                    opcode: ebpf::JNE64_IMM,
+                    dst: 1,
+                    src: 0,
+                    offset: 1,
+                    immediate: 1,
+                    assembly: "jne r1, 1, +1".into(),
+                },
+            ],
+            functions: Vec::new(),
+            basic_blocks: vec![sos_analysis::BasicBlockFact {
+                start_pc: 0,
+                end_instruction_index: 3,
+                destinations: vec![4],
+                label: "entry".into(),
+            }],
+            memory_accesses: vec![MemoryAccessFact {
+                pc: 2,
+                kind: "load".into(),
+                width: 1,
+                base_register: ebpf::FRAME_PTR_REG as u8,
+                value_register: Some(1),
+                offset: -64,
+                immediate: None,
+                assembly: "ldxb r1, [r10-64]".into(),
+            }],
+            stack_accesses: Vec::new(),
+            strings: Vec::new(),
+            public_key_candidates: Vec::new(),
+            immediate_constants: vec![ImmediateConstantFact {
+                pc: 0,
+                value: 0x8_0000_0000,
+                kind: "lddw".into(),
+                assembly: "lddw r0, 0x800000000".into(),
+            }],
+            register_uses: Vec::new(),
+            calls: Vec::new(),
+            relocations: Vec::new(),
+            sccs: Vec::new(),
+            dataflow_edges: Vec::new(),
+            verifier_diagnostics: Vec::new(),
+        };
+
+        let result = analyze(&analysis);
+
+        assert_eq!(result.validation_checks.len(), 1);
+        assert_eq!(result.validation_checks[0].compared_value, Some(1));
+        assert_eq!(
+            result.validation_checks[0].nearby_runtime_error.as_deref(),
+            Some("ERROR_MISSING_REQUIRED_SIGNATURES")
+        );
+        assert!(result.validation_checks[0]
+            .interpretations
+            .contains(&"stack_materialized_runtime_field_candidate".into()));
     }
 
     #[test]
