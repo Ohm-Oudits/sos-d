@@ -37,3 +37,5 @@ it is a deterministic regression signal rather than equivalence proof.
 The rebuild-judge contract additionally records the strict Solana toolchain gate,
 locked dependency graph, package-source hash, exact build arguments, bounded logs,
 build duration, isolated output directory, and emitted candidate hash.
+The model-qualification corpus and result contracts separate reviewed weight
+identity from measured task behavior and preserve reproducible per-case evidence.

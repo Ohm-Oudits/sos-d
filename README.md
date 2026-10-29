@@ -236,6 +236,20 @@ cargo run -p sos-cli -- lift ./analysis \
   --out ./analysis/lifted
 ```
 
+Before trusting a model for a larger run, qualify that exact model/runtime pair
+against the checked-in Solana, cybersecurity, and systems pseudocode corpus:
+
+```bash
+sos qualify-model fixtures/model-qualification-v1.json \
+  --provider ollama --model gpt-oss:20b \
+  --minimum-score 0.80 --out ./model-qualification.json
+```
+
+Qualification requires every response to pass the normal JSON schema,
+evidence-reference, and anti-cheese gates, then scores hidden semantic concept
+groups and forbidden reconstruction shortcuts. A passing score is bounded corpus
+evidence—not a declaration that the weights are universally safe or correct.
+
 The same reviewed local pipeline is available directly from a deployed address;
 no separate model-adapter command is required. Scope the first run to an entrypoint
 or handler so large programs can be lifted and reviewed incrementally:

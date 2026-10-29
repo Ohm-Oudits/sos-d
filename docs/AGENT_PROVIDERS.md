@@ -112,6 +112,21 @@ For trusted open weights, prefer one of the reviewed GPT-OSS routes:
 | Hugging Face | `openai/gpt-oss-120b:fireworks-ai` | `HF_TOKEN` |
 | Cloudflare Workers AI | `@cf/openai/gpt-oss-120b` | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` |
 
+Registry review establishes publisher, license, and expected weight family; it
+does not establish task competence. Run the reproducible qualification corpus
+against the exact local model/runtime before a security-sensitive lift:
+
+```bash
+sos qualify-model fixtures/model-qualification-v1.json \
+  --provider ollama --model gpt-oss:20b \
+  --out model-qualification.json
+```
+
+Provider-neutral adapters can be assessed with `--provider command
+--model-command PATH`. The result records each case's input hash, schema/evidence
+acceptance, missing concept groups, forbidden matches, output, score, and the
+explicit limitations of corpus-based evaluation.
+
 SOS also has direct agent transports for the OpenAI Responses API and Anthropic
 Messages API. These are execution providers, not entries in SOS's reviewed
 open-weight registry. The operator must choose an exact model ID with `--model`

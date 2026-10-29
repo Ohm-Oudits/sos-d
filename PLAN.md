@@ -330,6 +330,7 @@ Deliverables:
 - bounded evidence-pack builder;
 - structure, labeling, explanation, and validation agents;
 - prompt/model audit records and strict JSON validation.
+- versioned Solana/security/systems model-qualification corpus and score report.
 
 Tasks:
 
@@ -339,6 +340,8 @@ Tasks:
 4. Add local-model support and provider-neutral configuration.
 5. Add prompt-injection corpus using hostile strings/logs/memos.
 6. Store model ID, prompt version, temperature, input hash, and output hash.
+7. Qualify the exact model/provider pair through the ordinary schema, evidence,
+   and anti-cheese gateway before security-sensitive use.
 
 Gate: invalid or adversarial model output is rejected or downgraded to an explicit
 hypothesis; deterministic facts remain unchanged.

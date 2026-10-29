@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sos.invalid/schemas/v1/model-qualification.schema.json",
+  "title": "SOS model qualification result",
+  "type": "object",
+  "required": ["schema_version", "corpus_name", "corpus_sha256", "provider", "model", "prompt_version", "minimum_score", "overall_score", "qualified", "cases", "limitations"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "corpus_name": {"type": "string"},
+    "corpus_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "provider": {"type": "string"},
+    "model": {"type": "string"},
+    "prompt_version": {"type": "string"},
+    "minimum_score": {"type": "number", "minimum": 0, "maximum": 1},
+    "overall_score": {"type": "number", "minimum": 0, "maximum": 1},
+    "qualified": {"type": "boolean"},
+    "cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "category", "input_sha256", "schema_and_evidence_accepted", "unit_count", "matched_concepts", "required_concepts", "missing_concepts", "forbidden_matches", "score", "output", "errors"]
+      }
+    },
+    "limitations": {"type": "array", "items": {"type": "string"}}
+  }
+}

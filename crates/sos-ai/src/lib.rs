@@ -624,6 +624,226 @@ pub struct DeterministicLineMapping {
     pub output: String,
 }
 
+pub const MODEL_QUALIFICATION_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelQualificationCorpus {
+    pub schema_version: u32,
+    pub name: String,
+    pub cases: Vec<ModelQualificationCase>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelQualificationCase {
+    pub id: String,
+    pub category: String,
+    pub pseudocode: String,
+    pub required_concepts: Vec<Vec<String>>,
+    #[serde(default)]
+    pub forbidden_fragments: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelQualificationResult {
+    pub schema_version: u32,
+    pub corpus_name: String,
+    pub corpus_sha256: String,
+    pub provider: String,
+    pub model: String,
+    pub prompt_version: String,
+    pub minimum_score: f64,
+    pub overall_score: f64,
+    pub qualified: bool,
+    pub cases: Vec<ModelQualificationCaseResult>,
+    pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelQualificationCaseResult {
+    pub id: String,
+    pub category: String,
+    pub input_sha256: String,
+    pub schema_and_evidence_accepted: bool,
+    pub unit_count: usize,
+    pub matched_concepts: usize,
+    pub required_concepts: usize,
+    pub missing_concepts: Vec<Vec<String>>,
+    pub forbidden_matches: Vec<String>,
+    pub score: f64,
+    pub output: String,
+    pub errors: Vec<String>,
+}
+
+pub fn qualify_humanization_model<P: ModelProvider>(
+    provider: P,
+    provider_name: &str,
+    model: &str,
+    prompt_version: &str,
+    corpus: &ModelQualificationCorpus,
+    minimum_score: f64,
+) -> Result<ModelQualificationResult, AiError> {
+    if corpus.schema_version != MODEL_QUALIFICATION_SCHEMA_VERSION {
+        return Err(AiError::InvalidResponse(format!(
+            "unsupported model qualification corpus schema {}",
+            corpus.schema_version
+        )));
+    }
+    if corpus.name.trim().is_empty()
+        || corpus.name.len() > 256
+        || corpus.cases.is_empty()
+        || corpus.cases.len() > 64
+    {
+        return Err(AiError::InvalidResponse(
+            "model qualification corpus must contain 1..=64 cases".into(),
+        ));
+    }
+    if !minimum_score.is_finite() || !(0.0..=1.0).contains(&minimum_score) {
+        return Err(AiError::InvalidResponse(
+            "model qualification minimum score must be between 0 and 1".into(),
+        ));
+    }
+    let gateway = ModelGateway::new(provider, 2 * 1024 * 1024, 1024 * 1024);
+    let mut results = Vec::with_capacity(corpus.cases.len());
+    let mut case_ids = BTreeSet::new();
+    for case in &corpus.cases {
+        if case.id.trim().is_empty()
+            || !case_ids.insert(case.id.clone())
+            || case.category.trim().is_empty()
+            || case.id.len() > 256
+            || case.category.len() > 256
+            || case.pseudocode.is_empty()
+            || case.pseudocode.len() > 256 * 1024
+            || case.required_concepts.len() > 64
+            || case.forbidden_fragments.len() > 64
+            || case.required_concepts.iter().any(|alternatives| {
+                alternatives.is_empty()
+                    || alternatives.len() > 16
+                    || alternatives
+                        .iter()
+                        .any(|term| term.is_empty() || term.len() > 256)
+            })
+            || case
+                .forbidden_fragments
+                .iter()
+                .any(|fragment| fragment.is_empty() || fragment.len() > 256)
+        {
+            return Err(AiError::InvalidResponse(format!(
+                "qualification case {:?} exceeds corpus bounds",
+                case.id
+            )));
+        }
+        let units = partition_pseudocode(&case.pseudocode)?;
+        if units.len() > 64 {
+            return Err(AiError::InvalidResponse(format!(
+                "qualification case {:?} requires more than 64 bounded units",
+                case.id
+            )));
+        }
+        let mut output = Vec::new();
+        let mut output_bytes = 0_usize;
+        let mut errors = Vec::new();
+        for unit in &units {
+            let pack = evidence_pack_from_pseudocode_unit(unit)?;
+            match gateway.submit_with_token_budget(
+                ModelTask::PseudocodeHumanization,
+                model,
+                prompt_version,
+                pack,
+                2_400,
+            ) {
+                Ok(response) => {
+                    let parsed = serde_json::from_value::<StructureRecoveryOutput>(
+                        response.structured_output,
+                    )
+                    .map_err(|error| AiError::InvalidResponse(error.to_string()))?;
+                    for function in parsed.functions {
+                        output_bytes = output_bytes.saturating_add(function.pseudocode.len());
+                        if output_bytes > 1024 * 1024 {
+                            return Err(AiError::OutputTooLarge {
+                                bytes: output_bytes,
+                                limit: 1024 * 1024,
+                            });
+                        }
+                        output.push(function.pseudocode);
+                    }
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        let output = output.join("\n\n");
+        let lower = output.to_ascii_lowercase();
+        let missing_concepts = case
+            .required_concepts
+            .iter()
+            .filter(|alternatives| {
+                !alternatives
+                    .iter()
+                    .any(|term| lower.contains(&term.to_ascii_lowercase()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let forbidden_matches = case
+            .forbidden_fragments
+            .iter()
+            .filter(|fragment| lower.contains(&fragment.to_ascii_lowercase()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let matched_concepts = case
+            .required_concepts
+            .len()
+            .saturating_sub(missing_concepts.len());
+        let concept_score = if case.required_concepts.is_empty() {
+            1.0
+        } else {
+            matched_concepts as f64 / case.required_concepts.len() as f64
+        };
+        let accepted = errors.is_empty() && !output.trim().is_empty();
+        let score = if accepted && forbidden_matches.is_empty() {
+            concept_score
+        } else {
+            0.0
+        };
+        results.push(ModelQualificationCaseResult {
+            id: case.id.clone(),
+            category: case.category.clone(),
+            input_sha256: sha256_bytes(case.pseudocode.as_bytes()),
+            schema_and_evidence_accepted: accepted,
+            unit_count: units.len(),
+            matched_concepts,
+            required_concepts: case.required_concepts.len(),
+            missing_concepts,
+            forbidden_matches,
+            score,
+            output,
+            errors,
+        });
+    }
+    let overall_score = results.iter().map(|case| case.score).sum::<f64>() / results.len() as f64;
+    let qualified = overall_score >= minimum_score
+        && results
+            .iter()
+            .all(|case| case.schema_and_evidence_accepted && case.forbidden_matches.is_empty());
+    Ok(ModelQualificationResult {
+        schema_version: MODEL_QUALIFICATION_SCHEMA_VERSION,
+        corpus_name: corpus.name.clone(),
+        corpus_sha256: sha256_json(corpus),
+        provider: provider_name.into(),
+        model: model.into(),
+        prompt_version: prompt_version.into(),
+        minimum_score,
+        overall_score,
+        qualified,
+        cases: results,
+        limitations: vec![
+            "qualification measures this bounded corpus and provider response, not universal model correctness".into(),
+            "semantic concept matching is case-insensitive substring matching after schema, evidence, and anti-cheese validation".into(),
+            "model outputs remain untrusted hypotheses and still require compiler, replay, and binary gates".into(),
+        ],
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidencePack {
     pub schema_version: u32,
@@ -6373,5 +6593,100 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
         assert!(fallback
             .pseudocode
             .contains("quoted = \"not *(u64 *)(an expression)\";"));
+    }
+
+    #[derive(Clone)]
+    struct QualificationProvider;
+
+    impl ModelProvider for QualificationProvider {
+        fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
+            let function_id = request.evidence_pack.ir.functions[0].id.clone();
+            Ok(ModelResponse {
+                task: request.task,
+                model: request.model,
+                prompt_version: request.prompt_version,
+                structured_output: serde_json::json!({
+                    "functions": [{
+                        "function_id": function_id,
+                        "pseudocode": format!(
+                            "fn {}() {{ require signer; verify owner; reject invalid instruction tag; match instruction; invoke token program; checked arithmetic; }}",
+                            request.evidence_pack.ir.functions[0].id
+                        ),
+                        "evidence": [{
+                            "source": "ir",
+                            "location": format!("function:{}", request.evidence_pack.ir.functions[0].id),
+                            "detail": null
+                        }]
+                    }]
+                }),
+                evidence: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn model_qualification_requires_schema_evidence_and_semantic_concepts() {
+        let corpus = ModelQualificationCorpus {
+            schema_version: MODEL_QUALIFICATION_SCHEMA_VERSION,
+            name: "test-solana-security".into(),
+            cases: vec![
+                ModelQualificationCase {
+                    id: "account-guard".into(),
+                    category: "solana-security".into(),
+                    pseudocode: "void guard(Account *a) { if (!a->signer) return 1; if (a->owner != expected) return 2; }".into(),
+                    required_concepts: vec![
+                        vec!["signer".into()],
+                        vec!["owner".into()],
+                        vec!["reject".into(), "error".into()],
+                    ],
+                    forbidden_fragments: vec!["sos_raw_op".into()],
+                },
+                ModelQualificationCase {
+                    id: "dispatch-cpi".into(),
+                    category: "solana-blockchain".into(),
+                    pseudocode: "void dispatch(u8 tag) { if (tag == 1) token_cpi(); else abort(); }".into(),
+                    required_concepts: vec![
+                        vec!["instruction tag".into(), "discriminator".into()],
+                        vec!["match".into(), "branch".into()],
+                        vec!["token program".into(), "cpi".into()],
+                    ],
+                    forbidden_fragments: vec!["goto".into()],
+                },
+            ],
+        };
+        let result = qualify_humanization_model(
+            QualificationProvider,
+            "test_provider",
+            "test-model",
+            "qualification-v1",
+            &corpus,
+            1.0,
+        )
+        .unwrap();
+        assert!(result.qualified);
+        assert_eq!(result.overall_score, 1.0);
+        assert!(result
+            .cases
+            .iter()
+            .all(|case| case.schema_and_evidence_accepted));
+
+        let mut impossible = corpus;
+        impossible.cases[0]
+            .required_concepts
+            .push(vec!["rent epoch".into()]);
+        let result = qualify_humanization_model(
+            QualificationProvider,
+            "test_provider",
+            "test-model",
+            "qualification-v1",
+            &impossible,
+            1.0,
+        )
+        .unwrap();
+        assert!(!result.qualified);
+        assert_eq!(
+            result.cases[0].missing_concepts,
+            vec![vec![String::from("rent epoch")]]
+        );
     }
 }

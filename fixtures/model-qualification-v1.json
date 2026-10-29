@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "name": "sos-solana-security-humanization-v1",
+  "cases": [
+    {
+      "id": "solana-account-guards",
+      "category": "solana_security",
+      "pseudocode": "u64 check_account(Account *account, Pubkey *expected_owner) { if (account->is_signer == 0) return 7; if (memcmp(account->owner, expected_owner, 32) != 0) return 8; return 0; }",
+      "required_concepts": [
+        ["signer"],
+        ["owner"],
+        ["error", "reject", "invalid"],
+        ["success", "ok", "return 0"]
+      ],
+      "forbidden_fragments": ["sos_raw_op", "inline assembly"]
+    },
+    {
+      "id": "instruction-dispatch-and-cpi",
+      "category": "solana_blockchain",
+      "pseudocode": "u64 process(u8 *data, u64 len) { if (len < 1) return 1; switch (data[0]) { case 0: return transfer_checked_cpi(data + 1); case 1: return close_account_cpi(); default: return 2; } }",
+      "required_concepts": [
+        ["instruction tag", "discriminator", "opcode"],
+        ["length", "empty"],
+        ["transfer"],
+        ["close account", "close_account"],
+        ["cpi", "invoke"]
+      ],
+      "forbidden_fragments": ["sos_raw_op", "unknown_memory_write"]
+    },
+    {
+      "id": "checked-arithmetic-and-bounds",
+      "category": "cybersecurity",
+      "pseudocode": "u64 update(u64 *balance, u64 amount, u8 *buffer, u64 index, u64 size) { if (index >= size) return 3; u64 old = *balance; u64 next = old + amount; if (next < old) return 4; buffer[index] = 1; *balance = next; return 0; }",
+      "required_concepts": [
+        ["bounds", "index"],
+        ["overflow", "checked"],
+        ["balance"],
+        ["error", "reject", "invalid"]
+      ],
+      "forbidden_fragments": ["sos_raw_op", "unsafe unchecked"]
+    },
+    {
+      "id": "decompiler-loop-recovery",
+      "category": "computer_systems",
+      "pseudocode": "void clear(u8 *dst, u64 n) { u64 i = 0; LAB_1: if (i >= n) goto LAB_2; *(dst + i) = 0; i = i + 1; goto LAB_1; LAB_2: return; }",
+      "required_concepts": [
+        ["loop", "while", "for"],
+        ["clear", "zero"],
+        ["length", " n"],
+        ["destination", "dst", "buffer"]
+      ],
+      "forbidden_fragments": ["goto lab_", "sos_raw_op", "inline assembly"]
+    }
+  ]
+}

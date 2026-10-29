@@ -184,6 +184,15 @@ cannot alter facts, evidence references, or confidence values directly.
 The model gateway must support local and remote providers, prompt/model versioning,
 timeouts, token/size budgets, redaction, deterministic settings, and audit logs.
 
+Reviewed model identity and demonstrated task competence are separate claims.
+SOS must provide a versioned qualification corpus and command that runs the exact
+model/runtime through the ordinary schema, evidence, and anti-cheese gateway,
+then scores Solana, cybersecurity, and systems reconstruction concepts without
+placing expected answers in the prompt. Qualification output must retain input
+hashes, accepted/rejected state, missing concepts, forbidden shortcuts, per-case
+scores, aggregate threshold, and limitations. Passing this bounded corpus must
+not be represented as universal model trust or semantic correctness.
+
 The local integration uses an explicitly configured subprocess protocol: one JSON
 `ModelRequest` on stdin and one JSON `ModelResponse` on stdout. Hosted providers use
 the same provider-neutral request/response contract over bounded HTTP. The gateway validates
