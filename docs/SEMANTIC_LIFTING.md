@@ -133,6 +133,12 @@ reconstruction and Patina's staged region recovery while keeping each request
 reviewable and within hosted token limits. The CLI defaults to 16 units per run
 and requires an explicit `--max-units N` increase for larger submissions.
 
+The partitioner extracts conservative function symbols and calls to other known
+symbols. Each synthetic IR function keeps its recovered name. Accepted output
+from up to two earlier units is passed to the next request as bounded, explicitly
+untrusted context, following the iterative GoonFi/Patina pattern without allowing
+model output to replace line-level evidence.
+
 Use `--plan` to write the source hash, detected line ranges, synthetic function
 IDs, operation counts, and per-unit hashes without requiring an API key or
 contacting any model:

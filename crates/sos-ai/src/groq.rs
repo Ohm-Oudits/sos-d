@@ -239,6 +239,21 @@ pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::V
         })
         .collect::<Vec<_>>();
     if pack.task == ModelTask::PseudocodeHumanization {
+        let context = pack
+            .untrusted_evidence
+            .iter()
+            .rev()
+            .take(3)
+            .map(|item| {
+                serde_json::json!({
+                    "source": item.source,
+                    "content": serde_json::from_str::<serde_json::Value>(&item.content)
+                        .unwrap_or_else(|_| serde_json::Value::String(
+                            item.content.chars().take(2_048).collect()
+                        )),
+                })
+            })
+            .collect::<Vec<_>>();
         return serde_json::json!({
             "schema_version": pack.schema_version,
             "task": pack.task,
@@ -253,7 +268,8 @@ pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::V
                 "operations": operations,
                 "operations_total": pack.ir.operations.len(),
                 "truncated": pack.ir.operations.len() > operation_limit,
-            }
+            },
+            "bounded_context_untrusted": context,
         });
     }
     let prior = pack

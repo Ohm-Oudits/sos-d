@@ -1602,6 +1602,8 @@ fn build_humanization_plan(
             "start_line": unit.start_line,
             "end_line": unit.end_line,
             "function_id": pack.ir.functions.first().map(|function| &function.id),
+            "function_name": unit.function_name,
+            "referenced_functions": unit.referenced_functions,
             "operation_count": pack.ir.operations.len(),
             "unit_sha256": pack.artifact_sha256,
         }));
@@ -1624,6 +1626,7 @@ where
         unit_audits: Vec::with_capacity(units.len()),
         failures: 0,
     };
+    let mut accepted_context = Vec::<UntrustedEvidence>::new();
     for (index, unit) in units.iter().enumerate() {
         eprintln!(
             "humanizing unit {}/{}: {} (lines {}-{})",
@@ -1633,7 +1636,7 @@ where
             unit.start_line,
             unit.end_line
         );
-        let pack = match evidence_pack_from_pseudocode_unit(unit) {
+        let mut pack = match evidence_pack_from_pseudocode_unit(unit) {
             Ok(pack) => pack,
             Err(error) => {
                 run.failures += 1;
@@ -1649,6 +1652,9 @@ where
                 continue;
             }
         };
+        let context_start = accepted_context.len().saturating_sub(2);
+        pack.untrusted_evidence
+            .extend_from_slice(&accepted_context[context_start..]);
         let expected_function = pack
             .ir
             .functions
@@ -1674,6 +1680,15 @@ where
                         .find(|function| function.function_id == expected_function)
                 });
                 if let Some(function) = candidate {
+                    let prior = serde_json::to_string(&response.structured_output)
+                        .unwrap_or_else(|_| "{}".into())
+                        .chars()
+                        .take(4_096)
+                        .collect::<String>();
+                    accepted_context.push(UntrustedEvidence {
+                        source: format!("accepted_humanization:{}", unit.id),
+                        content: prior,
+                    });
                     run.readable_fragments.push(format!(
                         "// {}: original pseudocode lines {}-{}; evidence function {}\n{}",
                         unit.id,
@@ -2998,6 +3013,7 @@ fn usage() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
     use super::{
         run_humanization_units, transaction_account_addresses, BenchmarkOptions, ExplainOptions,
@@ -3168,9 +3184,19 @@ mod tests {
     #[test]
     fn humanize_merges_every_automatically_partitioned_unit() {
         #[derive(Clone)]
-        struct FakeHumanizer;
+        struct FakeHumanizer {
+            contexts: Arc<Mutex<Vec<Vec<String>>>>,
+        }
         impl ModelProvider for FakeHumanizer {
             fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
+                self.contexts.lock().unwrap().push(
+                    request
+                        .evidence_pack
+                        .untrusted_evidence
+                        .iter()
+                        .map(|item| item.source.clone())
+                        .collect(),
+                );
                 let function_id = request.evidence_pack.ir.functions[0].id.clone();
                 let operation_id = request.evidence_pack.ir.operations[0].id.clone();
                 Ok(ModelResponse {
@@ -3198,12 +3224,24 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let units = sos_ai::partition_pseudocode(&source).unwrap();
-        let run = run_humanization_units(FakeHumanizer, "test", &units);
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let run = run_humanization_units(
+            FakeHumanizer {
+                contexts: contexts.clone(),
+            },
+            "test",
+            &units,
+        );
         assert_eq!(units.len(), 3);
         assert_eq!(run.failures, 0);
         assert_eq!(run.readable_fragments.len(), 3);
         assert_eq!(run.unit_audits.len(), 3);
         assert!(run.readable_fragments[1].contains("lines 129-256"));
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 3);
+        assert!(contexts[1]
+            .iter()
+            .any(|source| source == "accepted_humanization:unit_0001"));
     }
 
     #[test]

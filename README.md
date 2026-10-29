@@ -251,6 +251,9 @@ function boundaries and partitions larger input into free-tier-sized units of
 at most 128 evidence operations, following the GoonFi/Patina workflow. Hosted
 rate-limit pacing applies between units. A run defaults to at most 16 units;
 review the partition and pass `--max-units N` to authorize a larger run.
+Detected function names and known call relationships are attached to each unit.
+Up to two accepted earlier reconstructions are supplied to the next unit as
+explicitly untrusted context; deterministic line evidence remains authoritative.
 
 Preview decomposition without loading or contacting any model:
 

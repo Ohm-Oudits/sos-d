@@ -187,6 +187,8 @@ pub struct PseudocodeUnit {
     pub start_line: usize,
     pub end_line: usize,
     pub source: String,
+    pub function_name: Option<String>,
+    pub referenced_functions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -614,6 +616,7 @@ pub fn partition_pseudocode(source: &str) -> Result<Vec<PseudocodeUnit>, AiError
         operation_count = operation_count.saturating_add(line_operations);
     }
     push_pseudocode_unit(&mut units, &lines, start, lines.len())?;
+    annotate_pseudocode_units(&mut units, &lines);
     Ok(units)
 }
 
@@ -663,8 +666,59 @@ fn push_pseudocode_unit(
         start_line: start + 1,
         end_line: end,
         source: lines[start..end].join("\n"),
+        function_name: None,
+        referenced_functions: Vec::new(),
     });
     Ok(())
+}
+
+fn annotate_pseudocode_units(units: &mut [PseudocodeUnit], lines: &[&str]) {
+    let declarations = lines
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| looks_like_function_start(lines, *index))
+        .filter_map(|(index, line)| pseudocode_function_name(line).map(|name| (index + 1, name)))
+        .collect::<Vec<_>>();
+    let known_names = declarations
+        .iter()
+        .map(|(_, name)| name.clone())
+        .collect::<BTreeSet<_>>();
+    for unit in units {
+        unit.function_name = declarations
+            .iter()
+            .rfind(|(line, _)| *line <= unit.start_line)
+            .map(|(_, name)| name.clone());
+        unit.referenced_functions = known_names
+            .iter()
+            .filter(|name| unit.function_name.as_ref() != Some(*name))
+            .filter(|name| contains_pseudocode_call(&unit.source, name))
+            .cloned()
+            .collect();
+    }
+}
+
+fn pseudocode_function_name(line: &str) -> Option<String> {
+    let prefix = line.trim().split_once('(')?.0.trim();
+    let candidate = prefix
+        .strip_prefix("fn ")
+        .unwrap_or(prefix)
+        .split_whitespace()
+        .last()?
+        .trim_matches(|character: char| matches!(character, '*' | '&'));
+    if candidate.is_empty()
+        || !candidate
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return None;
+    }
+    Some(candidate.into())
+}
+
+fn contains_pseudocode_call(source: &str, function_name: &str) -> bool {
+    let needle = format!("{function_name}(");
+    let spaced = format!("{function_name} (");
+    source.contains(&needle) || source.contains(&spaced)
 }
 
 pub fn evidence_pack_from_pseudocode(source: &str) -> Result<EvidencePack, AiError> {
@@ -738,7 +792,10 @@ pub fn evidence_pack_from_pseudocode_unit(unit: &PseudocodeUnit) -> Result<Evide
         functions: vec![FunctionFact {
             pc: function_pc,
             symbol_hash: 0,
-            name: format!("humanize_{}", unit.id),
+            name: unit
+                .function_name
+                .clone()
+                .unwrap_or_else(|| format!("humanize_{}", unit.id)),
         }],
         basic_blocks: vec![BasicBlockFact {
             start_pc: function_pc,
@@ -759,12 +816,22 @@ pub fn evidence_pack_from_pseudocode_unit(unit: &PseudocodeUnit) -> Result<Evide
         verifier_diagnostics: Vec::new(),
     };
     let semantics = sos_solana::analyze(&analysis);
+    let context = serde_json::json!({
+        "unit_id": unit.id,
+        "global_line_range": [unit.start_line, unit.end_line],
+        "declared_function": unit.function_name,
+        "referenced_known_functions": unit.referenced_functions,
+    });
     Ok(EvidencePack::from_analysis(
         ModelTask::PseudocodeHumanization,
         Some(sha256_bytes(unit.source.as_bytes())),
         analysis,
         semantics,
-    ))
+    )
+    .with_untrusted_evidence(vec![UntrustedEvidence {
+        source: "deterministic_pseudocode_index".into(),
+        content: context.to_string(),
+    }]))
 }
 
 /// Produce a deterministic one-function analysis slice. Global read-only data
@@ -3041,11 +3108,14 @@ mod tests {
     #[test]
     fn pseudocode_partitioning_prefers_functions_then_bounds_oversized_regions() {
         let functions =
-            "undefined8 first()\n{\n  return 1;\n}\nundefined8 second()\n{\n  return 2;\n}";
+            "undefined8 first()\n{\n  return 1;\n}\nundefined8 second()\n{\n  return first();\n}";
         let units = partition_pseudocode(functions).unwrap();
         assert_eq!(units.len(), 2);
         assert_eq!((units[0].start_line, units[0].end_line), (1, 4));
         assert_eq!((units[1].start_line, units[1].end_line), (5, 8));
+        assert_eq!(units[0].function_name.as_deref(), Some("first"));
+        assert_eq!(units[1].function_name.as_deref(), Some("second"));
+        assert_eq!(units[1].referenced_functions, vec!["first"]);
 
         let large = (1..=300)
             .map(|line| format!("value_{line} = value_{line} + 1;"))
