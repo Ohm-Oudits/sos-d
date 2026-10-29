@@ -237,6 +237,52 @@ sos inspect <PROGRAM_ADDRESS> \
   --out ./reports/<PROGRAM_ADDRESS>
 ```
 
+Cloudflare Workers AI is the second no-local-load option and currently includes
+a daily free allocation on Workers Free. It hosts the same reviewed GPT-OSS
+120B weights. Create a Workers AI token, export the account ID separately, and
+run:
+
+```bash
+export CLOUDFLARE_ACCOUNT_ID='32-hex-character-account-id'
+export CLOUDFLARE_API_TOKEN='...'
+sos humanize ./decompiler-output.txt \
+  --provider cloudflare \
+  --resume \
+  --out ./readable.rs \
+  --audit-out ./humanize.json
+```
+
+The transport is pinned to `@cf/openai/gpt-oss-120b` and the native Workers AI
+endpoint. SOS reads both values from the process environment, places the account
+ID only in the endpoint URL and the token only in the authorization header, and
+never stores either value in the prompt body, audit, or checkpoints.
+
+Hugging Face Inference Providers is an additional reviewed hosted route. It forwards
+the same Apache-2.0 GPT-OSS 120B weights through its OpenAI-compatible router.
+SOS pins the Fireworks route because that route documents JSON-schema output.
+Free Hugging Face accounts currently require purchased inference credits;
+PRO/Team plans include monthly credits:
+
+```bash
+export HF_TOKEN='...'
+sos humanize ./decompiler-output.txt \
+  --provider huggingface \
+  --resume \
+  --out ./readable.rs \
+  --audit-out ./humanize.json
+
+# Address-only whole-program lifting is supported too:
+sos inspect <PROGRAM_ADDRESS> \
+  --rpc-url https://api.mainnet.solana.com \
+  --provider huggingface \
+  --resume \
+  --out ./reports/<PROGRAM_ADDRESS>
+```
+
+Create `HF_TOKEN` with Inference Providers permission. The fixed router is
+`https://router.huggingface.co/v1/chat/completions`; the reviewed default model
+route is `openai/gpt-oss-120b:fireworks-ai`.
+
 Without `--function`, address-first lifting processes the complete recovered
 call graph. Known callees are lifted before callers, and accepted callee
 reconstructions are supplied to the caller as bounded, explicitly untrusted
@@ -248,8 +294,8 @@ the scoped IR, Solana semantics, and callee context and then revalidates every
 stage's provider/model/prompt identity, input and output hashes, strict schema,
 anti-cheese rules, and evidence references before reuse. Invalid checkpoints
 are ignored. Choose a stable directory with `--cache-dir DIR`; no API key is
-stored. Fully cached Groq lifts can be reconstructed without loading a local
-model or setting `GROQ_API_KEY`.
+stored. Fully cached hosted lifts can be reconstructed without loading a local
+model or setting `GROQ_API_KEY`, `HF_TOKEN`, or Cloudflare credentials.
 
 SOS never writes the key into an audit bundle and does not send raw `.so`
 bytes. It sends a bounded projection of canonical IR and recovered Solana
@@ -290,8 +336,9 @@ prompt, unit hash, complete staged evidence-pack hash, output schema,
 anti-cheese rules, and every evidence reference before reuse. Stale or edited
 checkpoints are ignored and recomputed. Use `--cache-dir DIR` with `--resume`
 to choose a stable location. A fully cached hosted run can be reconstructed
-without `GROQ_API_KEY`; any cache miss remains explicitly unresolved until the
-key is available. API keys are never written to checkpoints.
+without `GROQ_API_KEY`, `HF_TOKEN`, or Cloudflare credentials; any cache miss
+remains explicitly unresolved until the selected credentials are available. API
+keys and account identifiers are never written to checkpoints.
 
 Preview decomposition without loading or contacting any model:
 
@@ -321,7 +368,10 @@ bundle, local model-manifest provenance, and quality result.
 Use `./scripts/demo-groq.sh` for the equivalent hosted demo. It requires only a
 `GROQ_API_KEY`; it does not start Ollama or load the downloaded local weights.
 Use `./scripts/demo-humanize-groq.sh` to transform the checked-in
-Ghidra-style pseudocode fixture directly.
+Ghidra-style pseudocode fixture directly. The provider-independent alternative
+with a daily free allocation is `./scripts/demo-humanize-cloudflare.sh`, using
+Workers AI credentials and no local model. Another fallback is
+`./scripts/demo-humanize-huggingface.sh`, using `HF_TOKEN` and no local model.
 
 Hosted providers can implement the same provider-neutral JSON protocol through an
 HTTP endpoint:

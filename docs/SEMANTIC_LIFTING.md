@@ -69,6 +69,29 @@ and a free-tier-safe request cadence. The API key is read only from
 - developer-tier rate limits: <https://console.groq.com/docs/rate-limits>
 - retention and Zero Data Retention: <https://console.groq.com/docs/your-data>
 
+Cloudflare Workers AI is the reviewed free-allocation alternative. Its Free plan
+currently includes 10,000 Neurons per day, and its catalog hosts
+`@cf/openai/gpt-oss-120b`. SOS calls the fixed native model endpoint with JSON
+mode, validates the returned object again locally, and reads
+`CLOUDFLARE_ACCOUNT_ID` plus `CLOUDFLARE_API_TOKEN` only from the environment.
+
+- pricing/free allocation: <https://developers.cloudflare.com/workers-ai/platform/pricing/>
+- GPT-OSS 120B model: <https://developers.cloudflare.com/workers-ai/models/gpt-oss-120b/>
+- JSON mode: <https://developers.cloudflare.com/workers-ai/features/json-mode/>
+
+The reviewed fallback is the same OpenAI GPT-OSS 120B weights through Hugging
+Face Inference Providers, pinned to
+`openai/gpt-oss-120b:fireworks-ai`. Hugging Face documents included monthly
+inference credits for PRO/Team plans (free accounts require purchased credits),
+an OpenAI-compatible router, and JSON-schema output for this route. SOS reads
+`HF_TOKEN` only from the process environment and sends the same bounded evidence
+projection used by Groq.
+
+- GPT-OSS provider guide: <https://huggingface.co/docs/inference-providers/en/guides/gpt-oss>
+- Inference Providers API: <https://huggingface.co/docs/inference-providers/index>
+- current pricing: <https://huggingface.co/docs/inference-providers/en/pricing>
+- reviewed weights: <https://huggingface.co/openai/gpt-oss-120b>
+
 ## Running a lift
 
 ### Hosted (recommended on lower-memory machines)
@@ -84,6 +107,31 @@ cargo run -p sos-cli -- lift ./analysis \
   --function fn_0 \
   --repair-rounds 2 \
   --out ./analysis/lifted-groq
+```
+
+Or use Hugging Face's routed service without loading local weights:
+
+```bash
+export HF_TOKEN='...'
+cargo run -p sos-cli -- lift ./analysis \
+  --provider huggingface \
+  --resume \
+  --function fn_0 \
+  --repair-rounds 2 \
+  --out ./analysis/lifted-huggingface
+```
+
+For the daily no-charge Workers AI allocation:
+
+```bash
+export CLOUDFLARE_ACCOUNT_ID='32-hex-character-account-id'
+export CLOUDFLARE_API_TOKEN='...'
+cargo run -p sos-cli -- lift ./analysis \
+  --provider cloudflare \
+  --resume \
+  --function fn_0 \
+  --repair-rounds 2 \
+  --out ./analysis/lifted-cloudflare
 ```
 
 Address-first usage requires no local `.so` and defaults to the reviewed 120B
@@ -115,8 +163,8 @@ Only a compact evidence projection is hosted: canonical operation/block IDs,
 bounded disassembly, and high-value Solana semantic facts. The raw ELF is not
 sent. The complete pack stays local for hashing and evidence-reference
 validation. Generated output is untrusted and cannot change deterministic IR.
-Because the projection still reveals program behavior, enable Groq Zero Data
-Retention where available and use local inference for confidential binaries.
+Because the projection still reveals program behavior, enable provider retention
+controls where available and use local inference for confidential binaries.
 
 ### Humanizing existing pseudocode
 
@@ -131,6 +179,12 @@ sos humanize ./decompiler-output.txt \
   --out ./readable.rs \
   --audit-out ./humanize.json
 ```
+
+The same command accepts `--provider huggingface` with `HF_TOKEN`; the audited
+model identity becomes `openai/gpt-oss-120b:fireworks-ai`, so Groq and Hugging
+Face checkpoints cannot be confused or silently reused across providers.
+`--provider cloudflare` similarly binds checkpoints to
+`cloudflare_workers_ai_open_weights` and `@cf/openai/gpt-oss-120b`.
 
 The adapter creates one synthetic `fn_0` and one or more
 `op_<hex-operation-index>` records per source line. Original line and segment
@@ -165,7 +219,8 @@ references. Invalid or stale records are warned about and recomputed rather
 than trusted. The default directory is derived from `--audit-out`; specify
 `--cache-dir DIR` for a stable path. Checkpoints contain no API credentials.
 If every unit is cached, SOS can validate and reconstruct the output without a
-Groq key; missing units stay unresolved until hosted inference is available.
+selected provider token; missing units stay unresolved until hosted inference is
+available.
 
 Use `--plan` to write the source hash, detected line ranges, synthetic function
 IDs, operation counts, and per-unit hashes without requiring an API key or

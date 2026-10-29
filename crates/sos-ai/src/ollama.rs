@@ -39,6 +39,22 @@ pub const TRUSTED_OPEN_MODELS: &[OpenModelProfile] = &[
         minimum_memory_gib: 80,
         intended_use: "hosted cybersecurity, blockchain, coding, and structured analysis",
     },
+    OpenModelProfile {
+        id: "openai/gpt-oss-120b:fireworks-ai",
+        publisher: "OpenAI",
+        weights_url: "https://huggingface.co/openai/gpt-oss-120b",
+        license: "Apache-2.0",
+        minimum_memory_gib: 80,
+        intended_use: "hosted strict-JSON cybersecurity, blockchain, coding, and structured analysis through Hugging Face Inference Providers",
+    },
+    OpenModelProfile {
+        id: "@cf/openai/gpt-oss-120b",
+        publisher: "OpenAI",
+        weights_url: "https://huggingface.co/openai/gpt-oss-120b",
+        license: "Apache-2.0",
+        minimum_memory_gib: 80,
+        intended_use: "hosted cybersecurity, blockchain, coding, and structured analysis through Cloudflare Workers AI",
+    },
 ];
 
 /// Return a reviewed open-weight model profile. A content-addressed Ollama
@@ -366,6 +382,8 @@ mod tests {
         assert!(trusted_open_model("gpt-oss:20b").is_some());
         assert!(trusted_open_model("gpt-oss:20b@sha256:abc").is_some());
         assert!(trusted_open_model("openai/gpt-oss-120b").is_some());
+        assert!(trusted_open_model("openai/gpt-oss-120b:fireworks-ai").is_some());
+        assert!(trusted_open_model("@cf/openai/gpt-oss-120b").is_some());
         assert!(trusted_open_model("unknown:latest").is_none());
     }
 

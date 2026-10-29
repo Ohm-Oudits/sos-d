@@ -60,6 +60,14 @@ Already implemented in this workspace:
 - Explicit local command-model provider protocol and `sos explain` integration path.
 - Provider-neutral bounded HTTP model provider with optional bearer-token support;
   local subprocess and hosted transports now share the same gateway/schema checks.
+- Reviewed Hugging Face Inference Providers transport for the Apache-2.0
+  `openai/gpt-oss-120b:fireworks-ai` route, including strict evidence validation,
+  token isolation, bounded responses, resumable provider-bound checkpoints, and
+  no local model load.
+- Reviewed Cloudflare Workers AI transport pinned to
+  `@cf/openai/gpt-oss-120b`, with environment-only credentials, native JSON mode,
+  bounded hosted evidence, local schema/evidence revalidation, resumable
+  provider-bound checkpoints, and access to the documented daily free allocation.
 - Local model subprocesses have bounded wall-clock execution and convert stalls into
   explicit unavailable stage results.
 - AI gateway exposes bounded retry for transient provider and validation failures;

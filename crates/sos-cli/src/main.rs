@@ -12,11 +12,12 @@ use sos_ai::{
     run_pipeline, run_pipeline_with_context, run_refinement_loop, scope_analysis_to_function,
     trusted_open_model, unavailable_pipeline_bundle, validate_model_response_for_pack,
     validate_pipeline_bundle_with_context, AiPipelineBundle, AiPipelineConfig, AiStageResult,
-    AiStageStatus, CommandModelProvider, CompilationStatus, EvidencePack, EvidencePackLimits,
-    GroqModelProvider, HttpModelProvider, ModelGateway, ModelProvider, ModelResponse, ModelTask,
-    OllamaModelProvider, PseudocodeUnit, RefinementFeedback, RefinementLoopResult,
-    RefinementOutput, RefinementValidation, StructureRecoveryOutput, UntrustedEvidence,
-    VALIDATION_BUNDLE_SCHEMA_VERSION,
+    AiStageStatus, CloudflareModelProvider, CommandModelProvider, CompilationStatus, EvidencePack,
+    EvidencePackLimits, GroqModelProvider, HttpModelProvider, HuggingFaceModelProvider,
+    ModelGateway, ModelProvider, ModelResponse, ModelTask, OllamaModelProvider, PseudocodeUnit,
+    RefinementFeedback, RefinementLoopResult, RefinementOutput, RefinementValidation,
+    StructureRecoveryOutput, UntrustedEvidence, CLOUDFLARE_GPT_OSS_120B, GROQ_GPT_OSS_120B,
+    HUGGING_FACE_GPT_OSS_120B, VALIDATION_BUNDLE_SCHEMA_VERSION,
 };
 use sos_analysis::{analyze_elf, build_canonical_ir, compare_binary_analyses};
 use sos_artifact::{
@@ -1127,7 +1128,7 @@ fn inspect_command(args: Vec<String>) -> ExitCode {
             || options.model_endpoint.is_some())
     {
         eprintln!(
-            "error: inspect --resume requires a reviewed --provider ollama|groq lift, not a custom model adapter"
+            "error: inspect --resume requires a reviewed --provider ollama|groq|cloudflare|huggingface lift, not a custom model adapter"
         );
         return ExitCode::from(2);
     }
@@ -1343,7 +1344,7 @@ fn inspect_command(args: Vec<String>) -> ExitCode {
                     },
                     &analysis,
                     &semantics,
-                    "provide --model-command PATH, --model-endpoint URL, or a reviewed open-weight model with --provider ollama|groq",
+                    "provide --model-command PATH, --model-endpoint URL, or a reviewed open-weight model with --provider ollama|groq|cloudflare|huggingface",
                 ),
                 None,
             ),
@@ -1648,6 +1649,8 @@ fn decompile_command(args: Vec<String>) -> ExitCode {
 enum LiftProvider {
     Ollama,
     Groq,
+    HuggingFace,
+    Cloudflare,
 }
 
 impl LiftProvider {
@@ -1655,9 +1658,33 @@ impl LiftProvider {
         match value {
             "ollama" => Ok(Self::Ollama),
             "groq" => Ok(Self::Groq),
+            "huggingface" | "hf" => Ok(Self::HuggingFace),
+            "cloudflare" | "workers-ai" => Ok(Self::Cloudflare),
             _ => Err(format!(
-                "unsupported lift provider {value:?}; use ollama or groq"
+                "unsupported lift provider {value:?}; use ollama, groq, huggingface, or cloudflare"
             )),
+        }
+    }
+
+    fn validate_model(self, model: &str) -> Result<(), String> {
+        let required = match self {
+            Self::Ollama => return Ok(()),
+            Self::Groq => GROQ_GPT_OSS_120B,
+            Self::HuggingFace => HUGGING_FACE_GPT_OSS_120B,
+            Self::Cloudflare => CLOUDFLARE_GPT_OSS_120B,
+        };
+        if model == required {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} provider is pinned to {required}, not {model:?}",
+                match self {
+                    Self::Groq => "Groq",
+                    Self::HuggingFace => "Hugging Face",
+                    Self::Cloudflare => "Cloudflare Workers AI",
+                    Self::Ollama => unreachable!(),
+                }
+            ))
         }
     }
 }
@@ -1681,7 +1708,7 @@ impl HumanizeOptions {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let Some(input) = args.first().map(PathBuf::from) else {
             return Err(
-                "usage: sos humanize <pseudocode-file> [--plan] [--resume] [--cache-dir DIR] [--provider groq|ollama] [--model MODEL] [--max-units N] [--out PATH] [--audit-out PATH]".into(),
+                "usage: sos humanize <pseudocode-file> [--plan] [--resume] [--cache-dir DIR] [--provider groq|cloudflare|huggingface|ollama] [--model MODEL] [--max-units N] [--out PATH] [--audit-out PATH]".into(),
             );
         };
         let mut output = input.clone();
@@ -1694,7 +1721,7 @@ impl HumanizeOptions {
             audit_output,
             cache_dir: None,
             provider: LiftProvider::Groq,
-            model: "openai/gpt-oss-120b".into(),
+            model: GROQ_GPT_OSS_120B.into(),
             ollama_url: "http://127.0.0.1:11434".into(),
             allow_unreviewed_model: false,
             max_units: 16,
@@ -1747,7 +1774,9 @@ impl HumanizeOptions {
         }
         if !model_explicit {
             options.model = match options.provider {
-                LiftProvider::Groq => "openai/gpt-oss-120b",
+                LiftProvider::Groq => GROQ_GPT_OSS_120B,
+                LiftProvider::HuggingFace => HUGGING_FACE_GPT_OSS_120B,
+                LiftProvider::Cloudflare => CLOUDFLARE_GPT_OSS_120B,
                 LiftProvider::Ollama => "gpt-oss:20b",
             }
             .into();
@@ -1758,6 +1787,7 @@ impl HumanizeOptions {
                 options.model
             ));
         }
+        options.provider.validate_model(&options.model)?;
         if options.output == options.input || options.audit_output == options.input {
             return Err("humanize output paths must not overwrite the input pseudocode".into());
         }
@@ -1912,7 +1942,7 @@ impl ModelProvider for UnavailableHostedProvider {
         _request: sos_ai::ModelRequest,
     ) -> Result<ModelResponse, sos_ai::AiError> {
         Err(sos_ai::AiError::Provider(
-            "validated checkpoint miss requires GROQ_API_KEY for hosted inference".into(),
+            "validated checkpoint miss requires the selected hosted provider token".into(),
         ))
     }
 }
@@ -2249,6 +2279,8 @@ fn humanize_command(args: Vec<String>) -> ExitCode {
     }
     let provider_name = match options.provider {
         LiftProvider::Groq => "groq_hosted_open_weights",
+        LiftProvider::HuggingFace => "huggingface_inference_open_weights",
+        LiftProvider::Cloudflare => "cloudflare_workers_ai_open_weights",
         LiftProvider::Ollama => "ollama_local_open_weights",
     };
     let cache = options
@@ -2285,6 +2317,65 @@ fn humanize_command(args: Vec<String>) -> ExitCode {
             }
             Err(_) => {
                 eprintln!("error: GROQ_API_KEY is required for --provider groq");
+                return ExitCode::from(2);
+            }
+        },
+        LiftProvider::HuggingFace => match env::var("HF_TOKEN") {
+            Ok(token) => {
+                let provider = match HuggingFaceModelProvider::new(token) {
+                    Ok(provider) => provider,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        return ExitCode::from(2);
+                    }
+                };
+                run_humanization_units(provider, &options.model, &units, cache.as_ref())
+            }
+            Err(_) if options.resume => {
+                eprintln!(
+                    "HF_TOKEN is not set; validating checkpoints and preserving cache misses as unresolved"
+                );
+                run_humanization_units(
+                    UnavailableHostedProvider,
+                    &options.model,
+                    &units,
+                    cache.as_ref(),
+                )
+            }
+            Err(_) => {
+                eprintln!("error: HF_TOKEN is required for --provider huggingface");
+                return ExitCode::from(2);
+            }
+        },
+        LiftProvider::Cloudflare => match (
+            env::var("CLOUDFLARE_ACCOUNT_ID"),
+            env::var("CLOUDFLARE_API_TOKEN"),
+        ) {
+            (Ok(account_id), Ok(api_token)) => {
+                let provider = match CloudflareModelProvider::new(account_id, api_token) {
+                    Ok(provider) => provider,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        return ExitCode::from(2);
+                    }
+                };
+                run_humanization_units(provider, &options.model, &units, cache.as_ref())
+            }
+            _ if options.resume => {
+                eprintln!(
+                    "Cloudflare credentials are not set; validating checkpoints and preserving cache misses as unresolved"
+                );
+                run_humanization_units(
+                    UnavailableHostedProvider,
+                    &options.model,
+                    &units,
+                    cache.as_ref(),
+                )
+            }
+            _ => {
+                eprintln!(
+                    "error: CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are required for --provider cloudflare"
+                );
                 return ExitCode::from(2);
             }
         },
@@ -2374,7 +2465,7 @@ impl LiftOptions {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let Some(directory) = args.first() else {
             return Err(
-                "usage: sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq] [--function fn_ID] [--model MODEL] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]".into(),
+                "usage: sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq|cloudflare|huggingface] [--function fn_ID] [--model MODEL] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]".into(),
             );
         };
         let mut options = Self {
@@ -2437,8 +2528,14 @@ impl LiftOptions {
             }
             index += 2;
         }
-        if options.provider == LiftProvider::Groq && !model_explicit {
-            options.model = "openai/gpt-oss-120b".into();
+        if !model_explicit {
+            options.model = match options.provider {
+                LiftProvider::Ollama => "gpt-oss:20b",
+                LiftProvider::Groq => GROQ_GPT_OSS_120B,
+                LiftProvider::HuggingFace => HUGGING_FACE_GPT_OSS_120B,
+                LiftProvider::Cloudflare => CLOUDFLARE_GPT_OSS_120B,
+            }
+            .into();
         }
         if trusted_open_model(&options.model).is_none() && !options.allow_unreviewed_model {
             return Err(format!(
@@ -2446,6 +2543,7 @@ impl LiftOptions {
                 options.model
             ));
         }
+        options.provider.validate_model(&options.model)?;
         if options.cache_dir.is_some() && !options.resume {
             return Err("--cache-dir requires --resume".into());
         }
@@ -2884,6 +2982,63 @@ fn run_selected_lift_bundle(
                 ),
             }
         }
+        LiftProvider::HuggingFace => match env::var("HF_TOKEN") {
+            Ok(token) => {
+                let provider =
+                    HuggingFaceModelProvider::new(token).map_err(|error| error.to_string())?;
+                run_lift_bundle(
+                    provider,
+                    analysis,
+                    semantics,
+                    run("huggingface_inference_open_weights"),
+                )
+            }
+            Err(_) if options.checkpoint_cache.is_some() => {
+                eprintln!(
+                    "HF_TOKEN is not set; validating lift checkpoints and preserving cache misses as unavailable"
+                );
+                run_lift_bundle(
+                    UnavailableHostedProvider,
+                    analysis,
+                    semantics,
+                    run("huggingface_inference_open_weights"),
+                )
+            }
+            Err(_) => Err(
+                "HF_TOKEN is required for --provider huggingface; create a Hugging Face token with Inference Providers permission and export it in this shell"
+                    .to_owned(),
+            ),
+        },
+        LiftProvider::Cloudflare => match (
+            env::var("CLOUDFLARE_ACCOUNT_ID"),
+            env::var("CLOUDFLARE_API_TOKEN"),
+        ) {
+            (Ok(account_id), Ok(api_token)) => {
+                let provider = CloudflareModelProvider::new(account_id, api_token)
+                    .map_err(|error| error.to_string())?;
+                run_lift_bundle(
+                    provider,
+                    analysis,
+                    semantics,
+                    run("cloudflare_workers_ai_open_weights"),
+                )
+            }
+            _ if options.checkpoint_cache.is_some() => {
+                eprintln!(
+                    "Cloudflare credentials are not set; validating lift checkpoints and preserving cache misses as unavailable"
+                );
+                run_lift_bundle(
+                    UnavailableHostedProvider,
+                    analysis,
+                    semantics,
+                    run("cloudflare_workers_ai_open_weights"),
+                )
+            }
+            _ => Err(
+                "CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are required for --provider cloudflare"
+                    .to_owned(),
+            ),
+        },
     }
 }
 
@@ -3596,10 +3751,17 @@ impl RemoteOptions {
             options.model = Some(
                 match options.lift_provider {
                     LiftProvider::Ollama => "gpt-oss:20b",
-                    LiftProvider::Groq => "openai/gpt-oss-120b",
+                    LiftProvider::Groq => GROQ_GPT_OSS_120B,
+                    LiftProvider::HuggingFace => HUGGING_FACE_GPT_OSS_120B,
+                    LiftProvider::Cloudflare => CLOUDFLARE_GPT_OSS_120B,
                 }
                 .into(),
             );
+        }
+        if command == "inspect" && provider_explicit {
+            options
+                .lift_provider
+                .validate_model(options.model.as_deref().expect("provider selected a model"))?;
         }
         if options.cache_dir.is_some() && !options.resume {
             return Err("--cache-dir requires --resume".into());
@@ -3816,7 +3978,7 @@ fn usage() -> ExitCode {
     eprintln!("usage: sos artifact-info <path-to-sbf-elf> [--json]");
     eprintln!("       sos manifest <path-to-sbf-elf>");
     eprintln!("       sos fetch <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--commitment LEVEL] [--json]");
-    eprintln!("       sos inspect <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--history N] [--replay] [--signature SIGNATURE] [--provider ollama|groq] [--model MODEL] [--function fn_ID] [--resume] [--cache-dir DIR] [--ollama-url URL] [--context-tokens N] [--model-command PATH|--model-endpoint URL] [--validate] [--repair --repair-rounds N] [--validation-trace PATH] [--commitment LEVEL] [--json]");
+    eprintln!("       sos inspect <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--history N] [--replay] [--signature SIGNATURE] [--provider ollama|groq|cloudflare|huggingface] [--model MODEL] [--function fn_ID] [--resume] [--cache-dir DIR] [--ollama-url URL] [--context-tokens N] [--model-command PATH|--model-endpoint URL] [--validate] [--repair --repair-rounds N] [--validation-trace PATH] [--commitment LEVEL] [--json]");
     eprintln!("       sos analyze <path-to-sbf-elf> [--out DIR]");
     eprintln!("       sos detect <analysis-directory> [--format json|sarif] [--out PATH]");
     eprintln!("       sos validate <analysis-directory> [--compiler PATH|--no-compile] [--trace PATH] [--repair --model-command PATH --repair-rounds N] [--out PATH]");
@@ -3830,8 +3992,8 @@ fn usage() -> ExitCode {
     eprintln!(
         "       sos decompile <analysis-directory> [--format rust-like|c-like|json] [--out PATH]"
     );
-    eprintln!("       sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq] [--function fn_ID] [--model MODEL] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]");
-    eprintln!("       sos humanize <pseudocode-file> [--plan] [--resume] [--cache-dir DIR] [--provider groq|ollama] [--model MODEL] [--max-units N] [--out PATH] [--audit-out PATH]");
+    eprintln!("       sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq|cloudflare|huggingface] [--function fn_ID] [--model MODEL] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]");
+    eprintln!("       sos humanize <pseudocode-file> [--plan] [--resume] [--cache-dir DIR] [--provider groq|cloudflare|huggingface|ollama] [--model MODEL] [--max-units N] [--out PATH] [--audit-out PATH]");
     eprintln!("       sos benchmark <artifact> [--repeats N] [--out PATH]");
     eprintln!("       sos judge <original-sbf-elf> <candidate-sbf-elf> [--minimum-score 0..1] [--require-exact] [--out PATH]");
     ExitCode::from(2)
@@ -3845,7 +4007,8 @@ mod tests {
     use super::{
         run_humanization_units, run_lift_bundle, transaction_account_addresses, BenchmarkOptions,
         ExplainOptions, HumanizationCache, HumanizeOptions, JudgeOptions, LiftCheckpointCache,
-        LiftOptions, LiftProvider, LiftRunConfig, RemoteOptions,
+        LiftOptions, LiftProvider, LiftRunConfig, RemoteOptions, GROQ_GPT_OSS_120B,
+        HUGGING_FACE_GPT_OSS_120B,
     };
     use sos_ai::{AiError, ModelProvider, ModelRequest, ModelResponse};
 
@@ -3932,6 +4095,48 @@ mod tests {
         assert_eq!(hosted.provider, LiftProvider::Groq);
         assert_eq!(hosted.model, "openai/gpt-oss-120b");
 
+        let hugging_face = LiftOptions::parse(vec![
+            "./analysis".into(),
+            "--provider".into(),
+            "huggingface".into(),
+        ])
+        .unwrap();
+        assert_eq!(hugging_face.provider, LiftProvider::HuggingFace);
+        assert_eq!(hugging_face.model, "openai/gpt-oss-120b:fireworks-ai");
+
+        let cloudflare = LiftOptions::parse(vec![
+            "./analysis".into(),
+            "--provider".into(),
+            "cloudflare".into(),
+        ])
+        .unwrap();
+        assert_eq!(cloudflare.provider, LiftProvider::Cloudflare);
+        assert_eq!(cloudflare.model, "@cf/openai/gpt-oss-120b");
+        assert!(LiftOptions::parse(vec![
+            "./analysis".into(),
+            "--provider".into(),
+            "cloudflare".into(),
+            "--model".into(),
+            "openai/gpt-oss-120b".into(),
+        ])
+        .is_err());
+        assert!(LiftOptions::parse(vec![
+            "./analysis".into(),
+            "--provider".into(),
+            "huggingface".into(),
+            "--model".into(),
+            GROQ_GPT_OSS_120B.into(),
+        ])
+        .is_err());
+        assert!(LiftOptions::parse(vec![
+            "./analysis".into(),
+            "--provider".into(),
+            "groq".into(),
+            "--model".into(),
+            HUGGING_FACE_GPT_OSS_120B.into(),
+        ])
+        .is_err());
+
         let resumed = LiftOptions::parse(vec![
             "./analysis".into(),
             "--resume".into(),
@@ -3971,7 +4176,7 @@ mod tests {
     }
 
     #[test]
-    fn inspect_provider_groq_selects_the_reviewed_hosted_default() {
+    fn inspect_hosted_providers_select_and_enforce_reviewed_defaults() {
         let options = RemoteOptions::parse(
             vec![
                 "11111111111111111111111111111111".into(),
@@ -4003,6 +4208,44 @@ mod tests {
             resumed.cache_dir,
             Some(PathBuf::from("./report/lift-checkpoints"))
         );
+
+        let hugging_face = RemoteOptions::parse(
+            vec![
+                "11111111111111111111111111111111".into(),
+                "--provider".into(),
+                "hf".into(),
+            ],
+            "inspect",
+        )
+        .unwrap();
+        assert_eq!(hugging_face.lift_provider, LiftProvider::HuggingFace);
+        assert_eq!(
+            hugging_face.model.as_deref(),
+            Some("openai/gpt-oss-120b:fireworks-ai")
+        );
+
+        let cloudflare = RemoteOptions::parse(
+            vec![
+                "11111111111111111111111111111111".into(),
+                "--provider".into(),
+                "workers-ai".into(),
+            ],
+            "inspect",
+        )
+        .unwrap();
+        assert_eq!(cloudflare.lift_provider, LiftProvider::Cloudflare);
+        assert_eq!(cloudflare.model.as_deref(), Some("@cf/openai/gpt-oss-120b"));
+        assert!(RemoteOptions::parse(
+            vec![
+                "11111111111111111111111111111111".into(),
+                "--provider".into(),
+                "hf".into(),
+                "--model".into(),
+                GROQ_GPT_OSS_120B.into(),
+            ],
+            "inspect",
+        )
+        .is_err());
     }
 
     #[test]
@@ -4043,6 +4286,24 @@ mod tests {
         .unwrap();
         assert_eq!(local.provider, LiftProvider::Ollama);
         assert_eq!(local.model, "gpt-oss:20b");
+
+        let hugging_face = HumanizeOptions::parse(vec![
+            "decompiler.txt".into(),
+            "--provider".into(),
+            "huggingface".into(),
+        ])
+        .unwrap();
+        assert_eq!(hugging_face.provider, LiftProvider::HuggingFace);
+        assert_eq!(hugging_face.model, "openai/gpt-oss-120b:fireworks-ai");
+
+        let cloudflare = HumanizeOptions::parse(vec![
+            "decompiler.txt".into(),
+            "--provider".into(),
+            "cloudflare".into(),
+        ])
+        .unwrap();
+        assert_eq!(cloudflare.provider, LiftProvider::Cloudflare);
+        assert_eq!(cloudflare.model, "@cf/openai/gpt-oss-120b");
 
         assert!(HumanizeOptions::parse(vec![
             "decompiler.txt".into(),

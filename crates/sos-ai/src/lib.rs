@@ -22,10 +22,14 @@ use sos_analysis::{
 use sos_solana::SemanticAnalysis;
 use sos_types::{EvidenceItem, EvidenceStatus, ANALYSIS_SCHEMA_VERSION};
 
+mod cloudflare;
 mod groq;
+mod huggingface;
 mod ollama;
 
-pub use groq::GroqModelProvider;
+pub use cloudflare::{CloudflareModelProvider, CLOUDFLARE_GPT_OSS_120B};
+pub use groq::{GroqModelProvider, GROQ_GPT_OSS_120B};
+pub use huggingface::{HuggingFaceModelProvider, HUGGING_FACE_GPT_OSS_120B};
 pub use ollama::{trusted_open_model, OllamaModelProvider, OpenModelProfile, TRUSTED_OPEN_MODELS};
 
 pub const AI_SCHEMA_VERSION: u32 = 1;

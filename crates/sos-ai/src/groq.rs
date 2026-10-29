@@ -1,8 +1,8 @@
 //! Hosted open-weight inference through Groq's OpenAI-compatible API.
 //!
 //! The provider sends a compact, evidence-preserving projection rather than
-//! complete binary artifacts. API credentials remain process-local and are
-//! never included in model requests or audit bundles.
+//! complete binary artifacts. The API key is confined to the authorization
+//! header and never enters the prompt body, checkpoints, or audit bundles.
 
 use std::{
     io::Read,
@@ -16,9 +16,10 @@ use serde::Deserialize;
 use crate::{ollama, AiError, ModelProvider, ModelRequest, ModelResponse, ModelTask};
 
 const GROQ_CHAT_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
+pub const GROQ_GPT_OSS_120B: &str = "openai/gpt-oss-120b";
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GroqModelProvider {
     endpoint: String,
     api_key: String,
@@ -26,6 +27,18 @@ pub struct GroqModelProvider {
     max_response_bytes: usize,
     min_request_interval: Duration,
     last_request: Arc<Mutex<Option<Instant>>>,
+}
+
+impl std::fmt::Debug for GroqModelProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GroqModelProvider")
+            .field("endpoint", &self.endpoint)
+            .field("api_key", &"<redacted>")
+            .field("max_response_bytes", &self.max_response_bytes)
+            .field("min_request_interval", &self.min_request_interval)
+            .finish_non_exhaustive()
+    }
 }
 
 impl GroqModelProvider {
@@ -68,6 +81,12 @@ impl GroqModelProvider {
 
 impl ModelProvider for GroqModelProvider {
     fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
+        if request.model != GROQ_GPT_OSS_120B {
+            return Err(AiError::Provider(format!(
+                "Groq provider is pinned to {GROQ_GPT_OSS_120B}, not {:?}",
+                request.model
+            )));
+        }
         self.wait_for_request_slot()?;
         let evidence = hosted_model_evidence(&request.evidence_pack);
         let evidence_json = serde_json::to_string(&evidence).map_err(|error| {
@@ -155,7 +174,7 @@ impl GroqModelProvider {
     }
 }
 
-fn completion_token_limit(task: ModelTask) -> usize {
+pub(crate) fn completion_token_limit(task: ModelTask) -> usize {
     match task {
         ModelTask::Explanation => 640,
         ModelTask::StructureRecovery
@@ -165,7 +184,7 @@ fn completion_token_limit(task: ModelTask) -> usize {
     }
 }
 
-fn schema_name(task: ModelTask) -> &'static str {
+pub(crate) fn schema_name(task: ModelTask) -> &'static str {
     match task {
         ModelTask::StructureRecovery => "sos_structure_recovery",
         ModelTask::SemanticLabeling => "sos_semantic_labeling",
@@ -366,6 +385,13 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn debug_output_redacts_api_key() {
+        let debug = format!("{:?}", GroqModelProvider::new("groq-debug-secret").unwrap());
+        assert!(!debug.contains("groq-debug-secret"));
+        assert!(debug.contains("<redacted>"));
+    }
 
     #[test]
     fn hosted_projection_is_smaller_than_local_projection() {
