@@ -16,9 +16,11 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sos_analysis::{build_canonical_ir, CanonicalIr, StaticAnalysis};
+use sos_analysis::{
+    build_canonical_ir, BasicBlockFact, CanonicalIr, FunctionFact, InstructionFact, StaticAnalysis,
+};
 use sos_solana::SemanticAnalysis;
-use sos_types::{EvidenceItem, EvidenceStatus};
+use sos_types::{EvidenceItem, EvidenceStatus, ANALYSIS_SCHEMA_VERSION};
 
 mod groq;
 mod ollama;
@@ -36,6 +38,7 @@ pub enum ModelTask {
     SemanticLabeling,
     Explanation,
     Refinement,
+    PseudocodeHumanization,
 }
 
 impl ModelTask {
@@ -539,6 +542,120 @@ impl EvidencePack {
         pack.ir.sccs.truncate(limits.max_sccs);
         pack
     }
+}
+
+/// Convert arbitrary textual decompiler output into a deterministic synthetic
+/// IR function. Each original line becomes one or more evidence-addressable
+/// operations, allowing a hosted model to improve readability without receiving
+/// an ELF or inventing citations absent from the submitted pseudocode.
+pub fn evidence_pack_from_pseudocode(source: &str) -> Result<EvidencePack, AiError> {
+    const MAX_SOURCE_BYTES: usize = 512 * 1024;
+    // Groq's free GPT-OSS tier is token constrained. Larger inputs should be
+    // split by recovered function/call-graph unit before model submission.
+    const MAX_SOURCE_LINES: usize = 128;
+    const MAX_LINE_BYTES: usize = 4_096;
+    const MAX_IR_OPERATIONS: usize = 128;
+    const OPERATION_TEXT_CHARS: usize = 96;
+
+    if source.len() > MAX_SOURCE_BYTES {
+        return Err(AiError::EvidencePackTooLarge {
+            bytes: source.len(),
+            limit: MAX_SOURCE_BYTES,
+        });
+    }
+    if source.trim().is_empty() {
+        return Err(AiError::InvalidResponse(
+            "pseudocode input must not be empty".into(),
+        ));
+    }
+    let lines = source
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect::<Vec<_>>();
+    if lines.len() > MAX_SOURCE_LINES {
+        return Err(AiError::EvidencePackTooLarge {
+            bytes: lines.len(),
+            limit: MAX_SOURCE_LINES,
+        });
+    }
+    if let Some((index, _)) = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| line.len() > MAX_LINE_BYTES)
+    {
+        return Err(AiError::InvalidResponse(format!(
+            "pseudocode line {} exceeds {MAX_LINE_BYTES} bytes",
+            index + 1
+        )));
+    }
+
+    let mut instructions = Vec::new();
+    for (line_index, line) in lines.iter().enumerate() {
+        let chars = line.chars().collect::<Vec<_>>();
+        let parts = chars.chunks(OPERATION_TEXT_CHARS).collect::<Vec<_>>();
+        let part_count = parts.len().max(1);
+        for part_index in 0..part_count {
+            if instructions.len() >= MAX_IR_OPERATIONS {
+                return Err(AiError::EvidencePackTooLarge {
+                    bytes: instructions.len().saturating_add(1),
+                    limit: MAX_IR_OPERATIONS,
+                });
+            }
+            let text = parts
+                .get(part_index)
+                .map(|part| part.iter().collect::<String>())
+                .unwrap_or_default();
+            instructions.push(InstructionFact {
+                pc: instructions.len(),
+                opcode: 0,
+                dst: 0,
+                src: 0,
+                offset: 0,
+                immediate: 0,
+                assembly: format!(
+                    "line_{:04}_part_{:02}: {text}",
+                    line_index + 1,
+                    part_index + 1
+                ),
+            });
+        }
+    }
+    let instruction_count = instructions.len();
+    let analysis = StaticAnalysis {
+        schema_version: ANALYSIS_SCHEMA_VERSION,
+        sbpf_version: "textual_pseudocode".into(),
+        entrypoint: 0,
+        instructions,
+        functions: vec![FunctionFact {
+            pc: 0,
+            symbol_hash: 0,
+            name: "humanize_input".into(),
+        }],
+        basic_blocks: vec![BasicBlockFact {
+            start_pc: 0,
+            end_instruction_index: instruction_count,
+            destinations: Vec::new(),
+            label: "pseudocode_input".into(),
+        }],
+        memory_accesses: Vec::new(),
+        stack_accesses: Vec::new(),
+        strings: Vec::new(),
+        public_key_candidates: Vec::new(),
+        immediate_constants: Vec::new(),
+        register_uses: Vec::new(),
+        calls: Vec::new(),
+        relocations: Vec::new(),
+        sccs: Vec::new(),
+        dataflow_edges: Vec::new(),
+        verifier_diagnostics: Vec::new(),
+    };
+    let semantics = sos_solana::analyze(&analysis);
+    Ok(EvidencePack::from_analysis(
+        ModelTask::PseudocodeHumanization,
+        Some(sha256_bytes(source.as_bytes())),
+        analysis,
+        semantics,
+    ))
 }
 
 /// Produce a deterministic one-function analysis slice. Global read-only data
@@ -1553,7 +1670,7 @@ fn validate_structured_consistency(
         .map(|function| function.id.as_str())
         .collect::<BTreeSet<_>>();
     match request.task {
-        ModelTask::StructureRecovery => {
+        ModelTask::StructureRecovery | ModelTask::PseudocodeHumanization => {
             let parsed: StructureRecoveryOutput = serde_json::from_value(output.clone())
                 .map_err(|error| AiError::InvalidResponse(error.to_string()))?;
             for function in parsed.functions {
@@ -1626,7 +1743,7 @@ fn validate_structured_consistency(
 
 fn validate_structured_output(task: ModelTask, output: &serde_json::Value) -> Result<(), AiError> {
     let parsed = match task {
-        ModelTask::StructureRecovery => {
+        ModelTask::StructureRecovery | ModelTask::PseudocodeHumanization => {
             serde_json::from_value::<StructureRecoveryOutput>(output.clone())
                 .map(|_| "structure_recovery")
         }
@@ -1655,7 +1772,7 @@ fn structured_evidence_refs(
 ) -> Result<Vec<sos_types::EvidenceRef>, AiError> {
     let mut references = Vec::new();
     match task {
-        ModelTask::StructureRecovery => {
+        ModelTask::StructureRecovery | ModelTask::PseudocodeHumanization => {
             let parsed: StructureRecoveryOutput = serde_json::from_value(output.clone())
                 .map_err(|error| AiError::InvalidResponse(error.to_string()))?;
             for function in parsed.functions {
@@ -1979,6 +2096,9 @@ mod tests {
                     "patches": [],
                     "validation": {"status": "not_available", "notes": []}
                 }),
+                ModelTask::PseudocodeHumanization => {
+                    serde_json::json!({"functions": []})
+                }
             };
             Ok(ModelResponse {
                 task: request.task,
@@ -2745,5 +2865,67 @@ mod tests {
             }],
         };
         assert!(validate_response(&response).is_err());
+    }
+
+    #[test]
+    fn textual_pseudocode_gets_stable_line_evidence_and_validated_output() {
+        let pack = evidence_pack_from_pseudocode(
+            "tmp = *(u64 *)(ctx + 8)\nif (tmp == 0) goto fail\nreturn tmp",
+        )
+        .unwrap();
+        assert_eq!(pack.task, ModelTask::PseudocodeHumanization);
+        assert_eq!(pack.ir.functions[0].id, "fn_0");
+        assert_eq!(pack.ir.operations.len(), 3);
+        assert_eq!(pack.ir.operations[1].id, "op_1");
+        assert!(pack.ir.operations[1]
+            .assembly
+            .starts_with("line_0002_part_01:"));
+
+        let long_line = "x".repeat(150);
+        let segmented = evidence_pack_from_pseudocode(&long_line).unwrap();
+        assert_eq!(segmented.ir.operations.len(), 2);
+        let recovered_text = segmented
+            .ir
+            .operations
+            .iter()
+            .map(|operation| operation.assembly.split_once(": ").unwrap().1)
+            .collect::<String>();
+        assert_eq!(recovered_text, long_line);
+
+        struct HumanizeProvider;
+        impl ModelProvider for HumanizeProvider {
+            fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
+                Ok(ModelResponse {
+                    task: request.task,
+                    model: request.model,
+                    prompt_version: request.prompt_version,
+                    structured_output: serde_json::json!({
+                        "functions": [{
+                            "function_id": "fn_0",
+                            "pseudocode": "fn read_value(ctx: &Context) -> Result<u64, Error> { /* recovered */ }",
+                            "evidence": [{
+                                "source": "ir",
+                                "location": "operation:op_1",
+                                "detail": "null guard on line 2"
+                            }]
+                        }]
+                    }),
+                    evidence: Vec::new(),
+                })
+            }
+        }
+
+        let response = ModelGateway::new(HumanizeProvider, 1024 * 1024, 64 * 1024)
+            .submit(
+                ModelTask::PseudocodeHumanization,
+                "test",
+                "humanize-v1",
+                pack,
+            )
+            .unwrap();
+        assert!(response.structured_output["functions"][0]["pseudocode"]
+            .as_str()
+            .unwrap()
+            .contains("read_value"));
     }
 }

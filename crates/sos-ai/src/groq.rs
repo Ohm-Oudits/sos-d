@@ -158,7 +158,10 @@ impl GroqModelProvider {
 fn completion_token_limit(task: ModelTask) -> usize {
     match task {
         ModelTask::Explanation => 640,
-        ModelTask::StructureRecovery | ModelTask::SemanticLabeling | ModelTask::Refinement => 1_200,
+        ModelTask::StructureRecovery
+        | ModelTask::SemanticLabeling
+        | ModelTask::Refinement
+        | ModelTask::PseudocodeHumanization => 1_200,
     }
 }
 
@@ -168,6 +171,7 @@ fn schema_name(task: ModelTask) -> &'static str {
         ModelTask::SemanticLabeling => "sos_semantic_labeling",
         ModelTask::Explanation => "sos_explanation",
         ModelTask::Refinement => "sos_refinement",
+        ModelTask::PseudocodeHumanization => "sos_pseudocode_humanization",
     }
 }
 
@@ -201,6 +205,7 @@ pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::V
         ModelTask::SemanticLabeling => (48, 24, 1),
         ModelTask::Explanation => (24, 12, 2),
         ModelTask::Refinement => (96, 48, 3),
+        ModelTask::PseudocodeHumanization => (128, 1, 0),
     };
     let operations = pack
         .ir
@@ -212,7 +217,7 @@ pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::V
                 "id": operation.id,
                 "bb": operation.block_id,
                 "pc": operation.pc,
-                "asm": operation.assembly.chars().take(96).collect::<String>(),
+                "asm": operation.assembly.chars().take(160).collect::<String>(),
                 "effect": operation.memory_effect,
                 "call": operation.call_target_pc,
             })
@@ -233,6 +238,24 @@ pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::V
             })
         })
         .collect::<Vec<_>>();
+    if pack.task == ModelTask::PseudocodeHumanization {
+        return serde_json::json!({
+            "schema_version": pack.schema_version,
+            "task": pack.task,
+            "source_sha256": pack.artifact_sha256,
+            "evidence_addressing": {
+                "ir": "cite function:<fn_id>, block:<bb_id>, or operation:<op_id>",
+                "detail": "always include a short string or null"
+            },
+            "pseudocode": {
+                "functions": pack.ir.functions.iter().take(1).collect::<Vec<_>>(),
+                "blocks": blocks,
+                "operations": operations,
+                "operations_total": pack.ir.operations.len(),
+                "truncated": pack.ir.operations.len() > operation_limit,
+            }
+        });
+    }
     let prior = pack
         .untrusted_evidence
         .iter()
@@ -361,6 +384,26 @@ mod tests {
                     .len()
                     + 512
         );
+    }
+
+    #[test]
+    fn humanization_projection_contains_every_bounded_input_operation() {
+        let source = (1_usize..=128)
+            .map(|line| format!("tmp_{line} = tmp_{} + 1;", line.saturating_sub(1)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pack = crate::evidence_pack_from_pseudocode(&source).unwrap();
+        let projection = hosted_model_evidence(&pack);
+        assert_eq!(projection["pseudocode"]["operations_total"], 128);
+        assert_eq!(projection["pseudocode"]["truncated"], false);
+        assert_eq!(
+            projection["pseudocode"]["operations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            128
+        );
+        assert!(serde_json::to_vec(&projection).unwrap().len() < 32 * 1024);
     }
 
     #[test]

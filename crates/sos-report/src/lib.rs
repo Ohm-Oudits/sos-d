@@ -386,8 +386,8 @@ pub fn render_ai_markdown(bundle: &AiPipelineBundle) -> String {
             continue;
         }
         match stage.task {
-            sos_ai::ModelTask::StructureRecovery => {
-                output.push_str("## Structure recovery (hypothesis)\n\n");
+            sos_ai::ModelTask::StructureRecovery | sos_ai::ModelTask::PseudocodeHumanization => {
+                output.push_str("## Structure recovery / humanization (hypothesis)\n\n");
                 if let Ok(parsed) = serde_json::from_value::<StructureRecoveryOutput>(
                     response.structured_output.clone(),
                 ) {

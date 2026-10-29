@@ -103,6 +103,32 @@ validation. Generated output is untrusted and cannot change deterministic IR.
 Because the projection still reveals program behavior, enable Groq Zero Data
 Retention where available and use local inference for confidential binaries.
 
+### Humanizing existing pseudocode
+
+SOS can apply the same evidence-constrained model boundary to textual output
+from another decompiler:
+
+```bash
+export GROQ_API_KEY='...'
+sos humanize ./decompiler-output.txt \
+  --provider groq \
+  --out ./readable.rs \
+  --audit-out ./humanize.json
+```
+
+The adapter creates one synthetic `fn_0` and one or more
+`op_<hex-operation-index>` records per source line. Original line and segment
+numbers are embedded in each operation. The model
+must cite valid operation, block, or function IDs, and SOS rejects unknown
+references, inline assembly, raw byte arrays, include directives, unsafe code,
+and raw-operation passthroughs. The output is a reconstruction hypothesis—not
+original source or proof of equivalence.
+
+The free-tier projection is bounded to 128 lines. Larger pseudocode should be
+partitioned by recovered function or call-graph slice. This follows GoonFi's
+function-by-function reconstruction and Patina's staged region recovery while
+keeping each model request reviewable and within hosted token limits.
+
 ### Local
 
 Install Ollama, obtain the reviewed model, and start its local service:

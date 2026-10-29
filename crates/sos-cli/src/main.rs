@@ -6,12 +6,13 @@ use std::{
 };
 
 use sos_ai::{
-    compile_refinement_output, run_pipeline, run_refinement_loop, scope_analysis_to_function,
-    trusted_open_model, unavailable_pipeline_bundle, AiPipelineBundle, AiPipelineConfig,
-    AiStageResult, AiStageStatus, CommandModelProvider, CompilationStatus, EvidencePack,
-    EvidencePackLimits, GroqModelProvider, HttpModelProvider, ModelGateway, ModelProvider,
-    ModelResponse, ModelTask, OllamaModelProvider, RefinementFeedback, RefinementLoopResult,
-    RefinementOutput, RefinementValidation, UntrustedEvidence, VALIDATION_BUNDLE_SCHEMA_VERSION,
+    compile_refinement_output, evidence_pack_from_pseudocode, run_pipeline, run_refinement_loop,
+    scope_analysis_to_function, trusted_open_model, unavailable_pipeline_bundle, AiPipelineBundle,
+    AiPipelineConfig, AiStageResult, AiStageStatus, CommandModelProvider, CompilationStatus,
+    EvidencePack, EvidencePackLimits, GroqModelProvider, HttpModelProvider, ModelGateway,
+    ModelProvider, ModelResponse, ModelTask, OllamaModelProvider, RefinementFeedback,
+    RefinementLoopResult, RefinementOutput, RefinementValidation, StructureRecoveryOutput,
+    UntrustedEvidence, VALIDATION_BUNDLE_SCHEMA_VERSION,
 };
 use sos_analysis::{analyze_elf, build_canonical_ir};
 use sos_artifact::{
@@ -68,6 +69,7 @@ fn main() -> ExitCode {
         "report" => report_command(args.collect()),
         "decompile" => decompile_command(args.collect()),
         "lift" => lift_command(args.collect()),
+        "humanize" => humanize_command(args.collect()),
         "benchmark" => benchmark_command(args.collect()),
         _ => usage(),
     }
@@ -1486,6 +1488,210 @@ impl LiftProvider {
 }
 
 #[derive(Debug)]
+struct HumanizeOptions {
+    input: PathBuf,
+    output: PathBuf,
+    audit_output: PathBuf,
+    provider: LiftProvider,
+    model: String,
+    ollama_url: String,
+    allow_unreviewed_model: bool,
+}
+
+impl HumanizeOptions {
+    fn parse(args: Vec<String>) -> Result<Self, String> {
+        let Some(input) = args.first().map(PathBuf::from) else {
+            return Err(
+                "usage: sos humanize <pseudocode-file> [--provider groq|ollama] [--model MODEL] [--out PATH] [--audit-out PATH]".into(),
+            );
+        };
+        let mut output = input.clone();
+        output.set_extension("readable.rs");
+        let mut audit_output = input.clone();
+        audit_output.set_extension("humanize.json");
+        let mut options = Self {
+            input,
+            output,
+            audit_output,
+            provider: LiftProvider::Groq,
+            model: "openai/gpt-oss-120b".into(),
+            ollama_url: "http://127.0.0.1:11434".into(),
+            allow_unreviewed_model: false,
+        };
+        let mut model_explicit = false;
+        let mut index = 1;
+        while index < args.len() {
+            if args[index] == "--allow-unreviewed-model" {
+                options.allow_unreviewed_model = true;
+                index += 1;
+                continue;
+            }
+            let flag = &args[index];
+            let Some(value) = args.get(index + 1) else {
+                return Err(format!("missing value for {flag}"));
+            };
+            match flag.as_str() {
+                "--provider" => options.provider = LiftProvider::parse(value)?,
+                "--model" => {
+                    options.model = value.clone();
+                    model_explicit = true;
+                }
+                "--ollama-url" => options.ollama_url = value.clone(),
+                "--out" => options.output = PathBuf::from(value),
+                "--audit-out" => options.audit_output = PathBuf::from(value),
+                _ => return Err(format!("unknown humanize option: {flag}")),
+            }
+            index += 2;
+        }
+        if !model_explicit {
+            options.model = match options.provider {
+                LiftProvider::Groq => "openai/gpt-oss-120b",
+                LiftProvider::Ollama => "gpt-oss:20b",
+            }
+            .into();
+        }
+        if trusted_open_model(&options.model).is_none() && !options.allow_unreviewed_model {
+            return Err(format!(
+                "model {:?} is not in SOS's reviewed open-weight registry; pass --allow-unreviewed-model to override",
+                options.model
+            ));
+        }
+        if options.output == options.input || options.audit_output == options.input {
+            return Err("humanize output paths must not overwrite the input pseudocode".into());
+        }
+        if options.output == options.audit_output {
+            return Err("--out and --audit-out must use different paths".into());
+        }
+        Ok(options)
+    }
+}
+
+fn humanize_command(args: Vec<String>) -> ExitCode {
+    let options = match HumanizeOptions::parse(args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let source = match fs::read_to_string(&options.input) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("error: {}: {error}", options.input.display());
+            return ExitCode::from(1);
+        }
+    };
+    let pack = match evidence_pack_from_pseudocode(&source) {
+        Ok(pack) => pack,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let source_sha256 = pack.artifact_sha256.clone();
+    let response = match options.provider {
+        LiftProvider::Groq => {
+            let api_key = match env::var("GROQ_API_KEY") {
+                Ok(api_key) => api_key,
+                Err(_) => {
+                    eprintln!("error: GROQ_API_KEY is required for --provider groq");
+                    return ExitCode::from(2);
+                }
+            };
+            let provider = match GroqModelProvider::new(api_key) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(2);
+                }
+            };
+            submit_model(
+                provider,
+                ModelTask::PseudocodeHumanization,
+                &options.model,
+                pack.clone(),
+            )
+        }
+        LiftProvider::Ollama => submit_model(
+            OllamaModelProvider::new(&options.ollama_url),
+            ModelTask::PseudocodeHumanization,
+            &options.model,
+            pack.clone(),
+        ),
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let recovered =
+        match serde_json::from_value::<StructureRecoveryOutput>(response.structured_output.clone())
+        {
+            Ok(recovered) => recovered,
+            Err(error) => {
+                eprintln!("error: invalid humanization output: {error}");
+                return ExitCode::from(1);
+            }
+        };
+    let Some(function) = recovered
+        .functions
+        .iter()
+        .find(|function| function.function_id == "fn_0")
+    else {
+        eprintln!("error: model returned no humanized fn_0 candidate");
+        return ExitCode::from(1);
+    };
+    if let Some(parent) = options
+        .output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        if let Err(error) = fs::create_dir_all(parent) {
+            eprintln!("error: {}: {error}", parent.display());
+            return ExitCode::from(1);
+        }
+    }
+    let readable = format!(
+        "// SOS model-assisted reconstruction. Unverified; not original source.\n{}\n",
+        function.pseudocode.trim()
+    );
+    if let Err(error) = fs::write(&options.output, readable) {
+        eprintln!("error: {}: {error}", options.output.display());
+        return ExitCode::from(1);
+    }
+    let audit = serde_json::json!({
+        "schema_version": 1,
+        "provider": match options.provider { LiftProvider::Groq => "groq_hosted_open_weights", LiftProvider::Ollama => "ollama_local_open_weights" },
+        "model": options.model,
+        "source_sha256": source_sha256,
+        "evidence_pack": pack,
+        "response": response,
+    });
+    if let Some(parent) = options
+        .audit_output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        if let Err(error) = fs::create_dir_all(parent) {
+            eprintln!("error: {}: {error}", parent.display());
+            return ExitCode::from(1);
+        }
+    }
+    if let Err(error) = fs::write(
+        &options.audit_output,
+        serde_json::to_vec_pretty(&audit).expect("humanization audit is serializable"),
+    ) {
+        eprintln!("error: {}: {error}", options.audit_output.display());
+        return ExitCode::from(1);
+    }
+    println!("readable_source={}", options.output.display());
+    println!("audit={}", options.audit_output.display());
+    ExitCode::SUCCESS
+}
+
+#[derive(Debug)]
 struct LiftOptions {
     directory: PathBuf,
     output: PathBuf,
@@ -2611,15 +2817,18 @@ fn usage() -> ExitCode {
         "       sos decompile <analysis-directory> [--format rust-like|c-like|json] [--out PATH]"
     );
     eprintln!("       sos lift <analysis-directory> [--provider ollama|groq] [--function fn_ID] [--model MODEL] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]");
+    eprintln!("       sos humanize <pseudocode-file> [--provider groq|ollama] [--model MODEL] [--out PATH] [--audit-out PATH]");
     eprintln!("       sos benchmark <artifact> [--repeats N] [--out PATH]");
     ExitCode::from(2)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{
-        transaction_account_addresses, BenchmarkOptions, ExplainOptions, LiftOptions, LiftProvider,
-        RemoteOptions,
+        transaction_account_addresses, BenchmarkOptions, ExplainOptions, HumanizeOptions,
+        LiftOptions, LiftProvider, RemoteOptions,
     };
 
     #[test]
@@ -2745,6 +2954,30 @@ mod tests {
         .unwrap();
         assert_eq!(options.lift_provider, LiftProvider::Groq);
         assert_eq!(options.model.as_deref(), Some("openai/gpt-oss-120b"));
+    }
+
+    #[test]
+    fn humanize_defaults_to_hosted_gpt_oss_and_allows_explicit_local_mode() {
+        let hosted = HumanizeOptions::parse(vec!["decompiler.txt".into()]).unwrap();
+        assert_eq!(hosted.provider, LiftProvider::Groq);
+        assert_eq!(hosted.model, "openai/gpt-oss-120b");
+        assert_eq!(hosted.output, PathBuf::from("decompiler.readable.rs"));
+
+        let local = HumanizeOptions::parse(vec![
+            "decompiler.txt".into(),
+            "--provider".into(),
+            "ollama".into(),
+        ])
+        .unwrap();
+        assert_eq!(local.provider, LiftProvider::Ollama);
+        assert_eq!(local.model, "gpt-oss:20b");
+
+        assert!(HumanizeOptions::parse(vec![
+            "decompiler.txt".into(),
+            "--out".into(),
+            "decompiler.txt".into(),
+        ])
+        .is_err());
     }
 
     #[test]

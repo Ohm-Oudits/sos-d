@@ -232,6 +232,24 @@ Groq Zero Data Retention where available and do not use the hosted path for
 artifacts whose analysis must remain entirely local. The provider deliberately
 paces requests for the free developer-tier token limits.
 
+If pseudocode already exists from SOS, Ghidra, IDA, Binary Ninja, or another
+decompiler, use the one-stage humanizer instead of re-running binary analysis:
+
+```bash
+export GROQ_API_KEY='...'
+sos humanize ./decompiler-output.txt \
+  --provider groq \
+  --out ./readable.rs \
+  --audit-out ./humanize.json
+```
+
+Every source line receives one or more deterministic IR operation IDs. Model output must
+cite those IDs, passes the same anti-cheese checks as binary lifting, and is
+marked unverified. `humanize.json` stores the input hash, evidence pack, model
+identity, and response without storing the API key. Free-tier submissions are
+limited to 128 lines per call; split larger output by recovered function or
+call-graph unit, following the GoonFi/Patina workflow.
+
 The command writes `readable.rs`, `model.json`, and `ai-report.md`. Generated
 source remains evidence-linked hypothesis material; functions without an accepted
 candidate are marked unresolved. The research basis, trust boundary, and staged
@@ -253,6 +271,8 @@ bundle, local model-manifest provenance, and quality result.
 
 Use `./scripts/demo-groq.sh` for the equivalent hosted demo. It requires only a
 `GROQ_API_KEY`; it does not start Ollama or load the downloaded local weights.
+Use `./scripts/demo-humanize-groq.sh` to transform the checked-in
+Ghidra-style pseudocode fixture directly.
 
 Hosted providers can implement the same provider-neutral JSON protocol through an
 HTTP endpoint:

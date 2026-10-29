@@ -1,0 +1,23 @@
+undefined8 process_account(long ctx, byte *instruction_data, ulong instruction_len)
+{
+  long account;
+  ulong amount;
+
+  if (instruction_len < 9) {
+    return 0x100000002;
+  }
+  account = *(long *)(ctx + 0x20);
+  if (*(byte *)(account + 0x08) == 0) {
+    return 5;
+  }
+  if (*(byte *)(account + 0x09) == 0) {
+    return 7;
+  }
+  if (*instruction_data != 0x2a) {
+    return 0x100000003;
+  }
+  amount = *(ulong *)(instruction_data + 1);
+  *(ulong *)(account + 0x50) = *(ulong *)(account + 0x50) + amount;
+  sol_log_("account updated", 15);
+  return 0;
+}
