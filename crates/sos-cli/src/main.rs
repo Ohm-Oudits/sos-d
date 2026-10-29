@@ -1204,6 +1204,19 @@ fn inspect_command(args: Vec<String>) -> ExitCode {
                 eprintln!("error: {error}");
                 return ExitCode::from(1);
             }
+            let has_candidate = bundle.stages.iter().any(|stage| {
+                stage.status == AiStageStatus::Accepted
+                    && matches!(
+                        stage.task,
+                        ModelTask::StructureRecovery | ModelTask::Refinement
+                    )
+            });
+            if !has_candidate {
+                eprintln!(
+                    "error: the reviewed local model produced no accepted source candidate; inspect model.json for provider or validation errors"
+                );
+                return ExitCode::from(1);
+            }
             (Some(readable_path), Some(repair_path))
         } else {
             (None, None)
