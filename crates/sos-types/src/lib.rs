@@ -166,6 +166,7 @@ mod tests {
                 1,
             ),
             (include_str!("../../../schemas/v1/ai-bundle.schema.json"), 1),
+            (include_str!("../../../schemas/v2/ai-bundle.schema.json"), 2),
             (
                 include_str!("../../../schemas/v1/refinement.schema.json"),
                 1,

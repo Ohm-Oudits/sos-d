@@ -120,7 +120,8 @@ impl ModelProvider for OllamaModelProvider {
             "options": {
                 "temperature": 0,
                 "seed": 7,
-                "num_ctx": self.context_tokens
+                "num_ctx": self.context_tokens,
+                "num_predict": request.max_output_tokens
             }
         });
         let response = self
@@ -478,6 +479,8 @@ mod tests {
                     break;
                 }
             }
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(request_text.contains("\"num_predict\":777"));
             let body = r#"{"message":{"content":"{\"summary\":\"entrypoint candidate\",\"observations\":[]}"}}"#;
             write!(
                 stream,
@@ -523,6 +526,7 @@ mod tests {
                     semantics,
                 ),
                 max_output_bytes: 64 * 1024,
+                max_output_tokens: 777,
             })
             .unwrap();
         server.join().unwrap();

@@ -55,12 +55,17 @@ provider or stage model cannot silently reuse another result.
 implement Patina-style role specialization while retaining one provider and one
 credential boundary per run:
 
-| Stage | Override |
-| --- | --- |
-| Structure recovery | `--structure-model MODEL` |
-| Semantic labeling | `--semantic-model MODEL` |
-| Explanation | `--explanation-model MODEL` |
-| Refinement and compiler repair | `--refinement-model MODEL` |
+| Stage | Model override | Output-token override | Default |
+| --- | --- | --- | ---: |
+| Structure recovery | `--structure-model MODEL` | `--structure-tokens N` | 1,200 |
+| Semantic labeling | `--semantic-model MODEL` | `--semantic-tokens N` | 1,200 |
+| Explanation | `--explanation-model MODEL` | `--explanation-tokens N` | 640 |
+| Refinement and compiler repair | `--refinement-model MODEL` | `--refinement-tokens N` | 1,200 |
+
+Token overrides must be between 128 and 32,768. SOS sends the selected value to
+Ollama as `num_predict` and to hosted APIs through their corresponding maximum
+output-token field. It is also stored in the stage audit and checkpoint request
+identity. This makes Patina-style stage budgets enforceable and reproducible.
 
 For example, an API provider can use a stronger reconstruction/refinement model
 and a smaller labeling/explanation model:
@@ -73,12 +78,16 @@ sos lift ./analysis \
   --semantic-model labeling-model-id \
   --explanation-model explanation-model-id \
   --refinement-model reconstruction-model-id \
+  --structure-tokens 2400 \
+  --semantic-tokens 800 \
+  --explanation-tokens 512 \
+  --refinement-tokens 2400 \
   --resume \
   --out ./analysis/lifted
 ```
 
 Every model identity appears in its stage audit record. Compiler-driven repair
-uses the refinement model. Hosted providers that SOS pins to one reviewed model
+uses both the refinement model and refinement token budget. Hosted providers that SOS pins to one reviewed model
 (Groq, Hugging Face, and Cloudflare) reject a different override rather than
 quietly routing to unreviewed weights. Ollama overrides must remain in the
 reviewed registry unless `--allow-unreviewed-model` is explicitly supplied.
@@ -146,6 +155,8 @@ sos inspect <PROGRAM_ADDRESS> \
   --model your-explicit-model-id \
   --structure-model your-reconstruction-model-id \
   --refinement-model your-reconstruction-model-id \
+  --structure-tokens 2400 \
+  --refinement-tokens 2400 \
   --resume \
   --out ./reports/<PROGRAM_ADDRESS>
 ```

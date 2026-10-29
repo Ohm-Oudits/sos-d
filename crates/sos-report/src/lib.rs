@@ -360,12 +360,14 @@ pub fn render_ai_markdown(bundle: &AiPipelineBundle) -> String {
         bundle.artifact_sha256.as_deref().unwrap_or("not_available")
     ));
     output.push_str("## Stage audit\n\n");
-    output.push_str("| Stage | Status | Prompt | Input hash | Output hash | Error |\n|---|---|---|---|---|---|\n");
+    output.push_str("| Stage | Status | Model | Output tokens | Prompt | Input hash | Output hash | Error |\n|---|---|---|---:|---|---|---|---|\n");
     for stage in &bundle.stages {
         output.push_str(&format!(
-            "| `{:?}` | `{:?}` | `{}` | `{}` | `{}` | {} |\n",
+            "| `{:?}` | `{:?}` | `{}` | `{}` | `{}` | `{}` | `{}` | {} |\n",
             stage.task,
             stage.status,
+            escape_inline(&stage.model),
+            stage.max_output_tokens,
             escape_inline(&stage.prompt_version),
             stage.input_sha256,
             stage.output_sha256.as_deref().unwrap_or("—"),
@@ -981,13 +983,13 @@ fn function_suffix(function: &FunctionFact) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sos_ai::{AiStageResult, ModelResponse, ModelTask};
+    use sos_ai::{AiStageResult, ModelResponse, ModelTask, AI_BUNDLE_SCHEMA_VERSION};
     use sos_types::{EvidenceRef, EvidenceStatus};
 
     #[test]
     fn sarif_preserves_finding_identity_and_evidence_metadata() {
         let report = SecurityReport {
-            schema_version: 1,
+            schema_version: AI_BUNDLE_SCHEMA_VERSION,
             findings: vec![sos_solana::SecurityFinding {
                 detector_id: "test_detector".into(),
                 severity: "high".into(),
@@ -1024,6 +1026,7 @@ mod tests {
                 task: ModelTask::Explanation,
                 status: AiStageStatus::Accepted,
                 model: "model".into(),
+                max_output_tokens: 640,
                 prompt_version: "sos-v1".into(),
                 input_sha256: "a".repeat(64),
                 output_sha256: Some("b".repeat(64)),
@@ -1043,6 +1046,8 @@ mod tests {
         let report = render_ai_markdown(&bundle);
         assert!(report.contains("untrusted model output"));
         assert!(report.contains("Explanation (hypothesis)"));
+        assert!(report.contains("Output tokens"));
+        assert!(report.contains("`640`"));
         assert!(report.contains("observed"));
         assert!(report.contains(&"a".repeat(64)));
     }
@@ -1050,7 +1055,7 @@ mod tests {
     #[test]
     fn readable_rust_prefers_refinement_and_marks_missing_functions() {
         let analysis = StaticAnalysis {
-            schema_version: 1,
+            schema_version: AI_BUNDLE_SCHEMA_VERSION,
             sbpf_version: "V0".into(),
             entrypoint: 0,
             instructions: vec![],
@@ -1094,6 +1099,7 @@ mod tests {
                     task: ModelTask::StructureRecovery,
                     status: AiStageStatus::Accepted,
                     model: "gpt-oss:20b".into(),
+                    max_output_tokens: 1_200,
                     prompt_version: "sos-v2".into(),
                     input_sha256: "a".repeat(64),
                     output_sha256: Some("b".repeat(64)),
@@ -1113,6 +1119,7 @@ mod tests {
                     task: ModelTask::Refinement,
                     status: AiStageStatus::Accepted,
                     model: "gpt-oss:20b".into(),
+                    max_output_tokens: 1_200,
                     prompt_version: "sos-v2".into(),
                     input_sha256: "c".repeat(64),
                     output_sha256: Some("d".repeat(64)),

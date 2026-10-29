@@ -37,7 +37,9 @@ pub use ollama::{trusted_open_model, OllamaModelProvider, OpenModelProfile, TRUS
 pub use openai::OpenAiModelProvider;
 
 pub const AI_SCHEMA_VERSION: u32 = 1;
-pub const AI_BUNDLE_SCHEMA_VERSION: u32 = 1;
+pub const AI_BUNDLE_SCHEMA_VERSION: u32 = 2;
+pub const MIN_STAGE_OUTPUT_TOKENS: usize = 128;
+pub const MAX_STAGE_OUTPUT_TOKENS: usize = 32_768;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,6 +60,16 @@ impl ModelTask {
     ];
 }
 
+pub fn default_stage_output_tokens(task: ModelTask) -> usize {
+    match task {
+        ModelTask::Explanation => 640,
+        ModelTask::StructureRecovery
+        | ModelTask::SemanticLabeling
+        | ModelTask::Refinement
+        | ModelTask::PseudocodeHumanization => 1_200,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AiStageStatus {
@@ -71,6 +83,8 @@ pub struct AiStageResult {
     pub task: ModelTask,
     pub status: AiStageStatus,
     pub model: String,
+    #[serde(default)]
+    pub max_output_tokens: usize,
     pub prompt_version: String,
     pub input_sha256: String,
     pub output_sha256: Option<String>,
@@ -93,10 +107,48 @@ pub struct AiPipelineConfig {
     pub model: String,
     #[serde(default)]
     pub stage_models: AiStageModels,
+    #[serde(default)]
+    pub stage_token_budgets: AiStageTokenBudgets,
     pub prompt_version: String,
     pub artifact_sha256: Option<String>,
     pub limits: EvidencePackLimits,
     pub max_attempts: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiStageTokenBudgets {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structure_recovery: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_labeling: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refinement: Option<usize>,
+}
+
+impl AiStageTokenBudgets {
+    pub fn tokens_for(&self, task: ModelTask) -> usize {
+        match task {
+            ModelTask::StructureRecovery => self.structure_recovery,
+            ModelTask::SemanticLabeling => self.semantic_labeling,
+            ModelTask::Explanation => self.explanation,
+            ModelTask::Refinement => self.refinement,
+            ModelTask::PseudocodeHumanization => None,
+        }
+        .unwrap_or_else(|| default_stage_output_tokens(task))
+    }
+
+    pub fn configured(&self) -> impl Iterator<Item = (ModelTask, usize)> {
+        [
+            (ModelTask::StructureRecovery, self.structure_recovery),
+            (ModelTask::SemanticLabeling, self.semantic_labeling),
+            (ModelTask::Explanation, self.explanation),
+            (ModelTask::Refinement, self.refinement),
+        ]
+        .into_iter()
+        .filter_map(|(task, tokens)| tokens.map(|tokens| (task, tokens)))
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1511,6 +1563,7 @@ pub struct ModelRequest {
     pub model: String,
     pub evidence_pack: EvidencePack,
     pub max_output_bytes: usize,
+    pub max_output_tokens: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1781,6 +1834,28 @@ where
         prompt_version: impl Into<String>,
         pack: EvidencePack,
     ) -> Result<ModelResponse, AiError> {
+        self.submit_with_token_budget(
+            task,
+            model,
+            prompt_version,
+            pack,
+            default_stage_output_tokens(task),
+        )
+    }
+
+    pub fn submit_with_token_budget(
+        &self,
+        task: ModelTask,
+        model: impl Into<String>,
+        prompt_version: impl Into<String>,
+        pack: EvidencePack,
+        max_output_tokens: usize,
+    ) -> Result<ModelResponse, AiError> {
+        if !(MIN_STAGE_OUTPUT_TOKENS..=MAX_STAGE_OUTPUT_TOKENS).contains(&max_output_tokens) {
+            return Err(AiError::InvalidResponse(format!(
+                "model output token budget {max_output_tokens} is outside {MIN_STAGE_OUTPUT_TOKENS}..={MAX_STAGE_OUTPUT_TOKENS}"
+            )));
+        }
         let input_bytes = serde_json::to_vec(&pack)
             .map_err(|error| AiError::InvalidResponse(error.to_string()))?;
         if input_bytes.len() > self.max_input_bytes {
@@ -1795,6 +1870,7 @@ where
             model: model.into(),
             evidence_pack: pack,
             max_output_bytes: self.max_output_bytes,
+            max_output_tokens,
         };
         let expected_request = request.clone();
         let response = self.provider.generate_structured(request)?;
@@ -1821,12 +1897,37 @@ where
         pack: EvidencePack,
         max_attempts: usize,
     ) -> Result<ModelResponse, AiError> {
+        self.submit_with_retry_and_token_budget(
+            task,
+            model,
+            prompt_version,
+            pack,
+            max_attempts,
+            default_stage_output_tokens(task),
+        )
+    }
+
+    pub fn submit_with_retry_and_token_budget(
+        &self,
+        task: ModelTask,
+        model: impl Into<String>,
+        prompt_version: impl Into<String>,
+        pack: EvidencePack,
+        max_attempts: usize,
+        max_output_tokens: usize,
+    ) -> Result<ModelResponse, AiError> {
         let attempts = max_attempts.max(1);
         let model = model.into();
         let prompt_version = prompt_version.into();
         let mut last_error = None;
         for _ in 0..attempts {
-            match self.submit(task, model.clone(), prompt_version.clone(), pack.clone()) {
+            match self.submit_with_token_budget(
+                task,
+                model.clone(),
+                prompt_version.clone(),
+                pack.clone(),
+                max_output_tokens,
+            ) {
                 Ok(response) => return Ok(response),
                 Err(error @ (AiError::Provider(_) | AiError::InvalidResponse(_))) => {
                     last_error = Some(error);
@@ -1866,6 +1967,7 @@ pub fn run_pipeline_with_context<P: ModelProvider>(
         provider_name,
         model,
         stage_models,
+        stage_token_budgets,
         prompt_version,
         artifact_sha256,
         limits,
@@ -1877,6 +1979,7 @@ pub fn run_pipeline_with_context<P: ModelProvider>(
 
     for task in ModelTask::ALL {
         let stage_model = stage_models.model_for(task, &model).to_owned();
+        let max_output_tokens = stage_token_budgets.tokens_for(task);
         let mut pack = EvidencePack::bounded_from_analysis(
             task,
             artifact_sha256.clone(),
@@ -1890,12 +1993,13 @@ pub fn run_pipeline_with_context<P: ModelProvider>(
         pack.untrusted_evidence
             .extend(accepted_prior_stages.iter().cloned());
         let input_sha256 = sha256_json(&pack);
-        match gateway.submit_with_retry(
+        match gateway.submit_with_retry_and_token_budget(
             task,
             stage_model.clone(),
             prompt_version.clone(),
             pack,
             max_attempts,
+            max_output_tokens,
         ) {
             Ok(response) => {
                 let prior = serde_json::to_string(&response.structured_output)
@@ -1911,6 +2015,7 @@ pub fn run_pipeline_with_context<P: ModelProvider>(
                     task,
                     status: AiStageStatus::Accepted,
                     model: stage_model.clone(),
+                    max_output_tokens,
                     prompt_version: prompt_version.clone(),
                     input_sha256,
                     output_sha256: Some(sha256_json(&response)),
@@ -1928,6 +2033,7 @@ pub fn run_pipeline_with_context<P: ModelProvider>(
                     task,
                     status,
                     model: stage_model,
+                    max_output_tokens,
                     prompt_version: prompt_version.clone(),
                     input_sha256,
                     output_sha256: None,
@@ -1987,9 +2093,11 @@ pub fn validate_pipeline_bundle_with_context(
     let mut accepted_prior_stages = bounded_initial_context(initial_context);
     for (stage, expected_task) in bundle.stages.iter().zip(ModelTask::ALL) {
         let expected_model = config.stage_models.model_for(expected_task, &config.model);
+        let expected_tokens = config.stage_token_budgets.tokens_for(expected_task);
         if stage.task != expected_task
             || stage.status != AiStageStatus::Accepted
             || stage.model != expected_model
+            || stage.max_output_tokens != expected_tokens
             || stage.prompt_version != config.prompt_version
             || stage.error.is_some()
         {
@@ -2049,6 +2157,7 @@ pub fn unavailable_pipeline_bundle(
         provider_name,
         model,
         stage_models,
+        stage_token_budgets,
         prompt_version,
         artifact_sha256,
         limits,
@@ -2059,6 +2168,7 @@ pub fn unavailable_pipeline_bundle(
         .into_iter()
         .map(|task| {
             let stage_model = stage_models.model_for(task, &model).to_owned();
+            let max_output_tokens = stage_token_budgets.tokens_for(task);
             let pack = EvidencePack::bounded_from_analysis(
                 task,
                 artifact_sha256.clone(),
@@ -2070,6 +2180,7 @@ pub fn unavailable_pipeline_bundle(
                 task,
                 status: AiStageStatus::NotAvailable,
                 model: stage_model,
+                max_output_tokens,
                 prompt_version: prompt_version.clone(),
                 input_sha256: sha256_json(&pack),
                 output_sha256: None,
@@ -2356,11 +2467,19 @@ pub struct RefinementRound {
 pub struct RefinementLoopResult {
     pub schema_version: u32,
     pub model: String,
+    pub max_output_tokens: usize,
     pub prompt_version: String,
     pub status: RefinementLoopStatus,
     pub rounds: Vec<RefinementRound>,
     pub final_output: Option<RefinementOutput>,
     pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefinementLoopLimits {
+    pub max_output_tokens: usize,
+    pub max_attempts: usize,
+    pub max_rounds: usize,
 }
 
 /// Run a bounded external-validation/repair loop for one refinement task.
@@ -2382,10 +2501,37 @@ where
     P: ModelProvider,
     F: Fn(&RefinementOutput) -> RefinementFeedback,
 {
+    run_refinement_loop_with_limits(
+        provider,
+        base_pack,
+        model,
+        prompt_version,
+        RefinementLoopLimits {
+            max_output_tokens: default_stage_output_tokens(ModelTask::Refinement),
+            max_attempts,
+            max_rounds,
+        },
+        validate,
+    )
+}
+
+pub fn run_refinement_loop_with_limits<P, F>(
+    provider: P,
+    base_pack: EvidencePack,
+    model: impl Into<String>,
+    prompt_version: impl Into<String>,
+    limits: RefinementLoopLimits,
+    validate: F,
+) -> RefinementLoopResult
+where
+    P: ModelProvider,
+    F: Fn(&RefinementOutput) -> RefinementFeedback,
+{
     let gateway = ModelGateway::new(provider, 4 * 1024 * 1024, 1024 * 1024);
     let model = model.into();
     let prompt_version = prompt_version.into();
-    let round_limit = max_rounds.clamp(1, 8);
+    let round_limit = limits.max_rounds.clamp(1, 8);
+    let max_output_tokens = limits.max_output_tokens;
     let mut feedback = None;
     let mut rounds = Vec::with_capacity(round_limit);
     let mut final_output = None;
@@ -2393,12 +2539,13 @@ where
     for round in 1..=round_limit {
         let pack = refinement_pack_with_feedback(&base_pack, feedback.as_ref());
         let input_sha256 = sha256_json(&pack);
-        let result = gateway.submit_with_retry(
+        let result = gateway.submit_with_retry_and_token_budget(
             ModelTask::Refinement,
             model.clone(),
             prompt_version.clone(),
             pack,
-            max_attempts,
+            limits.max_attempts,
+            max_output_tokens,
         );
         let response = match result {
             Ok(response) => response,
@@ -2415,6 +2562,7 @@ where
                 return RefinementLoopResult {
                     schema_version: REFINEMENT_LOOP_SCHEMA_VERSION,
                     model: model.clone(),
+                    max_output_tokens,
                     prompt_version: prompt_version.clone(),
                     status: if provider_error {
                         RefinementLoopStatus::NotAvailable
@@ -2446,6 +2594,7 @@ where
                     return RefinementLoopResult {
                         schema_version: REFINEMENT_LOOP_SCHEMA_VERSION,
                         model: model.clone(),
+                        max_output_tokens,
                         prompt_version: prompt_version.clone(),
                         status: RefinementLoopStatus::Rejected,
                         rounds,
@@ -2479,6 +2628,7 @@ where
             return RefinementLoopResult {
                 schema_version: REFINEMENT_LOOP_SCHEMA_VERSION,
                 model: model.clone(),
+                max_output_tokens,
                 prompt_version: prompt_version.clone(),
                 status,
                 rounds,
@@ -2494,6 +2644,7 @@ where
     RefinementLoopResult {
         schema_version: REFINEMENT_LOOP_SCHEMA_VERSION,
         model,
+        max_output_tokens,
         prompt_version,
         status: RefinementLoopStatus::Exhausted,
         rounds,
@@ -2627,6 +2778,7 @@ pub fn validate_model_response_for_pack(
         model: model.into(),
         evidence_pack: pack,
         max_output_bytes: MAX_CACHED_OUTPUT_BYTES,
+        max_output_tokens: default_stage_output_tokens(response.task),
     };
     validate_response_for_request(&request, response)
 }
@@ -3101,15 +3253,16 @@ mod tests {
     }
 
     struct ModelRecordingProvider {
-        requests: Arc<Mutex<Vec<(ModelTask, String)>>>,
+        requests: Arc<Mutex<Vec<(ModelTask, String, usize)>>>,
     }
 
     impl ModelProvider for ModelRecordingProvider {
         fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
-            self.requests
-                .lock()
-                .unwrap()
-                .push((request.task, request.model.clone()));
+            self.requests.lock().unwrap().push((
+                request.task,
+                request.model.clone(),
+                request.max_output_tokens,
+            ));
             EchoProvider.generate_structured(request)
         }
     }
@@ -3311,6 +3464,7 @@ mod tests {
             model: "test".into(),
             evidence_pack: pack,
             max_output_bytes: 10_000,
+            max_output_tokens: default_stage_output_tokens(ModelTask::Explanation),
         });
         assert!(matches!(result, Err(AiError::Provider(error)) if error.contains("timed out")));
     }
@@ -3388,6 +3542,10 @@ mod tests {
             },
         );
         assert_eq!(result.status, RefinementLoopStatus::BehaviorallyValidated);
+        assert_eq!(
+            result.max_output_tokens,
+            default_stage_output_tokens(ModelTask::Refinement)
+        );
         assert_eq!(result.rounds.len(), 2);
         assert!(result.rounds[1]
             .input_sha256
@@ -3405,6 +3563,7 @@ mod tests {
                 provider_name: "test-provider".into(),
                 model: "test-model".into(),
                 stage_models: AiStageModels::default(),
+                stage_token_budgets: AiStageTokenBudgets::default(),
                 prompt_version: "sos-v1".into(),
                 artifact_sha256: Some("artifact".into()),
                 limits: EvidencePackLimits::default(),
@@ -3442,6 +3601,12 @@ mod tests {
                 explanation: None,
                 refinement: Some("refinement-model".into()),
             },
+            stage_token_budgets: AiStageTokenBudgets {
+                structure_recovery: Some(2_000),
+                semantic_labeling: Some(800),
+                explanation: Some(400),
+                refinement: Some(2_400),
+            },
             prompt_version: "sos-v3".into(),
             artifact_sha256: Some("artifact".into()),
             limits: EvidencePackLimits::default(),
@@ -3458,10 +3623,14 @@ mod tests {
         assert_eq!(
             *requests.lock().unwrap(),
             vec![
-                (ModelTask::StructureRecovery, "structure-model".into()),
-                (ModelTask::SemanticLabeling, "semantic-model".into()),
-                (ModelTask::Explanation, "default-model".into()),
-                (ModelTask::Refinement, "refinement-model".into()),
+                (
+                    ModelTask::StructureRecovery,
+                    "structure-model".into(),
+                    2_000
+                ),
+                (ModelTask::SemanticLabeling, "semantic-model".into(), 800),
+                (ModelTask::Explanation, "default-model".into(), 400),
+                (ModelTask::Refinement, "refinement-model".into(), 2_400),
             ]
         );
         assert!(validate_pipeline_bundle_with_context(
@@ -3483,6 +3652,18 @@ mod tests {
             &bundle,
         )
         .is_err());
+
+        let mut changed_budget = changed;
+        changed_budget.stage_models.refinement = Some("refinement-model".into());
+        changed_budget.stage_token_budgets.refinement = Some(2_401);
+        assert!(validate_pipeline_bundle_with_context(
+            &changed_budget,
+            &pack.analysis,
+            &pack.semantics,
+            &[],
+            &bundle,
+        )
+        .is_err());
     }
 
     #[test]
@@ -3497,6 +3678,7 @@ mod tests {
                 provider_name: "test-provider".into(),
                 model: "test-model".into(),
                 stage_models: AiStageModels::default(),
+                stage_token_budgets: AiStageTokenBudgets::default(),
                 prompt_version: "sos-v2".into(),
                 artifact_sha256: None,
                 limits: EvidencePackLimits::default(),
@@ -3526,6 +3708,7 @@ mod tests {
                 provider_name: "test-provider".into(),
                 model: "test-model".into(),
                 stage_models: AiStageModels::default(),
+                stage_token_budgets: AiStageTokenBudgets::default(),
                 prompt_version: "sos-v2".into(),
                 artifact_sha256: None,
                 limits: EvidencePackLimits::default(),
@@ -3545,6 +3728,7 @@ mod tests {
             provider_name: "test-provider".into(),
             model: "test-model".into(),
             stage_models: AiStageModels::default(),
+            stage_token_budgets: AiStageTokenBudgets::default(),
             prompt_version: "sos-v2".into(),
             artifact_sha256: Some("artifact".into()),
             limits: EvidencePackLimits::default(),
@@ -3709,6 +3893,7 @@ mod tests {
             model: "test".into(),
             evidence_pack: pack,
             max_output_bytes: 10_000,
+            max_output_tokens: default_stage_output_tokens(ModelTask::Explanation),
         };
         assert!(validate_evidence_ref(
             &request,
@@ -3747,6 +3932,7 @@ mod tests {
             model: "test".into(),
             evidence_pack: empty_pack(),
             max_output_bytes: 10_000,
+            max_output_tokens: default_stage_output_tokens(ModelTask::Explanation),
         };
         for evidence in [
             sos_types::EvidenceRef {
@@ -3835,6 +4021,7 @@ mod tests {
             model: "hosted-test".into(),
             evidence_pack: empty_pack(),
             max_output_bytes: 10_000,
+            max_output_tokens: default_stage_output_tokens(ModelTask::Explanation),
         };
         let response = provider.generate_structured(request).unwrap();
         assert_eq!(response.model, "hosted-test");
@@ -3858,6 +4045,23 @@ mod tests {
         let gateway = ModelGateway::new(LargeResponseProvider, 10_000, 32);
         let result = gateway.submit(ModelTask::Explanation, "test", "v1", empty_pack());
         assert!(matches!(result, Err(AiError::OutputTooLarge { .. })));
+    }
+
+    #[test]
+    fn gateway_rejects_out_of_range_stage_token_budgets() {
+        let gateway = ModelGateway::new(EchoProvider, 10_000, 10_000);
+        for invalid in [MIN_STAGE_OUTPUT_TOKENS - 1, MAX_STAGE_OUTPUT_TOKENS + 1] {
+            let result = gateway.submit_with_token_budget(
+                ModelTask::Explanation,
+                "test",
+                "v1",
+                empty_pack(),
+                invalid,
+            );
+            assert!(
+                matches!(result, Err(AiError::InvalidResponse(error)) if error.contains("token budget"))
+            );
+        }
     }
 
     #[test]
@@ -3933,6 +4137,7 @@ mod tests {
             model: "test".into(),
             evidence_pack: empty_pack(),
             max_output_bytes: 10_000,
+            max_output_tokens: default_stage_output_tokens(ModelTask::Refinement),
         };
         let output = serde_json::json!({
             "patches": [{
@@ -3956,6 +4161,7 @@ mod tests {
             model: "test".into(),
             evidence_pack: empty_pack(),
             max_output_bytes: 10_000,
+            max_output_tokens: default_stage_output_tokens(ModelTask::Refinement),
         };
         let output = serde_json::json!({
             "patches": [],
@@ -3972,6 +4178,7 @@ mod tests {
             model: "test".into(),
             evidence_pack: empty_pack(),
             max_output_bytes: 10_000,
+            max_output_tokens: default_stage_output_tokens(ModelTask::Refinement),
         };
         let unsupported = serde_json::json!({
             "schema_version": 1,
@@ -4008,6 +4215,7 @@ mod tests {
             model: "test".into(),
             evidence_pack: empty_pack(),
             max_output_bytes: 10_000,
+            max_output_tokens: default_stage_output_tokens(ModelTask::Refinement),
         };
         let output = serde_json::json!({
             "patches": [],

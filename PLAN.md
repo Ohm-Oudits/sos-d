@@ -75,6 +75,9 @@ Already implemented in this workspace:
 - Patina-style per-stage model routing for structure recovery, semantic labeling,
   explanation, refinement, and compiler-repair rounds; stage identities are
   recorded in audit results and participate in checkpoint request validation.
+- Enforced per-stage output-token budgets across Ollama and every hosted adapter,
+  with bounded CLI overrides, compiler-repair inheritance, audited stage values,
+  and an AI bundle v2 contract that rejects budget-mismatched checkpoints.
 - Deterministic no-model pseudocode humanizer for common Ghidra/IDA C syntax,
   including evidence-linked type spelling, guards, returns, pointer reads/writes,
   calls, explicit untranslated-line preservation, and an audited fallback path

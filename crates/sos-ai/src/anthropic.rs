@@ -13,8 +13,7 @@ use std::{
 };
 
 use crate::{
-    groq::{completion_token_limit, hosted_model_evidence},
-    ollama, AiError, ModelProvider, ModelRequest, ModelResponse,
+    groq::hosted_model_evidence, ollama, AiError, ModelProvider, ModelRequest, ModelResponse,
 };
 
 const ANTHROPIC_MESSAGES_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
@@ -126,7 +125,7 @@ impl ModelProvider for AnthropicModelProvider {
             })?;
         let body = serde_json::json!({
             "model": request.model,
-            "max_tokens": completion_token_limit(request.task),
+            "max_tokens": request.max_output_tokens,
             "system": ollama::system_prompt(request.task),
             "messages": [{
                 "role": "user",
@@ -283,6 +282,7 @@ mod tests {
             assert!(body_text.contains("claude-test-explicit"));
             assert!(body_text.contains("output_config"));
             assert!(body_text.contains("json_schema"));
+            assert!(body_text.contains("\"max_tokens\":777"));
             assert!(!body_text.contains("maxItems"));
             let body = r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"{\"summary\":\"bounded\",\"observations\":[]}"}]}"#;
             write!(
@@ -371,6 +371,7 @@ mod tests {
                 semantics,
             ),
             max_output_bytes: 4096,
+            max_output_tokens: 777,
         }
     }
 

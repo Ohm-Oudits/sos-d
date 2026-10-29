@@ -104,7 +104,7 @@ impl ModelProvider for GroqModelProvider {
             "temperature": 0,
             "seed": 7,
             "reasoning_effort": "medium",
-            "max_completion_tokens": completion_token_limit(request.task),
+            "max_completion_tokens": request.max_output_tokens,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -171,16 +171,6 @@ impl GroqModelProvider {
         }
         *last_request = Some(Instant::now());
         Ok(())
-    }
-}
-
-pub(crate) fn completion_token_limit(task: ModelTask) -> usize {
-    match task {
-        ModelTask::Explanation => 640,
-        ModelTask::StructureRecovery
-        | ModelTask::SemanticLabeling
-        | ModelTask::Refinement
-        | ModelTask::PseudocodeHumanization => 1_200,
     }
 }
 
@@ -503,6 +493,7 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer test-secret"));
             assert!(request_text.contains("json_schema"));
+            assert!(request_text.contains("\"max_completion_tokens\":777"));
             let body = r#"{"choices":[{"message":{"content":"{\"summary\":\"bounded\",\"observations\":[]}"}}]}"#;
             write!(
                 stream,
@@ -547,6 +538,7 @@ mod tests {
                     semantics,
                 ),
                 max_output_bytes: 64 * 1024,
+                max_output_tokens: 777,
             })
             .unwrap();
         server.join().unwrap();

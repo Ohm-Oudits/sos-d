@@ -302,6 +302,9 @@ sos inspect <PROGRAM_ADDRESS> \
   --structure-model your-reconstruction-model-id \
   --semantic-model your-labeling-model-id \
   --refinement-model your-reconstruction-model-id \
+  --structure-tokens 2400 \
+  --semantic-tokens 800 \
+  --refinement-tokens 2400 \
   --resume \
   --out ./reports/<PROGRAM_ADDRESS>
 ```
@@ -311,7 +314,9 @@ outputs pass the same local schemas, evidence-reference checks, anti-cheese
 rules, and checkpoint validation. `--structure-model`, `--semantic-model`,
 `--explanation-model`, and `--refinement-model` optionally assign distinct
 models to the Patina-style agent stages; each identity is audited and included
-in checkpoint validation. See
+in checkpoint validation. Matching `--structure-tokens`, `--semantic-tokens`,
+`--explanation-tokens`, and `--refinement-tokens` flags enforce and audit bounded
+per-stage output budgets. See
 [docs/AGENT_PROVIDERS.md](docs/AGENT_PROVIDERS.md) and the empty
 [.env.example](.env.example) placeholders.
 

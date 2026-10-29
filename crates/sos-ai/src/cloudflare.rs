@@ -15,8 +15,7 @@ use std::{
 use serde::Deserialize;
 
 use crate::{
-    groq::{completion_token_limit, hosted_model_evidence},
-    ollama, AiError, ModelProvider, ModelRequest, ModelResponse,
+    groq::hosted_model_evidence, ollama, AiError, ModelProvider, ModelRequest, ModelResponse,
 };
 
 pub const CLOUDFLARE_GPT_OSS_120B: &str = "@cf/openai/gpt-oss-120b";
@@ -128,7 +127,7 @@ impl ModelProvider for CloudflareModelProvider {
             "stream": false,
             "temperature": 0,
             "seed": 7,
-            "max_tokens": completion_token_limit(request.task),
+            "max_tokens": request.max_output_tokens,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": ollama::output_schema(request.task)
@@ -293,6 +292,7 @@ mod tests {
             assert!(!body_text.contains("cf-test-secret"));
             assert!(!body_text.contains("0123456789abcdef0123456789abcdef"));
             assert!(body_text.contains("json_schema"));
+            assert!(body_text.contains("\"max_tokens\":777"));
             let body = r#"{"success":true,"errors":[],"result":{"response":{"summary":"bounded","observations":[]}}}"#;
             write!(
                 stream,
@@ -339,6 +339,7 @@ mod tests {
                         semantics,
                     ),
                     max_output_bytes: 4096,
+                    max_output_tokens: 777,
                 })
                 .unwrap();
         server.join().unwrap();

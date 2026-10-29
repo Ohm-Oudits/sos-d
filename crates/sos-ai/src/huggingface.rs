@@ -15,7 +15,7 @@ use std::{
 use serde::Deserialize;
 
 use crate::{
-    groq::{completion_token_limit, hosted_model_evidence, schema_name},
+    groq::{hosted_model_evidence, schema_name},
     ollama, AiError, ModelProvider, ModelRequest, ModelResponse,
 };
 
@@ -121,7 +121,7 @@ impl ModelProvider for HuggingFaceModelProvider {
             "temperature": 0,
             "seed": 7,
             "reasoning_effort": "medium",
-            "max_tokens": completion_token_limit(request.task),
+            "max_tokens": request.max_output_tokens,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -278,6 +278,7 @@ mod tests {
             assert!(!body_text.contains("hf-test-secret"));
             assert!(body_text.contains("openai/gpt-oss-120b:fireworks-ai"));
             assert!(body_text.contains("json_schema"));
+            assert!(body_text.contains("\"max_tokens\":777"));
             let body = r#"{"choices":[{"message":{"content":"{\"summary\":\"bounded\",\"observations\":[]}"}}]}"#;
             write!(
                 stream,
@@ -323,6 +324,7 @@ mod tests {
                     semantics,
                 ),
                 max_output_bytes: 4096,
+                max_output_tokens: 777,
             })
             .unwrap();
         server.join().unwrap();

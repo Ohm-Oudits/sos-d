@@ -102,6 +102,10 @@ The default `--model` can be overridden independently with
 `--structure-model`, `--semantic-model`, `--explanation-model`, and
 `--refinement-model`. Each stage records the selected model, and checkpoint
 validation rejects any bundle created with a different stage assignment.
+The parallel `--structure-tokens`, `--semantic-tokens`,
+`--explanation-tokens`, and `--refinement-tokens` flags bound generated output;
+the selected budget is sent to the provider, recorded in AI bundle schema v2,
+and included in checkpoint validation.
 
 ## Running a lift
 

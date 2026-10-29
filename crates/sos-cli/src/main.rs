@@ -10,15 +10,17 @@ use serde::{Deserialize, Serialize};
 use sos_ai::{
     compile_refinement_output, deterministic_humanize_pseudocode_unit,
     evidence_pack_from_pseudocode_unit, partition_pseudocode, run_pipeline,
-    run_pipeline_with_context, run_refinement_loop, scope_analysis_to_function, trusted_open_model,
-    unavailable_pipeline_bundle, validate_model_response_for_pack,
-    validate_pipeline_bundle_with_context, AiPipelineBundle, AiPipelineConfig, AiStageModels,
-    AiStageResult, AiStageStatus, AnthropicModelProvider, CloudflareModelProvider,
-    CommandModelProvider, CompilationStatus, EvidencePack, EvidencePackLimits, GroqModelProvider,
-    HttpModelProvider, HuggingFaceModelProvider, ModelGateway, ModelProvider, ModelResponse,
-    ModelTask, OllamaModelProvider, OpenAiModelProvider, PseudocodeUnit, RefinementFeedback,
-    RefinementLoopResult, RefinementOutput, RefinementValidation, StructureRecoveryOutput,
-    UntrustedEvidence, CLOUDFLARE_GPT_OSS_120B, GROQ_GPT_OSS_120B, HUGGING_FACE_GPT_OSS_120B,
+    run_pipeline_with_context, run_refinement_loop, run_refinement_loop_with_limits,
+    scope_analysis_to_function, trusted_open_model, unavailable_pipeline_bundle,
+    validate_model_response_for_pack, validate_pipeline_bundle_with_context, AiPipelineBundle,
+    AiPipelineConfig, AiStageModels, AiStageResult, AiStageStatus, AiStageTokenBudgets,
+    AnthropicModelProvider, CloudflareModelProvider, CommandModelProvider, CompilationStatus,
+    EvidencePack, EvidencePackLimits, GroqModelProvider, HttpModelProvider,
+    HuggingFaceModelProvider, ModelGateway, ModelProvider, ModelResponse, ModelTask,
+    OllamaModelProvider, OpenAiModelProvider, PseudocodeUnit, RefinementFeedback,
+    RefinementLoopLimits, RefinementLoopResult, RefinementOutput, RefinementValidation,
+    StructureRecoveryOutput, UntrustedEvidence, CLOUDFLARE_GPT_OSS_120B, GROQ_GPT_OSS_120B,
+    HUGGING_FACE_GPT_OSS_120B, MAX_STAGE_OUTPUT_TOKENS, MIN_STAGE_OUTPUT_TOKENS,
     VALIDATION_BUNDLE_SCHEMA_VERSION,
 };
 use sos_analysis::{analyze_elf, build_canonical_ir, compare_binary_analyses};
@@ -46,7 +48,7 @@ const DETERMINISTIC_HUMANIZER_ID: &str = "sos-deterministic-syntax-v1";
 const HUMANIZATION_CACHE_SCHEMA_VERSION: u32 = 1;
 const HUMANIZATION_CACHE_RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v3";
-const LIFT_CACHE_SCHEMA_VERSION: u32 = 2;
+const LIFT_CACHE_SCHEMA_VERSION: u32 = 3;
 const LIFT_CACHE_RECORD_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 fn main() -> ExitCode {
@@ -1325,6 +1327,7 @@ fn inspect_command(args: Vec<String>) -> ExitCode {
                         provider: options.lift_provider,
                         model,
                         stage_models: &options.stage_models,
+                        stage_token_budgets: &options.stage_token_budgets,
                         ollama_url: &options.ollama_url,
                         context_tokens: options.context_tokens,
                         function_id: options.function_id.as_deref(),
@@ -1345,6 +1348,7 @@ fn inspect_command(args: Vec<String>) -> ExitCode {
                         provider_name: "none".into(),
                         model: model.clone(),
                         stage_models: options.stage_models.clone(),
+                        stage_token_budgets: options.stage_token_budgets.clone(),
                         prompt_version: "sos-v1".into(),
                         artifact_sha256: Some(manifest.elf_sha256.clone()),
                         limits: EvidencePackLimits::default(),
@@ -1770,6 +1774,18 @@ impl LiftProvider {
         }
         Ok(())
     }
+}
+
+fn parse_stage_token_budget(flag: &str, value: &str) -> Result<usize, String> {
+    let tokens = value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid {flag} token budget: {error}"))?;
+    if !(MIN_STAGE_OUTPUT_TOKENS..=MAX_STAGE_OUTPUT_TOKENS).contains(&tokens) {
+        return Err(format!(
+            "{flag} must be between {MIN_STAGE_OUTPUT_TOKENS} and {MAX_STAGE_OUTPUT_TOKENS}"
+        ));
+    }
+    Ok(tokens)
 }
 
 #[derive(Debug)]
@@ -2747,6 +2763,7 @@ struct LiftOptions {
     ollama_url: String,
     model: String,
     stage_models: AiStageModels,
+    stage_token_budgets: AiStageTokenBudgets,
     context_tokens: usize,
     allow_unreviewed_model: bool,
     function_id: Option<String>,
@@ -2759,7 +2776,7 @@ impl LiftOptions {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let Some(directory) = args.first() else {
             return Err(
-                "usage: sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq|cloudflare|huggingface|openai|anthropic] [--model MODEL] [--structure-model MODEL] [--semantic-model MODEL] [--explanation-model MODEL] [--refinement-model MODEL] [--function fn_ID] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]".into(),
+                "usage: sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq|cloudflare|huggingface|openai|anthropic] [--model MODEL] [--structure-model MODEL] [--semantic-model MODEL] [--explanation-model MODEL] [--refinement-model MODEL] [--structure-tokens N] [--semantic-tokens N] [--explanation-tokens N] [--refinement-tokens N] [--function fn_ID] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]".into(),
             );
         };
         let mut options = Self {
@@ -2769,6 +2786,7 @@ impl LiftOptions {
             ollama_url: "http://127.0.0.1:11434".into(),
             model: "gpt-oss:20b".into(),
             stage_models: AiStageModels::default(),
+            stage_token_budgets: AiStageTokenBudgets::default(),
             context_tokens: 32_768,
             allow_unreviewed_model: false,
             function_id: None,
@@ -2808,6 +2826,22 @@ impl LiftOptions {
                 "--semantic-model" => options.stage_models.semantic_labeling = Some(value.clone()),
                 "--explanation-model" => options.stage_models.explanation = Some(value.clone()),
                 "--refinement-model" => options.stage_models.refinement = Some(value.clone()),
+                "--structure-tokens" => {
+                    options.stage_token_budgets.structure_recovery =
+                        Some(parse_stage_token_budget(flag, value)?)
+                }
+                "--semantic-tokens" => {
+                    options.stage_token_budgets.semantic_labeling =
+                        Some(parse_stage_token_budget(flag, value)?)
+                }
+                "--explanation-tokens" => {
+                    options.stage_token_budgets.explanation =
+                        Some(parse_stage_token_budget(flag, value)?)
+                }
+                "--refinement-tokens" => {
+                    options.stage_token_budgets.refinement =
+                        Some(parse_stage_token_budget(flag, value)?)
+                }
                 "--function" => options.function_id = Some(value.clone()),
                 "--context-tokens" => {
                     options.context_tokens = value
@@ -2862,6 +2896,7 @@ struct LiftRunConfig<'a> {
     artifact_sha256: Option<String>,
     model: &'a str,
     stage_models: &'a AiStageModels,
+    stage_token_budgets: &'a AiStageTokenBudgets,
     provider_name: &'a str,
     function_id: Option<&'a str>,
     repair_rounds: usize,
@@ -3085,6 +3120,7 @@ where
         provider_name: options.provider_name.into(),
         model: options.model.into(),
         stage_models: (*options.stage_models).clone(),
+        stage_token_budgets: (*options.stage_token_budgets).clone(),
         prompt_version: LIFT_PROMPT_VERSION.into(),
         artifact_sha256: options.artifact_sha256.clone(),
         limits: EvidencePackLimits::default(),
@@ -3232,6 +3268,7 @@ struct SelectedLiftConfig<'a> {
     provider: LiftProvider,
     model: &'a str,
     stage_models: &'a AiStageModels,
+    stage_token_budgets: &'a AiStageTokenBudgets,
     ollama_url: &'a str,
     context_tokens: usize,
     function_id: Option<&'a str>,
@@ -3258,6 +3295,7 @@ fn run_selected_lift_bundle(
         artifact_sha256: options.artifact_sha256.clone(),
         model: options.model,
         stage_models: options.stage_models,
+        stage_token_budgets: options.stage_token_budgets,
         provider_name,
         function_id: options.function_id,
         repair_rounds: options.repair_rounds,
@@ -3440,6 +3478,7 @@ fn lift_command(args: Vec<String>) -> ExitCode {
             provider: options.provider,
             model: &options.model,
             stage_models: &options.stage_models,
+            stage_token_budgets: &options.stage_token_budgets,
             ollama_url: &options.ollama_url,
             context_tokens: options.context_tokens,
             function_id: options.function_id.as_deref(),
@@ -3614,14 +3653,18 @@ fn repair_failed_refinement<P>(
         .stage_models
         .model_for(ModelTask::Refinement, &config.model)
         .to_owned();
+    let refinement_tokens = config.stage_token_budgets.tokens_for(ModelTask::Refinement);
 
-    let loop_result = run_refinement_loop(
+    let loop_result = run_refinement_loop_with_limits(
         provider.clone(),
         pack,
         refinement_model.clone(),
         config.prompt_version.clone(),
-        config.max_attempts,
-        repair_rounds,
+        RefinementLoopLimits {
+            max_output_tokens: refinement_tokens,
+            max_attempts: config.max_attempts,
+            max_rounds: repair_rounds,
+        },
         |candidate| {
             let compilation =
                 compile_refinement_output(candidate, Some(compiler), Duration::from_secs(30));
@@ -3647,6 +3690,7 @@ fn repair_failed_refinement<P>(
                 task: ModelTask::Refinement,
                 status: AiStageStatus::Accepted,
                 model: refinement_model.clone(),
+                max_output_tokens: refinement_tokens,
                 prompt_version: config.prompt_version.clone(),
                 input_sha256: round.input_sha256.clone(),
                 output_sha256: round.output_sha256.clone(),
@@ -3720,6 +3764,7 @@ fn run_model_pipeline(
                 provider_name: "local_command".into(),
                 model: model.into(),
                 stage_models: AiStageModels::default(),
+                stage_token_budgets: AiStageTokenBudgets::default(),
                 prompt_version: "sos-v1".into(),
                 artifact_sha256,
                 limits: EvidencePackLimits::default(),
@@ -3739,6 +3784,7 @@ fn run_model_pipeline(
                     provider_name: "http".into(),
                     model: model.into(),
                     stage_models: AiStageModels::default(),
+                    stage_token_budgets: AiStageTokenBudgets::default(),
                     prompt_version: "sos-v1".into(),
                     artifact_sha256,
                     limits: EvidencePackLimits::default(),
@@ -3831,6 +3877,7 @@ struct RemoteOptions {
     replay_requested: bool,
     model: Option<String>,
     stage_models: AiStageModels,
+    stage_token_budgets: AiStageTokenBudgets,
     model_command: Option<String>,
     model_endpoint: Option<String>,
     lift_provider: LiftProvider,
@@ -4009,6 +4056,7 @@ impl RemoteOptions {
             replay_requested: false,
             model: None,
             stage_models: AiStageModels::default(),
+            stage_token_budgets: AiStageTokenBudgets::default(),
             model_command: None,
             model_endpoint: None,
             lift_provider: LiftProvider::Ollama,
@@ -4101,6 +4149,22 @@ impl RemoteOptions {
                 "--refinement-model" if command == "inspect" => {
                     options.stage_models.refinement = Some(value.clone())
                 }
+                "--structure-tokens" if command == "inspect" => {
+                    options.stage_token_budgets.structure_recovery =
+                        Some(parse_stage_token_budget(flag, value)?)
+                }
+                "--semantic-tokens" if command == "inspect" => {
+                    options.stage_token_budgets.semantic_labeling =
+                        Some(parse_stage_token_budget(flag, value)?)
+                }
+                "--explanation-tokens" if command == "inspect" => {
+                    options.stage_token_budgets.explanation =
+                        Some(parse_stage_token_budget(flag, value)?)
+                }
+                "--refinement-tokens" if command == "inspect" => {
+                    options.stage_token_budgets.refinement =
+                        Some(parse_stage_token_budget(flag, value)?)
+                }
                 "--model-command" => options.model_command = Some(value.clone()),
                 "--model-endpoint" => options.model_endpoint = Some(value.clone()),
                 "--provider" if command == "inspect" => {
@@ -4148,13 +4212,17 @@ impl RemoteOptions {
             };
             options.model = Some(default_model);
         }
-        if command == "inspect" && options.stage_models.configured().next().is_some() {
+        if command == "inspect"
+            && (options.stage_models.configured().next().is_some()
+                || options.stage_token_budgets.configured().next().is_some())
+        {
             if options.model.is_none() {
-                return Err("stage model overrides require --model or --provider".into());
+                return Err("stage model or token overrides require --model or --provider".into());
             }
             if options.model_command.is_some() || options.model_endpoint.is_some() {
                 return Err(
-                    "stage model overrides are supported only by built-in lift providers".into(),
+                    "stage model and token overrides are supported only by built-in lift providers"
+                        .into(),
                 );
             }
         }
@@ -4384,7 +4452,7 @@ fn usage() -> ExitCode {
     eprintln!("usage: sos artifact-info <path-to-sbf-elf> [--json]");
     eprintln!("       sos manifest <path-to-sbf-elf>");
     eprintln!("       sos fetch <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--commitment LEVEL] [--json]");
-    eprintln!("       sos inspect <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--history N] [--replay] [--signature SIGNATURE] [--provider ollama|groq|cloudflare|huggingface|openai|anthropic] [--model MODEL] [--structure-model MODEL] [--semantic-model MODEL] [--explanation-model MODEL] [--refinement-model MODEL] [--function fn_ID] [--resume] [--cache-dir DIR] [--ollama-url URL] [--context-tokens N] [--model-command PATH|--model-endpoint URL] [--validate] [--repair --repair-rounds N] [--validation-trace PATH] [--commitment LEVEL] [--json]");
+    eprintln!("       sos inspect <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--history N] [--replay] [--signature SIGNATURE] [--provider ollama|groq|cloudflare|huggingface|openai|anthropic] [--model MODEL] [--structure-model MODEL] [--semantic-model MODEL] [--explanation-model MODEL] [--refinement-model MODEL] [--structure-tokens N] [--semantic-tokens N] [--explanation-tokens N] [--refinement-tokens N] [--function fn_ID] [--resume] [--cache-dir DIR] [--ollama-url URL] [--context-tokens N] [--model-command PATH|--model-endpoint URL] [--validate] [--repair --repair-rounds N] [--validation-trace PATH] [--commitment LEVEL] [--json]");
     eprintln!("       sos analyze <path-to-sbf-elf> [--out DIR]");
     eprintln!("       sos detect <analysis-directory> [--format json|sarif] [--out PATH]");
     eprintln!("       sos validate <analysis-directory> [--compiler PATH|--no-compile] [--trace PATH] [--repair --model-command PATH --repair-rounds N] [--out PATH]");
@@ -4398,7 +4466,7 @@ fn usage() -> ExitCode {
     eprintln!(
         "       sos decompile <analysis-directory> [--format rust-like|c-like|json] [--out PATH]"
     );
-    eprintln!("       sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq|cloudflare|huggingface|openai|anthropic] [--model MODEL] [--structure-model MODEL] [--semantic-model MODEL] [--explanation-model MODEL] [--refinement-model MODEL] [--function fn_ID] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]");
+    eprintln!("       sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq|cloudflare|huggingface|openai|anthropic] [--model MODEL] [--structure-model MODEL] [--semantic-model MODEL] [--explanation-model MODEL] [--refinement-model MODEL] [--structure-tokens N] [--semantic-tokens N] [--explanation-tokens N] [--refinement-tokens N] [--function fn_ID] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]");
     eprintln!("       sos humanize <pseudocode-file> [--deterministic|--plan] [--resume] [--cache-dir DIR] [--provider groq|cloudflare|huggingface|ollama|openai|anthropic] [--model MODEL] [--max-units N] [--out PATH] [--audit-out PATH]");
     eprintln!("       sos benchmark <artifact> [--repeats N] [--out PATH]");
     eprintln!("       sos judge <original-sbf-elf> <candidate-sbf-elf> [--minimum-score 0..1] [--require-exact] [--out PATH]");
@@ -4417,7 +4485,9 @@ mod tests {
         LiftRunConfig, RemoteOptions, UnavailableHostedProvider, DETERMINISTIC_HUMANIZER_ID,
         GROQ_GPT_OSS_120B, HUGGING_FACE_GPT_OSS_120B,
     };
-    use sos_ai::{AiError, AiStageModels, ModelProvider, ModelRequest, ModelResponse};
+    use sos_ai::{
+        AiError, AiStageModels, AiStageTokenBudgets, ModelProvider, ModelRequest, ModelResponse,
+    };
 
     #[test]
     fn transaction_accounts_include_static_and_loaded_keys_without_duplicates() {
@@ -4529,6 +4599,10 @@ mod tests {
             "openai-structure-model".into(),
             "--refinement-model".into(),
             "openai-refinement-model".into(),
+            "--structure-tokens".into(),
+            "2400".into(),
+            "--explanation-tokens".into(),
+            "512".into(),
         ])
         .unwrap();
         assert_eq!(openai.provider, LiftProvider::OpenAi);
@@ -4541,6 +4615,8 @@ mod tests {
             openai.stage_models.refinement.as_deref(),
             Some("openai-refinement-model")
         );
+        assert_eq!(openai.stage_token_budgets.structure_recovery, Some(2_400));
+        assert_eq!(openai.stage_token_budgets.explanation, Some(512));
         let anthropic = LiftOptions::parse(vec![
             "./analysis".into(),
             "--provider".into(),
@@ -4581,6 +4657,12 @@ mod tests {
             "groq".into(),
             "--structure-model".into(),
             "different-model".into(),
+        ])
+        .is_err());
+        assert!(LiftOptions::parse(vec![
+            "./analysis".into(),
+            "--structure-tokens".into(),
+            "64".into(),
         ])
         .is_err());
 
@@ -4704,6 +4786,8 @@ mod tests {
                 "anthropic-test-model".into(),
                 "--semantic-model".into(),
                 "anthropic-semantic-model".into(),
+                "--semantic-tokens".into(),
+                "900".into(),
             ],
             "inspect",
         )
@@ -4714,6 +4798,7 @@ mod tests {
             anthropic.stage_models.semantic_labeling.as_deref(),
             Some("anthropic-semantic-model")
         );
+        assert_eq!(anthropic.stage_token_budgets.semantic_labeling, Some(900));
         assert!(RemoteOptions::parse(
             vec![
                 "11111111111111111111111111111111".into(),
@@ -5148,6 +5233,7 @@ mod tests {
             directory: directory.clone(),
         };
         let stage_models = AiStageModels::default();
+        let stage_token_budgets = AiStageTokenBudgets::default();
         let (bundle, repairs) = run_lift_bundle(
             DependencyAwareProvider {
                 requests: requests.clone(),
@@ -5158,6 +5244,7 @@ mod tests {
                 artifact_sha256: Some("fixture".into()),
                 model: "test",
                 stage_models: &stage_models,
+                stage_token_budgets: &stage_token_budgets,
                 provider_name: "test-provider",
                 function_id: None,
                 repair_rounds: 0,
@@ -5191,6 +5278,7 @@ mod tests {
                 artifact_sha256: Some("fixture".into()),
                 model: "test",
                 stage_models: &stage_models,
+                stage_token_budgets: &stage_token_budgets,
                 provider_name: "test-provider",
                 function_id: None,
                 repair_rounds: 0,
@@ -5220,6 +5308,7 @@ mod tests {
                 artifact_sha256: Some("fixture".into()),
                 model: "test",
                 stage_models: &stage_models,
+                stage_token_budgets: &stage_token_budgets,
                 provider_name: "test-provider",
                 function_id: None,
                 repair_rounds: 0,

@@ -49,6 +49,7 @@
       "properties": {
         "schema_version": {"const": 1},
         "model": {"type": "string"},
+        "max_output_tokens": {"type": "integer", "minimum": 128, "maximum": 32768},
         "prompt_version": {"type": "string"},
         "status": {
           "enum": ["behaviorally_validated", "compiled_unverified", "exhausted", "not_available", "rejected"]
