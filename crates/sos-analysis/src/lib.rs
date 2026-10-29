@@ -412,6 +412,386 @@ pub fn build_canonical_ir(analysis: &StaticAnalysis) -> CanonicalIr {
     }
 }
 
+pub const BINARY_COMPARISON_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FunctionSimilarity {
+    pub instruction_ngram: f64,
+    pub instruction_count: f64,
+    pub cfg_shape: f64,
+    pub call_shape: f64,
+    pub memory_shape: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FunctionComparison {
+    pub original_function_id: String,
+    pub original_name: String,
+    pub candidate_function_id: Option<String>,
+    pub candidate_name: Option<String>,
+    pub original_instruction_count: usize,
+    pub candidate_instruction_count: usize,
+    pub score: f64,
+    pub exact_normalized_shape: bool,
+    pub similarity: FunctionSimilarity,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BinaryComparison {
+    pub schema_version: u32,
+    pub overall_score: f64,
+    pub exact_normalized_match: bool,
+    pub original_function_count: usize,
+    pub candidate_function_count: usize,
+    pub matched_function_count: usize,
+    pub exact_function_matches: usize,
+    pub functions: Vec<FunctionComparison>,
+    pub unmatched_candidate_functions: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FunctionShape {
+    id: String,
+    name: String,
+    instruction_count: usize,
+    exact_instructions: Vec<(u8, u8, u8, i16, i64)>,
+    instruction_ngrams: BTreeMap<u64, usize>,
+    cfg: BTreeMap<u64, usize>,
+    calls: BTreeMap<String, usize>,
+    memory: BTreeMap<String, usize>,
+}
+
+/// Compare two deterministic SBPF analyses after a reconstructed source tree
+/// has been recompiled. This is a conservative structural judge inspired by
+/// decompilation workflows: it does not claim semantic equivalence, but it
+/// scores instruction n-grams, function size, CFG shape, calls, and memory
+/// effects without relying on source names or model assertions.
+pub fn compare_binary_analyses(
+    original: &StaticAnalysis,
+    candidate: &StaticAnalysis,
+) -> BinaryComparison {
+    #[derive(Debug, Clone)]
+    struct Pair {
+        original: usize,
+        candidate: usize,
+        score: f64,
+        exact: bool,
+        similarity: FunctionSimilarity,
+    }
+
+    let original_shapes = function_shapes(original);
+    let candidate_shapes = function_shapes(candidate);
+    let mut pairs = Vec::new();
+    for (original_index, original_shape) in original_shapes.iter().enumerate() {
+        for (candidate_index, candidate_shape) in candidate_shapes.iter().enumerate() {
+            let similarity = shape_similarity(original_shape, candidate_shape);
+            let score = round_score(
+                similarity.instruction_ngram * 0.55
+                    + similarity.instruction_count * 0.15
+                    + similarity.cfg_shape * 0.15
+                    + similarity.call_shape * 0.10
+                    + similarity.memory_shape * 0.05,
+            );
+            pairs.push(Pair {
+                original: original_index,
+                candidate: candidate_index,
+                score,
+                exact: original_shape.exact_instructions == candidate_shape.exact_instructions
+                    && original_shape.cfg == candidate_shape.cfg
+                    && original_shape.calls == candidate_shape.calls
+                    && original_shape.memory == candidate_shape.memory,
+                similarity,
+            });
+        }
+    }
+    pairs.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.original.cmp(&right.original))
+            .then_with(|| left.candidate.cmp(&right.candidate))
+    });
+
+    let mut matched_original = vec![None::<Pair>; original_shapes.len()];
+    let mut used_candidate = vec![false; candidate_shapes.len()];
+    for pair in pairs {
+        if matched_original[pair.original].is_none() && !used_candidate[pair.candidate] {
+            used_candidate[pair.candidate] = true;
+            let original_index = pair.original;
+            matched_original[original_index] = Some(pair);
+        }
+    }
+
+    let mut weighted_score = 0.0;
+    let mut total_weight = 0_usize;
+    let mut exact_function_matches = 0_usize;
+    let mut matched_function_count = 0_usize;
+    let functions = original_shapes
+        .iter()
+        .enumerate()
+        .map(|(index, original_shape)| {
+            let weight = original_shape.instruction_count.max(1);
+            total_weight = total_weight.saturating_add(weight);
+            if let Some(pair) = matched_original[index].as_ref() {
+                let candidate_shape = &candidate_shapes[pair.candidate];
+                matched_function_count += 1;
+                exact_function_matches += usize::from(pair.exact);
+                weighted_score += pair.score * weight as f64;
+                FunctionComparison {
+                    original_function_id: original_shape.id.clone(),
+                    original_name: original_shape.name.clone(),
+                    candidate_function_id: Some(candidate_shape.id.clone()),
+                    candidate_name: Some(candidate_shape.name.clone()),
+                    original_instruction_count: original_shape.instruction_count,
+                    candidate_instruction_count: candidate_shape.instruction_count,
+                    score: pair.score,
+                    exact_normalized_shape: pair.exact,
+                    similarity: pair.similarity.clone(),
+                }
+            } else {
+                FunctionComparison {
+                    original_function_id: original_shape.id.clone(),
+                    original_name: original_shape.name.clone(),
+                    candidate_function_id: None,
+                    candidate_name: None,
+                    original_instruction_count: original_shape.instruction_count,
+                    candidate_instruction_count: 0,
+                    score: 0.0,
+                    exact_normalized_shape: false,
+                    similarity: FunctionSimilarity {
+                        instruction_ngram: 0.0,
+                        instruction_count: 0.0,
+                        cfg_shape: 0.0,
+                        call_shape: 0.0,
+                        memory_shape: 0.0,
+                    },
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let unmatched_candidate_weight = candidate_shapes
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !used_candidate[*index])
+        .map(|(_, shape)| shape.instruction_count.max(1))
+        .sum::<usize>();
+    let unmatched_candidate_functions = candidate_shapes
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !used_candidate[*index])
+        .map(|(_, shape)| shape.id.clone())
+        .collect::<Vec<_>>();
+    let overall_score = if total_weight == 0 {
+        f64::from(candidate_shapes.is_empty())
+    } else {
+        round_score(weighted_score / (total_weight + unmatched_candidate_weight) as f64)
+    };
+    BinaryComparison {
+        schema_version: BINARY_COMPARISON_SCHEMA_VERSION,
+        overall_score,
+        exact_normalized_match: original_shapes.len() == candidate_shapes.len()
+            && exact_function_matches == original_shapes.len(),
+        original_function_count: original_shapes.len(),
+        candidate_function_count: candidate_shapes.len(),
+        matched_function_count,
+        exact_function_matches,
+        functions,
+        unmatched_candidate_functions,
+    }
+}
+
+fn function_shapes(analysis: &StaticAnalysis) -> Vec<FunctionShape> {
+    let mut functions = analysis.functions.clone();
+    functions.sort_by_key(|function| function.pc);
+    if functions.is_empty() && !analysis.instructions.is_empty() {
+        functions.push(FunctionFact {
+            pc: analysis.entrypoint,
+            symbol_hash: 0,
+            name: "entrypoint".into(),
+        });
+    }
+    functions
+        .iter()
+        .enumerate()
+        .map(|(function_index, function)| {
+            let next_pc = functions.get(function_index + 1).map(|item| item.pc);
+            let in_range = |pc: usize| pc >= function.pc && next_pc.is_none_or(|next| pc < next);
+            let call_pcs = analysis
+                .calls
+                .iter()
+                .filter(|call| in_range(call.call_pc))
+                .map(|call| call.call_pc)
+                .collect::<HashSet<_>>();
+            let instructions = analysis
+                .instructions
+                .iter()
+                .filter(|instruction| in_range(instruction.pc))
+                .collect::<Vec<_>>();
+            let exact_instructions = instructions
+                .iter()
+                .map(|instruction| {
+                    (
+                        instruction.opcode,
+                        instruction.dst,
+                        instruction.src,
+                        instruction.offset,
+                        instruction.immediate,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let shape_instructions = instructions
+                .iter()
+                .map(|instruction| {
+                    instruction_token(
+                        instruction,
+                        call_pcs.contains(&instruction.pc),
+                        instruction.opcode & 0x07 == 0x05 || instruction.opcode & 0x07 == 0x06,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut cfg = BTreeMap::new();
+            for block in analysis
+                .basic_blocks
+                .iter()
+                .filter(|block| in_range(block.start_pc))
+            {
+                let start_index = analysis
+                    .instructions
+                    .iter()
+                    .position(|instruction| instruction.pc == block.start_pc)
+                    .unwrap_or(block.end_instruction_index);
+                let instruction_count = block
+                    .end_instruction_index
+                    .min(analysis.instructions.len())
+                    .saturating_sub(start_index);
+                let token = ((instruction_count as u64) << 32)
+                    | u64::try_from(block.destinations.len()).unwrap_or(u64::MAX);
+                *cfg.entry(token).or_insert(0) += 1;
+            }
+            let mut calls = BTreeMap::new();
+            for call in analysis.calls.iter().filter(|call| in_range(call.call_pc)) {
+                let target_kind = if call.target_pc.is_some() {
+                    "resolved"
+                } else {
+                    "unresolved"
+                };
+                *calls
+                    .entry(format!("{}:{target_kind}", call.kind))
+                    .or_insert(0) += 1;
+            }
+            let mut memory = BTreeMap::new();
+            for access in analysis
+                .memory_accesses
+                .iter()
+                .filter(|access| in_range(access.pc))
+            {
+                *memory
+                    .entry(format!(
+                        "{}:{}:{}",
+                        access.kind, access.width, access.offset
+                    ))
+                    .or_insert(0) += 1;
+            }
+            FunctionShape {
+                id: format!("fn_{:x}", function.pc),
+                name: function.name.clone(),
+                instruction_count: instructions.len(),
+                exact_instructions,
+                instruction_ngrams: instruction_ngrams(&shape_instructions),
+                cfg,
+                calls,
+                memory,
+            }
+        })
+        .collect()
+}
+
+fn instruction_token(
+    instruction: &InstructionFact,
+    ignore_immediate: bool,
+    ignore_offset: bool,
+) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in [instruction.opcode, instruction.dst, instruction.src] {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let offset = if ignore_offset { 0 } else { instruction.offset };
+    for byte in offset.to_le_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let immediate = if ignore_immediate {
+        0
+    } else {
+        instruction.immediate
+    };
+    for byte in immediate.to_le_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn instruction_ngrams(tokens: &[u64]) -> BTreeMap<u64, usize> {
+    let mut ngrams = BTreeMap::new();
+    let width = tokens.len().min(3);
+    if width == 0 {
+        return ngrams;
+    }
+    for window in tokens.windows(width) {
+        let mut hash = 0xcbf29ce484222325_u64;
+        for token in window {
+            for byte in token.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+        *ngrams.entry(hash).or_insert(0) += 1;
+    }
+    ngrams
+}
+
+fn shape_similarity(left: &FunctionShape, right: &FunctionShape) -> FunctionSimilarity {
+    FunctionSimilarity {
+        instruction_ngram: multiset_similarity(&left.instruction_ngrams, &right.instruction_ngrams),
+        instruction_count: count_similarity(left.instruction_count, right.instruction_count),
+        cfg_shape: multiset_similarity(&left.cfg, &right.cfg),
+        call_shape: multiset_similarity(&left.calls, &right.calls),
+        memory_shape: multiset_similarity(&left.memory, &right.memory),
+    }
+}
+
+fn multiset_similarity<K: Ord>(left: &BTreeMap<K, usize>, right: &BTreeMap<K, usize>) -> f64 {
+    let intersection = left
+        .iter()
+        .map(|(key, left_count)| {
+            right
+                .get(key)
+                .map_or(0, |right_count| (*left_count).min(*right_count))
+        })
+        .sum::<usize>();
+    let left_total = left.values().sum::<usize>();
+    let right_total = right.values().sum::<usize>();
+    let union = left_total + right_total - intersection;
+    if union == 0 {
+        1.0
+    } else {
+        round_score(intersection as f64 / union as f64)
+    }
+}
+
+fn count_similarity(left: usize, right: usize) -> f64 {
+    match left.max(right) {
+        0 => 1.0,
+        maximum => round_score(left.min(right) as f64 / maximum as f64),
+    }
+}
+
+fn round_score(value: f64) -> f64 {
+    (value.clamp(0.0, 1.0) * 1_000_000.0).round() / 1_000_000.0
+}
+
 pub fn analyze_elf(bytes: &[u8]) -> Result<StaticAnalysis, AnalysisError> {
     let executable =
         Executable::<AnalysisContext>::from_elf(bytes, Arc::new(BuiltinProgram::new_mock()))
@@ -1293,5 +1673,136 @@ mod static_tests {
         assert_eq!(ir.blocks[0].id, "bb_0");
         assert_eq!(ir.blocks[0].successors, vec!["bb_0"]);
         assert_eq!(ir.operations[0].id, "op_0");
+    }
+
+    #[test]
+    fn binary_comparison_matches_functions_by_normalized_structure() {
+        let analysis = StaticAnalysis {
+            schema_version: sos_types::ANALYSIS_SCHEMA_VERSION,
+            sbpf_version: "V0".into(),
+            entrypoint: 0,
+            instructions: vec![
+                InstructionFact {
+                    pc: 0,
+                    opcode: solana_sbpf::ebpf::MOV64_IMM,
+                    dst: 1,
+                    src: 0,
+                    offset: 0,
+                    immediate: 7,
+                    assembly: "mov64 r1, 7".into(),
+                },
+                InstructionFact {
+                    pc: 8,
+                    opcode: solana_sbpf::ebpf::CALL_IMM,
+                    dst: 0,
+                    src: 0,
+                    offset: 0,
+                    immediate: 99,
+                    assembly: "call 99".into(),
+                },
+                InstructionFact {
+                    pc: 16,
+                    opcode: solana_sbpf::ebpf::MOV64_IMM,
+                    dst: 0,
+                    src: 0,
+                    offset: 0,
+                    immediate: 1,
+                    assembly: "mov64 r0, 1".into(),
+                },
+                InstructionFact {
+                    pc: 24,
+                    opcode: solana_sbpf::ebpf::EXIT,
+                    dst: 0,
+                    src: 0,
+                    offset: 0,
+                    immediate: 0,
+                    assembly: "exit".into(),
+                },
+            ],
+            functions: vec![
+                FunctionFact {
+                    pc: 0,
+                    symbol_hash: 0,
+                    name: "caller".into(),
+                },
+                FunctionFact {
+                    pc: 16,
+                    symbol_hash: 16,
+                    name: "helper".into(),
+                },
+            ],
+            basic_blocks: vec![
+                BasicBlockFact {
+                    start_pc: 0,
+                    end_instruction_index: 2,
+                    destinations: Vec::new(),
+                    label: "caller".into(),
+                },
+                BasicBlockFact {
+                    start_pc: 16,
+                    end_instruction_index: 4,
+                    destinations: Vec::new(),
+                    label: "helper".into(),
+                },
+            ],
+            memory_accesses: Vec::new(),
+            stack_accesses: Vec::new(),
+            strings: Vec::new(),
+            public_key_candidates: Vec::new(),
+            immediate_constants: Vec::new(),
+            register_uses: Vec::new(),
+            calls: vec![CallFact {
+                call_pc: 8,
+                caller_pc: Some(0),
+                kind: "direct_internal_call".into(),
+                target_pc: Some(16),
+                target_symbol_hash: Some(16),
+                status: "resolved".into(),
+            }],
+            relocations: Vec::new(),
+            sccs: Vec::new(),
+            dataflow_edges: Vec::new(),
+            verifier_diagnostics: Vec::new(),
+        };
+
+        let identical = compare_binary_analyses(&analysis, &analysis);
+        assert_eq!(identical.overall_score, 1.0);
+        assert!(identical.exact_normalized_match);
+        assert_eq!(identical.exact_function_matches, 2);
+
+        let mut changed = analysis.clone();
+        changed.instructions[2].opcode = solana_sbpf::ebpf::ADD64_IMM;
+        let comparison = compare_binary_analyses(&analysis, &changed);
+        assert!(comparison.overall_score < 1.0);
+        assert!(!comparison.exact_normalized_match);
+        assert_eq!(
+            comparison.functions[0].candidate_function_id.as_deref(),
+            Some("fn_0")
+        );
+
+        let mut extra = analysis.clone();
+        extra.functions.push(FunctionFact {
+            pc: 32,
+            symbol_hash: 32,
+            name: "extra".into(),
+        });
+        let comparison = compare_binary_analyses(&analysis, &extra);
+        assert!(comparison.overall_score < 1.0);
+        assert!(!comparison.exact_normalized_match);
+        assert_eq!(comparison.unmatched_candidate_functions, vec!["fn_20"]);
+
+        let empty = StaticAnalysis {
+            instructions: Vec::new(),
+            functions: Vec::new(),
+            basic_blocks: Vec::new(),
+            calls: Vec::new(),
+            ..analysis.clone()
+        };
+        let both_empty = compare_binary_analyses(&empty, &empty);
+        assert_eq!(both_empty.overall_score, 1.0);
+        assert!(both_empty.exact_normalized_match);
+        let missing_candidate = compare_binary_analyses(&analysis, &empty);
+        assert_eq!(missing_candidate.overall_score, 0.0);
+        assert!(!missing_candidate.exact_normalized_match);
     }
 }

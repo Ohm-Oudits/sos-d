@@ -18,7 +18,7 @@ use sos_ai::{
     RefinementOutput, RefinementValidation, StructureRecoveryOutput, UntrustedEvidence,
     VALIDATION_BUNDLE_SCHEMA_VERSION,
 };
-use sos_analysis::{analyze_elf, build_canonical_ir};
+use sos_analysis::{analyze_elf, build_canonical_ir, compare_binary_analyses};
 use sos_artifact::{
     build_manifest, local_artifact, sha256_hex, FileArtifactStore, ManifestContext,
 };
@@ -82,7 +82,154 @@ fn main() -> ExitCode {
         "lift" => lift_command(args.collect()),
         "humanize" => humanize_command(args.collect()),
         "benchmark" => benchmark_command(args.collect()),
+        "judge" => judge_command(args.collect()),
         _ => usage(),
+    }
+}
+
+#[derive(Debug)]
+struct JudgeOptions {
+    original: PathBuf,
+    candidate: PathBuf,
+    output: Option<PathBuf>,
+    minimum_score: f64,
+    require_exact: bool,
+}
+
+impl JudgeOptions {
+    fn parse(args: Vec<String>) -> Result<Self, String> {
+        let (Some(original), Some(candidate)) = (args.first(), args.get(1)) else {
+            return Err(
+                "usage: sos judge <original-sbf-elf> <candidate-sbf-elf> [--minimum-score 0..1] [--require-exact] [--out PATH]"
+                    .into(),
+            );
+        };
+        let mut options = Self {
+            original: PathBuf::from(original),
+            candidate: PathBuf::from(candidate),
+            output: None,
+            minimum_score: 0.9,
+            require_exact: false,
+        };
+        let mut index = 2;
+        while index < args.len() {
+            if args[index] == "--require-exact" {
+                options.require_exact = true;
+                index += 1;
+                continue;
+            }
+            let flag = &args[index];
+            let Some(value) = args.get(index + 1) else {
+                return Err(format!("missing value for {flag}"));
+            };
+            match flag.as_str() {
+                "--out" => options.output = Some(PathBuf::from(value)),
+                "--minimum-score" => {
+                    options.minimum_score = value
+                        .parse::<f64>()
+                        .map_err(|error| format!("invalid minimum score: {error}"))?;
+                    if !options.minimum_score.is_finite()
+                        || !(0.0..=1.0).contains(&options.minimum_score)
+                    {
+                        return Err("--minimum-score must be between 0 and 1".into());
+                    }
+                }
+                _ => return Err(format!("unknown judge option: {flag}")),
+            }
+            index += 2;
+        }
+        Ok(options)
+    }
+}
+
+fn judge_command(args: Vec<String>) -> ExitCode {
+    let options = match JudgeOptions::parse(args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let original_bytes = match fs::read(&options.original) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("error: {}: {error}", options.original.display());
+            return ExitCode::from(1);
+        }
+    };
+    let candidate_bytes = match fs::read(&options.candidate) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("error: {}: {error}", options.candidate.display());
+            return ExitCode::from(1);
+        }
+    };
+    let original = match analyze_elf(&original_bytes) {
+        Ok(analysis) => analysis,
+        Err(error) => {
+            eprintln!("error: original artifact: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let candidate = match analyze_elf(&candidate_bytes) {
+        Ok(analysis) => analysis,
+        Err(error) => {
+            eprintln!("error: candidate artifact: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let comparison = compare_binary_analyses(&original, &candidate);
+    let overall_score = comparison.overall_score;
+    let accepted = overall_score >= options.minimum_score
+        && (!options.require_exact || comparison.exact_normalized_match);
+    let result = serde_json::json!({
+        "schema_version": 1,
+        "accepted": accepted,
+        "minimum_score": options.minimum_score,
+        "require_exact": options.require_exact,
+        "limitations": [
+            "structural binary similarity is a regression signal, not proof of semantic equivalence",
+            "recompiled candidates may differ because of compiler, linker, optimization, or SBPF toolchain changes"
+        ],
+        "original": {
+            "path": options.original,
+            "sha256": sha256_hex(&original_bytes),
+            "sbpf_version": original.sbpf_version,
+        },
+        "candidate": {
+            "path": options.candidate,
+            "sha256": sha256_hex(&candidate_bytes),
+            "sbpf_version": candidate.sbpf_version,
+        },
+        "comparison": comparison,
+    });
+    let rendered = serde_json::to_vec_pretty(&result).expect("judge result is serializable");
+    if let Some(path) = options.output {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            if let Err(error) = fs::create_dir_all(parent) {
+                eprintln!("error: {}: {error}", parent.display());
+                return ExitCode::from(1);
+            }
+        }
+        if let Err(error) = fs::write(&path, rendered) {
+            eprintln!("error: {}: {error}", path.display());
+            return ExitCode::from(1);
+        }
+        println!("judge={}", path.display());
+    } else {
+        println!("{}", String::from_utf8_lossy(&rendered));
+    }
+    if accepted {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "error: candidate score {:.6} did not satisfy the judge threshold",
+            overall_score
+        );
+        ExitCode::from(1)
     }
 }
 
@@ -3686,6 +3833,7 @@ fn usage() -> ExitCode {
     eprintln!("       sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq] [--function fn_ID] [--model MODEL] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]");
     eprintln!("       sos humanize <pseudocode-file> [--plan] [--resume] [--cache-dir DIR] [--provider groq|ollama] [--model MODEL] [--max-units N] [--out PATH] [--audit-out PATH]");
     eprintln!("       sos benchmark <artifact> [--repeats N] [--out PATH]");
+    eprintln!("       sos judge <original-sbf-elf> <candidate-sbf-elf> [--minimum-score 0..1] [--require-exact] [--out PATH]");
     ExitCode::from(2)
 }
 
@@ -3696,8 +3844,8 @@ mod tests {
 
     use super::{
         run_humanization_units, run_lift_bundle, transaction_account_addresses, BenchmarkOptions,
-        ExplainOptions, HumanizationCache, HumanizeOptions, LiftCheckpointCache, LiftOptions,
-        LiftProvider, LiftRunConfig, RemoteOptions,
+        ExplainOptions, HumanizationCache, HumanizeOptions, JudgeOptions, LiftCheckpointCache,
+        LiftOptions, LiftProvider, LiftRunConfig, RemoteOptions,
     };
     use sos_ai::{AiError, ModelProvider, ModelRequest, ModelResponse};
 
@@ -4385,6 +4533,27 @@ mod tests {
         assert!(BenchmarkOptions::parse(
             vec!["program.so".into(), "--repeats".into(), "9".into(),]
         )
+        .is_err());
+    }
+
+    #[test]
+    fn judge_options_enforce_bounded_thresholds_and_exact_mode() {
+        let options = JudgeOptions::parse(vec![
+            "original.so".into(),
+            "candidate.so".into(),
+            "--minimum-score".into(),
+            "0.95".into(),
+            "--require-exact".into(),
+        ])
+        .unwrap();
+        assert_eq!(options.minimum_score, 0.95);
+        assert!(options.require_exact);
+        assert!(JudgeOptions::parse(vec![
+            "original.so".into(),
+            "candidate.so".into(),
+            "--minimum-score".into(),
+            "1.1".into(),
+        ])
         .is_err());
     }
 }

@@ -421,6 +421,15 @@ returns `passed`, `failed`, `timed_out`, or `not_available`. Replay comparison i
 reported independently in `validation.json`; observed trace agreement is evidence
 for selected paths, not proof of equivalence or source recovery.
 
+After a whole candidate is rebuilt with the pinned Solana/SBPF toolchain,
+`sos judge` provides a separate deterministic binary regression gate. It pairs
+functions without trusting names and scores normalized instruction n-grams,
+instruction counts, CFG shape, call shape, and memory effects. Missing or
+unmatched candidate functions lower the score, and an optional exact mode
+requires every normalized function shape to match. The versioned result records
+both content hashes and per-function components. This remains structural
+evidence—not semantic equivalence—and is interpreted alongside replay results.
+
 Refinement output can carry directly comparable, evidence-linked observations for
 logs, CPI targets, status, and return data. The validator matches these observations
 against the trace and emits explicit mismatch records. A bounded repair loop returns
@@ -555,6 +564,8 @@ and security tooling do not have to scrape human output.
 - Transaction history ingestion.
 - Historical account hydration where supported.
 - Sandboxed SVM/LiteSVM replay.
+- Pinned candidate compilation and deterministic binary-similarity judging.
+- Type-layout and call-graph non-regression checks.
 - Trace comparison and bounded AI repair loop.
 
 ### Phase 6 — research-grade product

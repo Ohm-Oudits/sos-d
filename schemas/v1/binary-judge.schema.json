@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sos.invalid/schemas/v1/binary-judge.schema.json",
+  "title": "SOS deterministic binary comparison",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "accepted",
+    "minimum_score",
+    "require_exact",
+    "limitations",
+    "original",
+    "candidate",
+    "comparison"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "accepted": { "type": "boolean" },
+    "minimum_score": { "type": "number", "minimum": 0, "maximum": 1 },
+    "require_exact": { "type": "boolean" },
+    "limitations": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "original": { "$ref": "#/$defs/artifact" },
+    "candidate": { "$ref": "#/$defs/artifact" },
+    "comparison": { "$ref": "#/$defs/comparison" }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "required": ["path", "sha256", "sbpf_version"],
+      "properties": {
+        "path": { "type": "string" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "sbpf_version": { "type": "string" }
+      }
+    },
+    "score": { "type": "number", "minimum": 0, "maximum": 1 },
+    "similarity": {
+      "type": "object",
+      "required": [
+        "instruction_ngram",
+        "instruction_count",
+        "cfg_shape",
+        "call_shape",
+        "memory_shape"
+      ],
+      "properties": {
+        "instruction_ngram": { "$ref": "#/$defs/score" },
+        "instruction_count": { "$ref": "#/$defs/score" },
+        "cfg_shape": { "$ref": "#/$defs/score" },
+        "call_shape": { "$ref": "#/$defs/score" },
+        "memory_shape": { "$ref": "#/$defs/score" }
+      }
+    },
+    "function": {
+      "type": "object",
+      "required": [
+        "original_function_id",
+        "original_name",
+        "candidate_function_id",
+        "candidate_name",
+        "original_instruction_count",
+        "candidate_instruction_count",
+        "score",
+        "exact_normalized_shape",
+        "similarity"
+      ],
+      "properties": {
+        "original_function_id": { "type": "string" },
+        "original_name": { "type": "string" },
+        "candidate_function_id": { "type": ["string", "null"] },
+        "candidate_name": { "type": ["string", "null"] },
+        "original_instruction_count": { "type": "integer", "minimum": 0 },
+        "candidate_instruction_count": { "type": "integer", "minimum": 0 },
+        "score": { "$ref": "#/$defs/score" },
+        "exact_normalized_shape": { "type": "boolean" },
+        "similarity": { "$ref": "#/$defs/similarity" }
+      }
+    },
+    "comparison": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "overall_score",
+        "exact_normalized_match",
+        "original_function_count",
+        "candidate_function_count",
+        "matched_function_count",
+        "exact_function_matches",
+        "functions",
+        "unmatched_candidate_functions"
+      ],
+      "properties": {
+        "schema_version": { "type": "integer", "const": 1 },
+        "overall_score": { "$ref": "#/$defs/score" },
+        "exact_normalized_match": { "type": "boolean" },
+        "original_function_count": { "type": "integer", "minimum": 0 },
+        "candidate_function_count": { "type": "integer", "minimum": 0 },
+        "matched_function_count": { "type": "integer", "minimum": 0 },
+        "exact_function_matches": { "type": "integer", "minimum": 0 },
+        "functions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/function" }
+        },
+        "unmatched_candidate_functions": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}

@@ -166,7 +166,18 @@ sos decompile ./analysis --format c-like --out ./analysis/pseudocode.c
 sos report ./analysis --format json --out ./analysis/report.json
 sos report ./analysis --format graphviz --out ./analysis/cfg.dot
 sos explain ./analysis --model-command ./fixtures/echo-model.sh --out ./analysis/explanation.json
+sos judge ./program.so ./recompiled-candidate.so \
+  --minimum-score 0.90 --out ./binary-judge.json
 ```
+
+`sos judge` compares a candidate rebuilt with the pinned Solana/SBPF toolchain
+against the original binary. It deterministically pairs functions without using
+source names and scores normalized instruction n-grams, instruction counts, CFG
+shape, call shape, and memory effects. Unmatched candidate functions lower the
+score. Add `--require-exact` when every normalized function shape must match.
+This is a strong reconstruction regression gate, not proof of semantic
+equivalence; compiler, linker, optimization, and SBPF toolchain versions must be
+pinned for meaningful comparisons.
 
 ### Local open-weight semantic lifting
 
@@ -326,6 +337,19 @@ repeated analysis runs are byte-identical:
 ```bash
 sos benchmark ./program.so --repeats 3 --out ./benchmark.json
 ```
+
+After a reconstructed program has been compiled to SBPF, run the deterministic
+binary judge and retain its versioned JSON result:
+
+```bash
+sos judge ./original.so ./recompiled-candidate.so \
+  --minimum-score 0.90 \
+  --out ./binary-judge.json
+```
+
+Use `--require-exact` for a GoonFi-style normalized exact-match gate. The default
+score is intentionally more tolerant of compiler-produced differences, while
+still penalizing missing and unmatched candidate functions.
 
 Build the currently available fixture corpus with:
 

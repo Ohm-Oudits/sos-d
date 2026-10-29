@@ -35,7 +35,7 @@ ELF/SBPF facts
   -> security-oriented explanation
   -> source refinement
   -> syntax/type validation
-  -> replay and recompilation comparison (planned judge expansion)
+  -> replay and deterministic recompilation comparison
 ```
 
 Accepted output from one model stage is passed to the next as explicitly tagged
@@ -221,8 +221,9 @@ Outputs:
 - `repair.json`: bounded `rustc` diagnostics and compiler-repair rounds. A
   successful compile is still marked unverified until replay agrees.
 
-For source-backed corpus fixtures, run the deterministic behavior judge after
-lifting. It fails when required observable semantics are absent:
+For source-backed corpus fixtures, run the lightweight text-contract smoke test
+after lifting. It fails when required observable semantics are absent from the
+readable candidate:
 
 ```bash
 python3 scripts/evaluate-readable.py \
@@ -231,10 +232,34 @@ python3 scripts/evaluate-readable.py \
   --out ./analysis/lifted/quality.json
 ```
 
+The stronger GoonFi-style gate recompiles the candidate with the same pinned
+Solana/SBPF toolchain and compares the resulting ELF to the original:
+
+```bash
+sos judge ./original.so ./recompiled-candidate.so \
+  --minimum-score 0.90 \
+  --out ./analysis/lifted/binary-judge.json
+```
+
+The judge performs deterministic one-to-one function pairing without relying on
+source names. Its weighted score covers normalized instruction n-grams,
+instruction count, CFG shape, call shape, and memory effects; missing or
+unmatched candidate functions reduce the score. `--require-exact` requires every
+normalized function shape to match and rejects extra functions. Both inputs,
+content hashes, per-function components, the threshold, and limitations are
+recorded in versioned JSON.
+
+This comparison is a reconstruction regression signal, not a proof of semantic
+equivalence. Toolchain changes can alter otherwise equivalent binaries, while
+untested behavior can still differ in structurally similar binaries. Pin the
+compiler, linker, optimization flags, SDK, and SBPF tools, then combine this gate
+with replay evidence.
+
 ## Current trust boundary
 
 `readable.rs` is a hypothesis until independent checks pass. Compilation proves
 only syntax and type consistency. Replay proves behavior only for the selected
-paths. The remaining judge work is function-level recompilation scoring,
-non-regression enforcement across the call graph, type-layout verification, and
+paths. Deterministic function-level recompilation scoring is implemented. The
+remaining judge work is automatic pinned candidate builds, type-layout
+verification, stronger call-graph non-regression constraints, and
 multi-transaction path coverage.

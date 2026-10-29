@@ -94,6 +94,10 @@ Already implemented in this workspace:
   subprocess and emits a versioned result that keeps replay status separate; an
   optional `--trace` records observed replay comparison without calling it a
   candidate execution proof.
+- `sos judge` compares an original SBPF ELF with a recompiled candidate using
+  deterministic name-independent function pairing, normalized instruction
+  n-grams, instruction counts, CFG/call/memory shape, unmatched-function
+  penalties, content hashes, and an optional normalized exact-match gate.
 - Refinement candidates can now emit bounded, evidence-linked behavior observations;
   `sos validate` compares them directly with supplied logs, CPI targets, status, and
   return data, emits mismatch records, and supports a capped compiler/mismatch-driven
@@ -324,6 +328,8 @@ Deliverables:
 - transaction history ingestion;
 - account hydration and trace bundles;
 - isolated local replay;
+- automatic candidate builds under a pinned Solana/SBPF compiler and linker;
+- type-layout and deeper call-graph checks around the deterministic binary judge;
 - bounded candidate-vs-trace comparison and repair loop.
 
 Tasks:
@@ -334,6 +340,8 @@ Tasks:
 4. Normalize status, logs, compute units, CPIs, return data, and account diffs.
 5. Compare candidate observations with observed traces and emit mismatch records.
 6. Permit only bounded, auditable AI repair passes.
+7. Rebuild whole-program candidates with a pinned toolchain and retain binary-judge
+   results beside replay evidence.
 
 Gate: a replay result is reproducible, read-only, and clearly scoped to its observed
 state/path; mismatches cannot be silently hidden.

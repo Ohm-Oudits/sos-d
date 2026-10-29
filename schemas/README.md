@@ -24,3 +24,6 @@ The refinement contract separately bounds source patches and directly comparable
 candidate observations.
 The validation contract keeps compiler status and behavioral status distinct;
 successful compilation alone is never represented as behavioral agreement.
+The binary-judge contract records content hashes, per-function structural scores,
+the configured acceptance threshold, exact-match status, and explicit limitations;
+it is a deterministic regression signal rather than equivalence proof.

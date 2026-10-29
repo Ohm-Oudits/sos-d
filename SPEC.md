@@ -46,6 +46,7 @@ report directory/
   model.json          optional four-stage AI audit bundle
   ai-report.md        optional human-readable AI hypotheses and stage audit
   validation.json     optional compilation/replay validation status
+  binary-judge.json   optional original-vs-recompiled structural comparison
 ```
 
 ## 3. Trust model and evidence statuses
@@ -196,6 +197,21 @@ also emit a bounded set of evidence-linked observations (`log_contains`, `cpi_ta
 `status`, or `return_data_base64`); only direct matches against the supplied trace
 can promote those observations to `behaviorally_validated`. A repair pass receives
 only capped compiler/mismatch feedback and is limited by `--repair-rounds`.
+
+`sos judge <original.so> <candidate.so>` is the deterministic recompilation
+gate. Both inputs must pass the normal ELF/SBPF analyzer. The judge must pair
+functions without trusting recovered source names and emit a versioned JSON
+record containing both content hashes, SBPF versions, acceptance threshold,
+exact-match requirement, per-function matches, unmatched functions, component
+scores, and limitations. The score must include normalized instruction n-grams,
+instruction count, CFG shape, call shape, and memory effects. Missing original
+functions and unmatched candidate functions must reduce acceptance quality.
+
+The judge must never represent structural similarity as semantic equivalence.
+An exact normalized match means only that all normalized function shapes used by
+this judge matched. Reproducible evaluation must pin the compiler, linker,
+optimization flags, SDK, and SBPF toolchain. Behavioral claims still require
+independent replay or observed execution evidence.
 
 ### 4.6 Output formats
 
