@@ -254,6 +254,8 @@ review the partition and pass `--max-units N` to authorize a larger run.
 Detected function names and known call relationships are attached to each unit.
 Up to two accepted earlier reconstructions are supplied to the next unit as
 explicitly untrusted context; deterministic line evidence remains authoritative.
+Dependency units are processed before callers even when file order is reversed,
+then merged back into original source order.
 
 Preview decomposition without loading or contacting any model:
 

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -1590,12 +1591,61 @@ struct HumanizationRun {
     failures: usize,
 }
 
+fn humanization_processing_order(units: &[PseudocodeUnit]) -> Vec<usize> {
+    fn visit(
+        index: usize,
+        units: &[PseudocodeUnit],
+        by_name: &BTreeMap<String, Vec<usize>>,
+        state: &mut [u8],
+        order: &mut Vec<usize>,
+    ) {
+        if state[index] == 2 {
+            return;
+        }
+        if state[index] == 1 {
+            // Preserve deterministic source order across recursive cycles.
+            return;
+        }
+        state[index] = 1;
+        for referenced in &units[index].referenced_functions {
+            if let Some(dependencies) = by_name.get(referenced) {
+                for dependency in dependencies {
+                    if *dependency != index {
+                        visit(*dependency, units, by_name, state, order);
+                    }
+                }
+            }
+        }
+        state[index] = 2;
+        order.push(index);
+    }
+
+    let mut by_name = BTreeMap::<String, Vec<usize>>::new();
+    for (index, unit) in units.iter().enumerate() {
+        if let Some(name) = &unit.function_name {
+            by_name.entry(name.clone()).or_default().push(index);
+        }
+    }
+    let mut state = vec![0_u8; units.len()];
+    let mut order = Vec::with_capacity(units.len());
+    for index in 0..units.len() {
+        visit(index, units, &by_name, &mut state, &mut order);
+    }
+    order
+}
+
 fn build_humanization_plan(
     source: &str,
     units: &[PseudocodeUnit],
 ) -> Result<serde_json::Value, String> {
+    let processing_order = humanization_processing_order(units);
+    let processing_positions = processing_order
+        .iter()
+        .enumerate()
+        .map(|(position, unit_index)| (*unit_index, position + 1))
+        .collect::<BTreeMap<_, _>>();
     let mut planned_units = Vec::with_capacity(units.len());
-    for unit in units {
+    for (unit_index, unit) in units.iter().enumerate() {
         let pack = evidence_pack_from_pseudocode_unit(unit).map_err(|error| error.to_string())?;
         planned_units.push(serde_json::json!({
             "id": unit.id,
@@ -1606,6 +1656,7 @@ fn build_humanization_plan(
             "referenced_functions": unit.referenced_functions,
             "operation_count": pack.ir.operations.len(),
             "unit_sha256": pack.artifact_sha256,
+            "processing_position": processing_positions.get(&unit_index),
         }));
     }
     Ok(serde_json::json!({
@@ -1613,6 +1664,10 @@ fn build_humanization_plan(
         "mode": "plan_only_no_inference",
         "source_sha256": sha256_hex(source.as_bytes()),
         "unit_count": units.len(),
+        "processing_sequence": processing_order
+            .iter()
+            .map(|index| &units[*index].id)
+            .collect::<Vec<_>>(),
         "units": planned_units,
     }))
 }
@@ -1622,15 +1677,17 @@ where
     P: ModelProvider + Clone,
 {
     let mut run = HumanizationRun {
-        readable_fragments: Vec::with_capacity(units.len()),
-        unit_audits: Vec::with_capacity(units.len()),
+        readable_fragments: vec![String::new(); units.len()],
+        unit_audits: vec![serde_json::Value::Null; units.len()],
         failures: 0,
     };
     let mut accepted_context = Vec::<UntrustedEvidence>::new();
-    for (index, unit) in units.iter().enumerate() {
+    let processing_order = humanization_processing_order(units);
+    for (processing_index, unit_index) in processing_order.iter().enumerate() {
+        let unit = &units[*unit_index];
         eprintln!(
             "humanizing unit {}/{}: {} (lines {}-{})",
-            index + 1,
+            processing_index + 1,
             units.len(),
             unit.id,
             unit.start_line,
@@ -1640,15 +1697,16 @@ where
             Ok(pack) => pack,
             Err(error) => {
                 run.failures += 1;
-                run.readable_fragments.push(format!(
+                run.readable_fragments[*unit_index] = format!(
                     "// UNRESOLVED {} (lines {}-{}): {}",
                     unit.id, unit.start_line, unit.end_line, error
-                ));
-                run.unit_audits.push(serde_json::json!({
+                );
+                run.unit_audits[*unit_index] = serde_json::json!({
                     "unit": unit,
+                    "processing_position": processing_index + 1,
                     "status": "rejected",
                     "error": error.to_string(),
-                }));
+                });
                 continue;
             }
         };
@@ -1689,50 +1747,53 @@ where
                         source: format!("accepted_humanization:{}", unit.id),
                         content: prior,
                     });
-                    run.readable_fragments.push(format!(
+                    run.readable_fragments[*unit_index] = format!(
                         "// {}: original pseudocode lines {}-{}; evidence function {}\n{}",
                         unit.id,
                         unit.start_line,
                         unit.end_line,
                         expected_function,
                         function.pseudocode.trim()
-                    ));
-                    run.unit_audits.push(serde_json::json!({
+                    );
+                    run.unit_audits[*unit_index] = serde_json::json!({
                         "unit": unit,
+                        "processing_position": processing_index + 1,
                         "status": "accepted_unverified",
                         "evidence_pack": pack,
                         "response": response,
-                    }));
+                    });
                 } else {
                     run.failures += 1;
                     let error = format!(
                         "model returned no candidate for expected function {expected_function}"
                     );
-                    run.readable_fragments.push(format!(
+                    run.readable_fragments[*unit_index] = format!(
                         "// UNRESOLVED {} (lines {}-{}): {}",
                         unit.id, unit.start_line, unit.end_line, error
-                    ));
-                    run.unit_audits.push(serde_json::json!({
+                    );
+                    run.unit_audits[*unit_index] = serde_json::json!({
                         "unit": unit,
+                        "processing_position": processing_index + 1,
                         "status": "rejected",
                         "error": error,
                         "evidence_pack": pack,
                         "response": response,
-                    }));
+                    });
                 }
             }
             Err(error) => {
                 run.failures += 1;
-                run.readable_fragments.push(format!(
+                run.readable_fragments[*unit_index] = format!(
                     "// UNRESOLVED {} (lines {}-{}): {}",
                     unit.id, unit.start_line, unit.end_line, error
-                ));
-                run.unit_audits.push(serde_json::json!({
+                );
+                run.unit_audits[*unit_index] = serde_json::json!({
                     "unit": unit,
+                    "processing_position": processing_index + 1,
                     "status": "not_available",
                     "error": error,
                     "evidence_pack": pack,
-                }));
+                });
             }
         }
     }
@@ -3242,6 +3303,70 @@ mod tests {
         assert!(contexts[1]
             .iter()
             .any(|source| source == "accepted_humanization:unit_0001"));
+    }
+
+    #[test]
+    fn humanize_processes_dependencies_first_but_merges_in_source_order() {
+        type RecordedRequests = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
+        #[derive(Clone)]
+        struct RecordingHumanizer {
+            requests: RecordedRequests,
+        }
+        impl ModelProvider for RecordingHumanizer {
+            fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
+                let function = request.evidence_pack.ir.functions[0].clone();
+                let operation_id = request.evidence_pack.ir.operations[0].id.clone();
+                self.requests.lock().unwrap().push((
+                    function.name.clone(),
+                    request
+                        .evidence_pack
+                        .untrusted_evidence
+                        .iter()
+                        .map(|item| item.source.clone())
+                        .collect(),
+                ));
+                Ok(ModelResponse {
+                    task: request.task,
+                    model: request.model,
+                    prompt_version: request.prompt_version,
+                    structured_output: serde_json::json!({
+                        "functions": [{
+                            "function_id": function.id,
+                            "pseudocode": format!("fn {}() {{}}", function.name),
+                            "evidence": [{
+                                "source": "ir",
+                                "location": format!("operation:{operation_id}"),
+                                "detail": "bounded function evidence"
+                            }]
+                        }]
+                    }),
+                    evidence: Vec::new(),
+                })
+            }
+        }
+
+        let source =
+            "undefined8 caller()\n{\n  return helper();\n}\nundefined8 helper()\n{\n  return 7;\n}";
+        let units = sos_ai::partition_pseudocode(source).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let run = run_humanization_units(
+            RecordingHumanizer {
+                requests: requests.clone(),
+            },
+            "test",
+            &units,
+        );
+        assert_eq!(run.failures, 0);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].0, "helper");
+        assert_eq!(requests[1].0, "caller");
+        assert!(requests[1]
+            .1
+            .iter()
+            .any(|source| source == "accepted_humanization:unit_0002"));
+        assert!(run.readable_fragments[0].contains("unit_0001"));
+        assert!(run.readable_fragments[1].contains("unit_0002"));
     }
 
     #[test]

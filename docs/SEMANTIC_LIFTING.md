@@ -137,7 +137,9 @@ The partitioner extracts conservative function symbols and calls to other known
 symbols. Each synthetic IR function keeps its recovered name. Accepted output
 from up to two earlier units is passed to the next request as bounded, explicitly
 untrusted context, following the iterative GoonFi/Patina pattern without allowing
-model output to replace line-level evidence.
+model output to replace line-level evidence. A deterministic dependency walk
+processes known callees before callers, handles cycles in stable source order,
+and merges final fragments back into their original line order.
 
 Use `--plan` to write the source hash, detected line ranges, synthetic function
 IDs, operation counts, and per-unit hashes without requiring an API key or
