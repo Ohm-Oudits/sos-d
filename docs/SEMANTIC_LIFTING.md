@@ -74,6 +74,7 @@ cargo run -p sos-cli -- analyze ./program.so --out ./analysis
 cargo run -p sos-cli -- lift ./analysis \
   --model gpt-oss:20b \
   --ollama-url http://127.0.0.1:11434 \
+  --repair-rounds 2 \
   --out ./analysis/lifted
 ```
 
@@ -90,6 +91,8 @@ Outputs:
 - `ai-report.md`: readable hypotheses and evidence;
 - `readable.rs`: best accepted source candidate per function, with unresolved
   functions left explicit.
+- `repair.json`: bounded `rustc` diagnostics and compiler-repair rounds. A
+  successful compile is still marked unverified until replay agrees.
 
 For source-backed corpus fixtures, run the deterministic behavior judge after
 lifting. It fails when required observable semantics are absent:

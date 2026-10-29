@@ -8,9 +8,10 @@ use std::{
 use sos_ai::{
     compile_refinement_output, run_pipeline, run_refinement_loop, scope_analysis_to_function,
     trusted_open_model, unavailable_pipeline_bundle, AiPipelineBundle, AiPipelineConfig,
-    CommandModelProvider, EvidencePack, EvidencePackLimits, HttpModelProvider, ModelGateway,
-    ModelProvider, ModelTask, OllamaModelProvider, RefinementFeedback, RefinementLoopResult,
-    RefinementOutput, RefinementValidation, VALIDATION_BUNDLE_SCHEMA_VERSION,
+    AiStageResult, AiStageStatus, CommandModelProvider, CompilationStatus, EvidencePack,
+    EvidencePackLimits, HttpModelProvider, ModelGateway, ModelProvider, ModelResponse, ModelTask,
+    OllamaModelProvider, RefinementFeedback, RefinementLoopResult, RefinementOutput,
+    RefinementValidation, UntrustedEvidence, VALIDATION_BUNDLE_SCHEMA_VERSION,
 };
 use sos_analysis::{analyze_elf, build_canonical_ir};
 use sos_artifact::{
@@ -1398,13 +1399,14 @@ struct LiftOptions {
     context_tokens: usize,
     allow_unreviewed_model: bool,
     function_id: Option<String>,
+    repair_rounds: usize,
 }
 
 impl LiftOptions {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let Some(directory) = args.first() else {
             return Err(
-                "usage: sos lift <analysis-directory> [--function fn_ID] [--model gpt-oss:20b] [--ollama-url URL] [--context-tokens N] [--out DIR]".into(),
+                "usage: sos lift <analysis-directory> [--function fn_ID] [--model gpt-oss:20b] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]".into(),
             );
         };
         let mut options = Self {
@@ -1415,6 +1417,7 @@ impl LiftOptions {
             context_tokens: 32_768,
             allow_unreviewed_model: false,
             function_id: None,
+            repair_rounds: 2,
         };
         let mut index = 1;
         while index < args.len() {
@@ -1438,6 +1441,14 @@ impl LiftOptions {
                         .map_err(|error| format!("invalid context token count: {error}"))?;
                     if !(4_096..=131_072).contains(&options.context_tokens) {
                         return Err("--context-tokens must be between 4096 and 131072".into());
+                    }
+                }
+                "--repair-rounds" => {
+                    options.repair_rounds = value
+                        .parse::<usize>()
+                        .map_err(|error| format!("invalid repair round count: {error}"))?;
+                    if options.repair_rounds > 4 {
+                        return Err("--repair-rounds must be between 0 and 4".into());
                     }
                 }
                 _ => return Err(format!("unknown lift option: {flag}")),
@@ -1493,6 +1504,7 @@ fn lift_command(args: Vec<String>) -> ExitCode {
         model: config.model.clone(),
         stages: Vec::new(),
     };
+    let mut repair_records = Vec::<serde_json::Value>::new();
     let mut functions = analysis.functions.clone();
     functions.sort_by_key(|function| function.pc);
     if let Some(function_id) = options.function_id.as_deref() {
@@ -1516,12 +1528,23 @@ fn lift_command(args: Vec<String>) -> ExitCode {
                 continue;
             };
             let scoped_semantics = analyze_semantics(&scoped_analysis);
-            let partial = run_pipeline(
+            let mut partial = run_pipeline(
                 provider.clone(),
                 config.clone(),
                 &scoped_analysis,
                 &scoped_semantics,
             );
+            if options.repair_rounds > 0 {
+                repair_failed_refinement(
+                    &provider,
+                    &config,
+                    &scoped_analysis,
+                    &scoped_semantics,
+                    options.repair_rounds,
+                    &mut partial,
+                    &mut repair_records,
+                );
+            }
             bundle.stages.extend(partial.stages);
         }
     }
@@ -1532,6 +1555,7 @@ fn lift_command(args: Vec<String>) -> ExitCode {
     let model_path = options.output.join("model.json");
     let report_path = options.output.join("ai-report.md");
     let source_path = options.output.join("readable.rs");
+    let repair_path = options.output.join("repair.json");
     let writes = [
         (
             &model_path,
@@ -1556,10 +1580,18 @@ fn lift_command(args: Vec<String>) -> ExitCode {
             return ExitCode::from(1);
         }
     }
+    if let Err(error) = fs::write(
+        &repair_path,
+        serde_json::to_vec_pretty(&repair_records).expect("repair records are serializable"),
+    ) {
+        eprintln!("error: {}: {error}", repair_path.display());
+        return ExitCode::from(1);
+    }
 
     println!("model={}", model_path.display());
     println!("ai_report={}", report_path.display());
     println!("readable_source={}", source_path.display());
+    println!("repair={}", repair_path.display());
     if let Some(profile) = trusted_open_model(&options.model) {
         println!(
             "open_model={} publisher={} license={} weights={}",
@@ -1588,6 +1620,142 @@ fn lift_command(args: Vec<String>) -> ExitCode {
         eprintln!("error: no readable candidate was accepted; inspect model.json for stage errors");
         ExitCode::from(1)
     }
+}
+
+fn repair_failed_refinement(
+    provider: &OllamaModelProvider,
+    config: &AiPipelineConfig,
+    analysis: &sos_analysis::StaticAnalysis,
+    semantics: &sos_solana::SemanticAnalysis,
+    repair_rounds: usize,
+    bundle: &mut AiPipelineBundle,
+    repair_records: &mut Vec<serde_json::Value>,
+) {
+    let function_id = format!("fn_{:x}", analysis.entrypoint);
+    let Some(initial) = bundle
+        .stages
+        .iter()
+        .rev()
+        .find(|stage| {
+            stage.task == ModelTask::Refinement && stage.status == AiStageStatus::Accepted
+        })
+        .and_then(|stage| stage.response.as_ref())
+        .and_then(|response| {
+            serde_json::from_value::<RefinementOutput>(response.structured_output.clone()).ok()
+        })
+    else {
+        repair_records.push(serde_json::json!({
+            "function_id": function_id,
+            "status": "not_available",
+            "reason": "no accepted initial refinement"
+        }));
+        return;
+    };
+    let compiler = Path::new("rustc");
+    let initial_compilation =
+        compile_refinement_output(&initial, Some(compiler), Duration::from_secs(30));
+    if matches!(
+        initial_compilation.status,
+        CompilationStatus::Passed | CompilationStatus::NotAvailable
+    ) {
+        repair_records.push(serde_json::json!({
+            "function_id": function_id,
+            "status": if initial_compilation.status == CompilationStatus::Passed { "compiled_unverified" } else { "not_available" },
+            "initial_compilation": initial_compilation,
+            "repair_loop": null
+        }));
+        return;
+    }
+
+    let mut pack = EvidencePack::bounded_from_analysis(
+        ModelTask::Refinement,
+        config.artifact_sha256.clone(),
+        analysis,
+        semantics,
+        config.limits,
+    );
+    for stage in bundle
+        .stages
+        .iter()
+        .filter(|stage| stage.status == AiStageStatus::Accepted)
+    {
+        if let Some(response) = stage.response.as_ref() {
+            let content = serde_json::to_string(&response.structured_output)
+                .unwrap_or_else(|_| "{}".into())
+                .chars()
+                .take(128 * 1024)
+                .collect::<String>();
+            pack.untrusted_evidence.push(UntrustedEvidence {
+                source: format!("accepted_model_stage:{:?}", stage.task),
+                content,
+            });
+        }
+    }
+    let initial_feedback = RefinementFeedback {
+        compilation: initial_compilation.status,
+        compiler_diagnostics: initial_compilation.diagnostics.clone(),
+        behavioral_status: "not_requested".into(),
+        mismatches: Vec::new(),
+        limitations: initial_compilation.limitations.clone(),
+    };
+    pack.untrusted_evidence.push(UntrustedEvidence {
+        source: "external_validation:initial_compilation".into(),
+        content: serde_json::to_string(&initial_feedback).unwrap_or_else(|_| "{}".into()),
+    });
+
+    let loop_result = run_refinement_loop(
+        provider.clone(),
+        pack,
+        config.model.clone(),
+        config.prompt_version.clone(),
+        config.max_attempts,
+        repair_rounds,
+        |candidate| {
+            let compilation =
+                compile_refinement_output(candidate, Some(compiler), Duration::from_secs(30));
+            RefinementFeedback {
+                compilation: compilation.status,
+                compiler_diagnostics: compilation.diagnostics,
+                behavioral_status: "not_requested".into(),
+                mismatches: Vec::new(),
+                limitations: compilation.limitations,
+            }
+        },
+    );
+    let compiled = loop_result
+        .rounds
+        .last()
+        .and_then(|round| round.feedback.as_ref())
+        .is_some_and(|feedback| feedback.compilation == CompilationStatus::Passed);
+    if compiled {
+        if let (Some(final_output), Some(round)) =
+            (loop_result.final_output.clone(), loop_result.rounds.last())
+        {
+            bundle.stages.push(AiStageResult {
+                task: ModelTask::Refinement,
+                status: AiStageStatus::Accepted,
+                model: config.model.clone(),
+                prompt_version: config.prompt_version.clone(),
+                input_sha256: round.input_sha256.clone(),
+                output_sha256: round.output_sha256.clone(),
+                response: Some(ModelResponse {
+                    task: ModelTask::Refinement,
+                    model: config.model.clone(),
+                    prompt_version: config.prompt_version.clone(),
+                    structured_output: serde_json::to_value(final_output)
+                        .expect("refinement output is serializable"),
+                    evidence: Vec::new(),
+                }),
+                error: None,
+            });
+        }
+    }
+    repair_records.push(serde_json::json!({
+        "function_id": function_id,
+        "status": if compiled { "compiled_unverified" } else { "repair_exhausted" },
+        "initial_compilation": initial_compilation,
+        "repair_loop": loop_result
+    }));
 }
 
 fn parse_decompile_options(args: &[String]) -> Result<(Option<PathBuf>, String), String> {
@@ -2220,7 +2388,7 @@ fn usage() -> ExitCode {
     eprintln!(
         "       sos decompile <analysis-directory> [--format rust-like|c-like|json] [--out PATH]"
     );
-    eprintln!("       sos lift <analysis-directory> [--function fn_ID] [--model gpt-oss:20b] [--ollama-url URL] [--context-tokens N] [--out DIR]");
+    eprintln!("       sos lift <analysis-directory> [--function fn_ID] [--model gpt-oss:20b] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]");
     eprintln!("       sos benchmark <artifact> [--repeats N] [--out PATH]");
     ExitCode::from(2)
 }
@@ -2285,6 +2453,17 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(options.function_id.as_deref(), Some("fn_10"));
+        assert_eq!(options.repair_rounds, 2);
+        assert_eq!(
+            LiftOptions::parse(vec![
+                "./analysis".into(),
+                "--repair-rounds".into(),
+                "0".into(),
+            ])
+            .unwrap()
+            .repair_rounds,
+            0
+        );
         assert!(LiftOptions::parse(vec![
             "./analysis".into(),
             "--model".into(),
