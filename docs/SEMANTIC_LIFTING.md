@@ -58,7 +58,52 @@ the explicit `--allow-unreviewed-model` option. For reproducible runs, record th
 content digest printed by `ollama list`/the local Ollama manifest and use immutable
 model storage in CI.
 
+For hosted inference, the reviewed profile is OpenAI's Apache-2.0
+`openai/gpt-oss-120b` weights through Groq's OpenAI-compatible API. SOS uses
+Groq strict structured outputs, a fixed HTTPS endpoint, bounded completions,
+and a free-tier-safe request cadence. The API key is read only from
+`GROQ_API_KEY` and never enters the request body or audit files.
+
+- model/runtime documentation: <https://console.groq.com/docs/model/openai/gpt-oss-120b>
+- strict structured outputs: <https://console.groq.com/docs/structured-outputs>
+- developer-tier rate limits: <https://console.groq.com/docs/rate-limits>
+- retention and Zero Data Retention: <https://console.groq.com/docs/your-data>
+
 ## Running a lift
+
+### Hosted (recommended on lower-memory machines)
+
+Create a Groq API key and export it in the shell that runs SOS:
+
+```bash
+export GROQ_API_KEY='...'
+cargo run -p sos-cli -- analyze ./program.so --out ./analysis
+cargo run -p sos-cli -- lift ./analysis \
+  --provider groq \
+  --function fn_0 \
+  --repair-rounds 2 \
+  --out ./analysis/lifted-groq
+```
+
+Address-first usage requires no local `.so` and defaults to the reviewed 120B
+model when `--provider groq` is selected:
+
+```bash
+sos inspect <PROGRAM_ADDRESS> \
+  --rpc-url https://api.mainnet.solana.com \
+  --provider groq \
+  --function fn_0 \
+  --out ./reports/<PROGRAM_ADDRESS>
+```
+
+Only a compact evidence projection is hosted: canonical operation/block IDs,
+bounded disassembly, and high-value Solana semantic facts. The raw ELF is not
+sent. The complete pack stays local for hashing and evidence-reference
+validation. Generated output is untrusted and cannot change deterministic IR.
+Because the projection still reveals program behavior, enable Groq Zero Data
+Retention where available and use local inference for confidential binaries.
+
+### Local
 
 Install Ollama, obtain the reviewed model, and start its local service:
 

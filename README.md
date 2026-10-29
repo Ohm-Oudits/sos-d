@@ -198,6 +198,40 @@ sos inspect <PROGRAM_ADDRESS> \
 This address-first form writes `readable.rs` and `repair.json` in addition to the
 deterministic evidence bundle and audited model outputs.
 
+### Hosted open-weight lifting without local model load
+
+For machines that cannot run a large local model, SOS supports Groq's hosted
+`openai/gpt-oss-120b` endpoint. The weights are OpenAI-published under
+Apache-2.0, and Groq supports strict JSON-schema output for this model. Create a
+Groq API key, keep it in the process environment, and run:
+
+```bash
+export GROQ_API_KEY='...'
+cargo run -p sos-cli -- lift ./analysis \
+  --provider groq \
+  --function fn_0 \
+  --repair-rounds 2 \
+  --out ./analysis/lifted-groq
+```
+
+The same provider works from only a deployed address:
+
+```bash
+export GROQ_API_KEY='...'
+sos inspect <PROGRAM_ADDRESS> \
+  --rpc-url https://api.mainnet.solana.com \
+  --provider groq \
+  --function fn_0 \
+  --out ./reports/<PROGRAM_ADDRESS>
+```
+
+SOS never writes the key into an audit bundle and does not send raw `.so`
+bytes. It sends a bounded projection of canonical IR and recovered Solana
+facts. Those facts and generated hypotheses still leave the machine, so enable
+Groq Zero Data Retention where available and do not use the hosted path for
+artifacts whose analysis must remain entirely local. The provider deliberately
+paces requests for the free developer-tier token limits.
+
 The command writes `readable.rs`, `model.json`, and `ai-report.md`. Generated
 source remains evidence-linked hypothesis material; functions without an accepted
 candidate are marked unresolved. The research basis, trust boundary, and staged
@@ -216,6 +250,9 @@ ollama serve
 The script uses only the reviewed `gpt-oss:20b` profile unless `SOS_MODEL` is
 explicitly changed, and prints the paths to the readable source, audited model
 bundle, local model-manifest provenance, and quality result.
+
+Use `./scripts/demo-groq.sh` for the equivalent hosted demo. It requires only a
+`GROQ_API_KEY`; it does not start Ollama or load the downloaded local weights.
 
 Hosted providers can implement the same provider-neutral JSON protocol through an
 HTTP endpoint:

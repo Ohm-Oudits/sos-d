@@ -22,14 +22,24 @@ pub struct OpenModelProfile {
     pub intended_use: &'static str,
 }
 
-pub const TRUSTED_OPEN_MODELS: &[OpenModelProfile] = &[OpenModelProfile {
-    id: "gpt-oss:20b",
-    publisher: "OpenAI",
-    weights_url: "https://huggingface.co/openai/gpt-oss-20b",
-    license: "Apache-2.0",
-    minimum_memory_gib: 16,
-    intended_use: "local reasoning, coding, structured output, and agentic analysis",
-}];
+pub const TRUSTED_OPEN_MODELS: &[OpenModelProfile] = &[
+    OpenModelProfile {
+        id: "gpt-oss:20b",
+        publisher: "OpenAI",
+        weights_url: "https://huggingface.co/openai/gpt-oss-20b",
+        license: "Apache-2.0",
+        minimum_memory_gib: 16,
+        intended_use: "local reasoning, coding, structured output, and agentic analysis",
+    },
+    OpenModelProfile {
+        id: "openai/gpt-oss-120b",
+        publisher: "OpenAI",
+        weights_url: "https://huggingface.co/openai/gpt-oss-120b",
+        license: "Apache-2.0",
+        minimum_memory_gib: 80,
+        intended_use: "hosted cybersecurity, blockchain, coding, and structured analysis",
+    },
+];
 
 /// Return a reviewed open-weight model profile. A content-addressed Ollama
 /// reference (`name@sha256:...`) is accepted when its base tag is reviewed.
@@ -141,7 +151,7 @@ impl ModelProvider for OllamaModelProvider {
 /// Keep one authoritative instruction stream (the canonical IR) in the model
 /// context. The gateway still hashes and validates the complete EvidencePack;
 /// this is only a transport projection for context-efficient local inference.
-fn compact_model_evidence(pack: &crate::EvidencePack) -> serde_json::Value {
+pub(crate) fn compact_model_evidence(pack: &crate::EvidencePack) -> serde_json::Value {
     let mut semantics = serde_json::to_value(&pack.semantics)
         .expect("SemanticAnalysis serialization is infallible for JSON-compatible fields");
     if let Some(object) = semantics.as_object_mut() {
@@ -196,7 +206,7 @@ fn evidence_ref_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["source", "location"],
+        "required": ["source", "location", "detail"],
         "properties": {
             "source": {"type": "string", "enum": ["analysis", "ir", "ro_section"]},
             "location": {"type": "string"},
@@ -205,7 +215,7 @@ fn evidence_ref_schema() -> serde_json::Value {
     })
 }
 
-fn output_schema(task: ModelTask) -> serde_json::Value {
+pub(crate) fn output_schema(task: ModelTask) -> serde_json::Value {
     let evidence = evidence_ref_schema();
     match task {
         ModelTask::StructureRecovery => serde_json::json!({
@@ -213,7 +223,7 @@ fn output_schema(task: ModelTask) -> serde_json::Value {
             "additionalProperties": false,
             "required": ["functions"],
             "properties": {"functions": {
-                "type": "array",
+                "type": "array", "maxItems": 1,
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
@@ -221,7 +231,7 @@ fn output_schema(task: ModelTask) -> serde_json::Value {
                     "properties": {
                         "function_id": {"type": "string"},
                         "pseudocode": {"type": "string"},
-                        "evidence": {"type": "array", "minItems": 1, "items": evidence}
+                        "evidence": {"type": "array", "minItems": 1, "maxItems": 8, "items": evidence}
                     }
                 }
             }}
@@ -231,17 +241,17 @@ fn output_schema(task: ModelTask) -> serde_json::Value {
             "additionalProperties": false,
             "required": ["labels"],
             "properties": {"labels": {
-                "type": "array",
+                "type": "array", "maxItems": 32,
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
                     "required": ["kind", "value", "confidence", "status", "evidence"],
                     "properties": {
                         "kind": {"type": "string"},
-                        "value": {},
+                        "value": {"type": "string"},
                         "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
                         "status": {"type": "string", "enum": ["hypothesis", "unverified", "not_available"]},
-                        "evidence": {"type": "array", "minItems": 1, "items": evidence}
+                        "evidence": {"type": "array", "minItems": 1, "maxItems": 8, "items": evidence}
                     }
                 }
             }}
@@ -252,7 +262,7 @@ fn output_schema(task: ModelTask) -> serde_json::Value {
             "required": ["summary", "observations"],
             "properties": {
                 "summary": {"type": "string"},
-                "observations": {"type": "array", "items": {"type": "string"}}
+                "observations": {"type": "array", "maxItems": 16, "items": {"type": "string"}}
             }
         }),
         ModelTask::Refinement => serde_json::json!({
@@ -261,30 +271,30 @@ fn output_schema(task: ModelTask) -> serde_json::Value {
             "required": ["schema_version", "patches", "observations", "validation"],
             "properties": {
                 "schema_version": {"type": "integer", "const": 1},
-                "patches": {"type": "array", "items": {
+                "patches": {"type": "array", "maxItems": 1, "items": {
                     "type": "object",
                     "additionalProperties": false,
                     "required": ["function_id", "replacement", "evidence"],
                     "properties": {
                         "function_id": {"type": "string"},
                         "replacement": {"type": "string"},
-                        "evidence": {"type": "array", "minItems": 1, "items": evidence}
+                        "evidence": {"type": "array", "minItems": 1, "maxItems": 8, "items": evidence}
                     }
                 }},
-                "observations": {"type": "array", "items": {
+                "observations": {"type": "array", "maxItems": 16, "items": {
                     "type": "object",
                     "additionalProperties": false,
                     "required": ["kind", "value", "evidence"],
                     "properties": {
                         "kind": {"type": "string"},
                         "value": {"type": "string"},
-                        "evidence": {"type": "array", "minItems": 1, "items": evidence}
+                        "evidence": {"type": "array", "minItems": 1, "maxItems": 8, "items": evidence}
                     }
                 }},
                 "validation": {"type": "object", "additionalProperties": false,
                     "required": ["status", "notes"], "properties": {
                         "status": {"type": "string", "enum": ["unverified", "not_available"]},
-                        "notes": {"type": "array", "items": {"type": "string"}}
+                        "notes": {"type": "array", "maxItems": 8, "items": {"type": "string"}}
                     }
                 }
             }
@@ -292,7 +302,7 @@ fn output_schema(task: ModelTask) -> serde_json::Value {
     }
 }
 
-fn system_prompt(task: ModelTask) -> &'static str {
+pub(crate) fn system_prompt(task: ModelTask) -> &'static str {
     match task {
         ModelTask::StructureRecovery => concat!(
             "You are the semantic lifting stage of SOS, a Solana SBPF decompiler.\n",
@@ -349,6 +359,7 @@ mod tests {
     fn trusted_profile_accepts_content_addressed_reference() {
         assert!(trusted_open_model("gpt-oss:20b").is_some());
         assert!(trusted_open_model("gpt-oss:20b@sha256:abc").is_some());
+        assert!(trusted_open_model("openai/gpt-oss-120b").is_some());
         assert!(trusted_open_model("unknown:latest").is_none());
     }
 

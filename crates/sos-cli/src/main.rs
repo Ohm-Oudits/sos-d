@@ -9,9 +9,9 @@ use sos_ai::{
     compile_refinement_output, run_pipeline, run_refinement_loop, scope_analysis_to_function,
     trusted_open_model, unavailable_pipeline_bundle, AiPipelineBundle, AiPipelineConfig,
     AiStageResult, AiStageStatus, CommandModelProvider, CompilationStatus, EvidencePack,
-    EvidencePackLimits, HttpModelProvider, ModelGateway, ModelProvider, ModelResponse, ModelTask,
-    OllamaModelProvider, RefinementFeedback, RefinementLoopResult, RefinementOutput,
-    RefinementValidation, UntrustedEvidence, VALIDATION_BUNDLE_SCHEMA_VERSION,
+    EvidencePackLimits, GroqModelProvider, HttpModelProvider, ModelGateway, ModelProvider,
+    ModelResponse, ModelTask, OllamaModelProvider, RefinementFeedback, RefinementLoopResult,
+    RefinementOutput, RefinementValidation, UntrustedEvidence, VALIDATION_BUNDLE_SCHEMA_VERSION,
 };
 use sos_analysis::{analyze_elf, build_canonical_ir};
 use sos_artifact::{
@@ -1134,11 +1134,12 @@ fn inspect_command(args: Vec<String>) -> ExitCode {
                 None,
             ),
             (None, None) if trusted_open_model(model).is_some() => {
-                match run_ollama_lift_bundle(
+                match run_selected_lift_bundle(
                     &analysis,
                     &semantics,
-                    OllamaLiftConfig {
+                    SelectedLiftConfig {
                         artifact_sha256: Some(manifest.elf_sha256.clone()),
+                        provider: options.lift_provider,
                         model,
                         ollama_url: &options.ollama_url,
                         context_tokens: options.context_tokens,
@@ -1165,7 +1166,7 @@ fn inspect_command(args: Vec<String>) -> ExitCode {
                     },
                     &analysis,
                     &semantics,
-                    "provide --model-command PATH, --model-endpoint URL, or a reviewed local open-weight model",
+                    "provide --model-command PATH, --model-endpoint URL, or a reviewed open-weight model with --provider ollama|groq",
                 ),
                 None,
             ),
@@ -1466,10 +1467,29 @@ fn decompile_command(args: Vec<String>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiftProvider {
+    Ollama,
+    Groq,
+}
+
+impl LiftProvider {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "ollama" => Ok(Self::Ollama),
+            "groq" => Ok(Self::Groq),
+            _ => Err(format!(
+                "unsupported lift provider {value:?}; use ollama or groq"
+            )),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct LiftOptions {
     directory: PathBuf,
     output: PathBuf,
+    provider: LiftProvider,
     ollama_url: String,
     model: String,
     context_tokens: usize,
@@ -1482,12 +1502,13 @@ impl LiftOptions {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let Some(directory) = args.first() else {
             return Err(
-                "usage: sos lift <analysis-directory> [--function fn_ID] [--model gpt-oss:20b] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]".into(),
+                "usage: sos lift <analysis-directory> [--provider ollama|groq] [--function fn_ID] [--model MODEL] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]".into(),
             );
         };
         let mut options = Self {
             directory: PathBuf::from(directory),
             output: PathBuf::from(directory).join("lifted"),
+            provider: LiftProvider::Ollama,
             ollama_url: "http://127.0.0.1:11434".into(),
             model: "gpt-oss:20b".into(),
             context_tokens: 32_768,
@@ -1495,6 +1516,7 @@ impl LiftOptions {
             function_id: None,
             repair_rounds: 2,
         };
+        let mut model_explicit = false;
         let mut index = 1;
         while index < args.len() {
             if args[index] == "--allow-unreviewed-model" {
@@ -1508,8 +1530,12 @@ impl LiftOptions {
             };
             match flag.as_str() {
                 "--out" => options.output = PathBuf::from(value),
+                "--provider" => options.provider = LiftProvider::parse(value)?,
                 "--ollama-url" => options.ollama_url = value.clone(),
-                "--model" => options.model = value.clone(),
+                "--model" => {
+                    options.model = value.clone();
+                    model_explicit = true;
+                }
                 "--function" => options.function_id = Some(value.clone()),
                 "--context-tokens" => {
                     options.context_tokens = value
@@ -1531,9 +1557,12 @@ impl LiftOptions {
             }
             index += 2;
         }
+        if options.provider == LiftProvider::Groq && !model_explicit {
+            options.model = "openai/gpt-oss-120b".into();
+        }
         if trusted_open_model(&options.model).is_none() && !options.allow_unreviewed_model {
             return Err(format!(
-                "model {:?} is not in SOS's reviewed open-weight registry; use gpt-oss:20b or explicitly pass --allow-unreviewed-model",
+                "model {:?} is not in SOS's reviewed open-weight registry; use gpt-oss:20b, openai/gpt-oss-120b, or explicitly pass --allow-unreviewed-model",
                 options.model
             ));
         }
@@ -1541,24 +1570,25 @@ impl LiftOptions {
     }
 }
 
-struct OllamaLiftConfig<'a> {
+struct LiftRunConfig<'a> {
     artifact_sha256: Option<String>,
     model: &'a str,
-    ollama_url: &'a str,
-    context_tokens: usize,
+    provider_name: &'a str,
     function_id: Option<&'a str>,
     repair_rounds: usize,
 }
 
-fn run_ollama_lift_bundle(
+fn run_lift_bundle<P>(
+    provider: P,
     analysis: &sos_analysis::StaticAnalysis,
     global_semantics: &sos_solana::SemanticAnalysis,
-    options: OllamaLiftConfig<'_>,
-) -> Result<(AiPipelineBundle, Vec<serde_json::Value>), String> {
-    let provider =
-        OllamaModelProvider::new(options.ollama_url).with_context_tokens(options.context_tokens);
+    options: LiftRunConfig<'_>,
+) -> Result<(AiPipelineBundle, Vec<serde_json::Value>), String>
+where
+    P: ModelProvider + Clone,
+{
     let config = AiPipelineConfig {
-        provider_name: "ollama_local_open_weights".into(),
+        provider_name: options.provider_name.into(),
         model: options.model.into(),
         prompt_version: "sos-semantic-lift-v3".into(),
         artifact_sha256: options.artifact_sha256.clone(),
@@ -1620,6 +1650,51 @@ fn run_ollama_lift_bundle(
     Ok((bundle, repair_records))
 }
 
+struct SelectedLiftConfig<'a> {
+    artifact_sha256: Option<String>,
+    provider: LiftProvider,
+    model: &'a str,
+    ollama_url: &'a str,
+    context_tokens: usize,
+    function_id: Option<&'a str>,
+    repair_rounds: usize,
+}
+
+fn run_selected_lift_bundle(
+    analysis: &sos_analysis::StaticAnalysis,
+    semantics: &sos_solana::SemanticAnalysis,
+    options: SelectedLiftConfig<'_>,
+) -> Result<(AiPipelineBundle, Vec<serde_json::Value>), String> {
+    let run = |provider_name| LiftRunConfig {
+        artifact_sha256: options.artifact_sha256.clone(),
+        model: options.model,
+        provider_name,
+        function_id: options.function_id,
+        repair_rounds: options.repair_rounds,
+    };
+    match options.provider {
+        LiftProvider::Ollama => run_lift_bundle(
+            OllamaModelProvider::new(options.ollama_url)
+                .with_context_tokens(options.context_tokens),
+            analysis,
+            semantics,
+            run("ollama_local_open_weights"),
+        ),
+        LiftProvider::Groq => {
+            let api_key = env::var("GROQ_API_KEY").map_err(|_| {
+                "GROQ_API_KEY is required for --provider groq; create a free Groq key and export it in this shell".to_owned()
+            })?;
+            let provider = GroqModelProvider::new(api_key).map_err(|error| error.to_string())?;
+            run_lift_bundle(
+                provider,
+                analysis,
+                semantics,
+                run("groq_hosted_open_weights"),
+            )
+        }
+    }
+}
+
 fn lift_command(args: Vec<String>) -> ExitCode {
     let options = match LiftOptions::parse(args) {
         Ok(options) => options,
@@ -1642,11 +1717,12 @@ fn lift_command(args: Vec<String>) -> ExitCode {
     let artifact_sha256 = read_json::<ArtifactManifest>(&options.directory.join("manifest.json"))
         .ok()
         .map(|manifest| manifest.elf_sha256);
-    let (bundle, repair_records) = match run_ollama_lift_bundle(
+    let (bundle, repair_records) = match run_selected_lift_bundle(
         &analysis,
         &global_semantics,
-        OllamaLiftConfig {
+        SelectedLiftConfig {
             artifact_sha256,
+            provider: options.provider,
             model: &options.model,
             ollama_url: &options.ollama_url,
             context_tokens: options.context_tokens,
@@ -1734,15 +1810,17 @@ fn lift_command(args: Vec<String>) -> ExitCode {
     }
 }
 
-fn repair_failed_refinement(
-    provider: &OllamaModelProvider,
+fn repair_failed_refinement<P>(
+    provider: &P,
     config: &AiPipelineConfig,
     analysis: &sos_analysis::StaticAnalysis,
     semantics: &sos_solana::SemanticAnalysis,
     repair_rounds: usize,
     bundle: &mut AiPipelineBundle,
     repair_records: &mut Vec<serde_json::Value>,
-) {
+) where
+    P: ModelProvider + Clone,
+{
     let function_id = format!("fn_{:x}", analysis.entrypoint);
     let Some(initial) = bundle
         .stages
@@ -2030,6 +2108,7 @@ struct RemoteOptions {
     model: Option<String>,
     model_command: Option<String>,
     model_endpoint: Option<String>,
+    lift_provider: LiftProvider,
     ollama_url: String,
     context_tokens: usize,
     function_id: Option<String>,
@@ -2204,6 +2283,7 @@ impl RemoteOptions {
             model: None,
             model_command: None,
             model_endpoint: None,
+            lift_provider: LiftProvider::Ollama,
             ollama_url: "http://127.0.0.1:11434".into(),
             context_tokens: 32_768,
             function_id: None,
@@ -2213,6 +2293,7 @@ impl RemoteOptions {
             repair_rounds: 2,
             validation_trace: None,
         };
+        let mut provider_explicit = false;
         let mut index = 1;
         while index < args.len() {
             let flag = &args[index];
@@ -2269,6 +2350,10 @@ impl RemoteOptions {
                 "--model" => options.model = Some(value.clone()),
                 "--model-command" => options.model_command = Some(value.clone()),
                 "--model-endpoint" => options.model_endpoint = Some(value.clone()),
+                "--provider" if command == "inspect" => {
+                    options.lift_provider = LiftProvider::parse(value)?;
+                    provider_explicit = true;
+                }
                 "--ollama-url" if command == "inspect" => options.ollama_url = value.clone(),
                 "--function" if command == "inspect" => options.function_id = Some(value.clone()),
                 "--context-tokens" if command == "inspect" => {
@@ -2292,6 +2377,15 @@ impl RemoteOptions {
                 _ => return Err(format!("unknown {command} option: {flag}")),
             }
             index += 2;
+        }
+        if command == "inspect" && provider_explicit && options.model.is_none() {
+            options.model = Some(
+                match options.lift_provider {
+                    LiftProvider::Ollama => "gpt-oss:20b",
+                    LiftProvider::Groq => "openai/gpt-oss-120b",
+                }
+                .into(),
+            );
         }
         if !options.rpc_explicit {
             if let Some(cluster) = options.cluster.as_deref() {
@@ -2502,7 +2596,7 @@ fn usage() -> ExitCode {
     eprintln!("usage: sos artifact-info <path-to-sbf-elf> [--json]");
     eprintln!("       sos manifest <path-to-sbf-elf>");
     eprintln!("       sos fetch <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--commitment LEVEL] [--json]");
-    eprintln!("       sos inspect <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--history N] [--replay] [--signature SIGNATURE] [--model gpt-oss:20b] [--function fn_ID] [--ollama-url URL] [--context-tokens N] [--model-command PATH|--model-endpoint URL] [--validate] [--repair --repair-rounds N] [--validation-trace PATH] [--commitment LEVEL] [--json]");
+    eprintln!("       sos inspect <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--history N] [--replay] [--signature SIGNATURE] [--provider ollama|groq] [--model MODEL] [--function fn_ID] [--ollama-url URL] [--context-tokens N] [--model-command PATH|--model-endpoint URL] [--validate] [--repair --repair-rounds N] [--validation-trace PATH] [--commitment LEVEL] [--json]");
     eprintln!("       sos analyze <path-to-sbf-elf> [--out DIR]");
     eprintln!("       sos detect <analysis-directory> [--format json|sarif] [--out PATH]");
     eprintln!("       sos validate <analysis-directory> [--compiler PATH|--no-compile] [--trace PATH] [--repair --model-command PATH --repair-rounds N] [--out PATH]");
@@ -2516,7 +2610,7 @@ fn usage() -> ExitCode {
     eprintln!(
         "       sos decompile <analysis-directory> [--format rust-like|c-like|json] [--out PATH]"
     );
-    eprintln!("       sos lift <analysis-directory> [--function fn_ID] [--model gpt-oss:20b] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]");
+    eprintln!("       sos lift <analysis-directory> [--provider ollama|groq] [--function fn_ID] [--model MODEL] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]");
     eprintln!("       sos benchmark <artifact> [--repeats N] [--out PATH]");
     ExitCode::from(2)
 }
@@ -2524,7 +2618,8 @@ fn usage() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        transaction_account_addresses, BenchmarkOptions, ExplainOptions, LiftOptions, RemoteOptions,
+        transaction_account_addresses, BenchmarkOptions, ExplainOptions, LiftOptions, LiftProvider,
+        RemoteOptions,
     };
 
     #[test]
@@ -2600,6 +2695,15 @@ mod tests {
             "unknown:latest".into(),
         ])
         .is_err());
+
+        let hosted = LiftOptions::parse(vec![
+            "./analysis".into(),
+            "--provider".into(),
+            "groq".into(),
+        ])
+        .unwrap();
+        assert_eq!(hosted.provider, LiftProvider::Groq);
+        assert_eq!(hosted.model, "openai/gpt-oss-120b");
     }
 
     #[test]
@@ -2624,6 +2728,23 @@ mod tests {
         assert_eq!(options.context_tokens, 16_384);
         assert!(options.model_command.is_none());
         assert!(options.model_endpoint.is_none());
+    }
+
+    #[test]
+    fn inspect_provider_groq_selects_the_reviewed_hosted_default() {
+        let options = RemoteOptions::parse(
+            vec![
+                "11111111111111111111111111111111".into(),
+                "--provider".into(),
+                "groq".into(),
+                "--function".into(),
+                "fn_0".into(),
+            ],
+            "inspect",
+        )
+        .unwrap();
+        assert_eq!(options.lift_provider, LiftProvider::Groq);
+        assert_eq!(options.model.as_deref(), Some("openai/gpt-oss-120b"));
     }
 
     #[test]
