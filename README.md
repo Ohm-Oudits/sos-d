@@ -299,13 +299,19 @@ export ANTHROPIC_API_KEY='...'
 export SOS_ANTHROPIC_MODEL='your-explicit-model-id'
 sos inspect <PROGRAM_ADDRESS> \
   --provider anthropic \
+  --structure-model your-reconstruction-model-id \
+  --semantic-model your-labeling-model-id \
+  --refinement-model your-reconstruction-model-id \
   --resume \
   --out ./reports/<PROGRAM_ADDRESS>
 ```
 
 These transports are not silently classified as reviewed open weights. Their
 outputs pass the same local schemas, evidence-reference checks, anti-cheese
-rules, and checkpoint validation. See
+rules, and checkpoint validation. `--structure-model`, `--semantic-model`,
+`--explanation-model`, and `--refinement-model` optionally assign distinct
+models to the Patina-style agent stages; each identity is audited and included
+in checkpoint validation. See
 [docs/AGENT_PROVIDERS.md](docs/AGENT_PROVIDERS.md) and the empty
 [.env.example](.env.example) placeholders.
 

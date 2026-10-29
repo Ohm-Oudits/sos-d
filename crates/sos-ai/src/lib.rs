@@ -91,10 +91,54 @@ pub struct AiPipelineBundle {
 pub struct AiPipelineConfig {
     pub provider_name: String,
     pub model: String,
+    #[serde(default)]
+    pub stage_models: AiStageModels,
     pub prompt_version: String,
     pub artifact_sha256: Option<String>,
     pub limits: EvidencePackLimits,
     pub max_attempts: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiStageModels {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structure_recovery: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_labeling: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refinement: Option<String>,
+}
+
+impl AiStageModels {
+    pub fn model_for<'a>(&'a self, task: ModelTask, fallback: &'a str) -> &'a str {
+        match task {
+            ModelTask::StructureRecovery => self.structure_recovery.as_deref(),
+            ModelTask::SemanticLabeling => self.semantic_labeling.as_deref(),
+            ModelTask::Explanation => self.explanation.as_deref(),
+            ModelTask::Refinement => self.refinement.as_deref(),
+            ModelTask::PseudocodeHumanization => None,
+        }
+        .unwrap_or(fallback)
+    }
+
+    pub fn configured(&self) -> impl Iterator<Item = (ModelTask, &str)> {
+        [
+            (
+                ModelTask::StructureRecovery,
+                self.structure_recovery.as_deref(),
+            ),
+            (
+                ModelTask::SemanticLabeling,
+                self.semantic_labeling.as_deref(),
+            ),
+            (ModelTask::Explanation, self.explanation.as_deref()),
+            (ModelTask::Refinement, self.refinement.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(task, model)| model.map(|model| (task, model)))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1821,6 +1865,7 @@ pub fn run_pipeline_with_context<P: ModelProvider>(
     let AiPipelineConfig {
         provider_name,
         model,
+        stage_models,
         prompt_version,
         artifact_sha256,
         limits,
@@ -1831,6 +1876,7 @@ pub fn run_pipeline_with_context<P: ModelProvider>(
     let mut accepted_prior_stages = bounded_initial_context(initial_context);
 
     for task in ModelTask::ALL {
+        let stage_model = stage_models.model_for(task, &model).to_owned();
         let mut pack = EvidencePack::bounded_from_analysis(
             task,
             artifact_sha256.clone(),
@@ -1846,7 +1892,7 @@ pub fn run_pipeline_with_context<P: ModelProvider>(
         let input_sha256 = sha256_json(&pack);
         match gateway.submit_with_retry(
             task,
-            model.clone(),
+            stage_model.clone(),
             prompt_version.clone(),
             pack,
             max_attempts,
@@ -1864,7 +1910,7 @@ pub fn run_pipeline_with_context<P: ModelProvider>(
                 stages.push(AiStageResult {
                     task,
                     status: AiStageStatus::Accepted,
-                    model: model.clone(),
+                    model: stage_model.clone(),
                     prompt_version: prompt_version.clone(),
                     input_sha256,
                     output_sha256: Some(sha256_json(&response)),
@@ -1881,7 +1927,7 @@ pub fn run_pipeline_with_context<P: ModelProvider>(
                 stages.push(AiStageResult {
                     task,
                     status,
-                    model: model.clone(),
+                    model: stage_model,
                     prompt_version: prompt_version.clone(),
                     input_sha256,
                     output_sha256: None,
@@ -1940,9 +1986,10 @@ pub fn validate_pipeline_bundle_with_context(
 
     let mut accepted_prior_stages = bounded_initial_context(initial_context);
     for (stage, expected_task) in bundle.stages.iter().zip(ModelTask::ALL) {
+        let expected_model = config.stage_models.model_for(expected_task, &config.model);
         if stage.task != expected_task
             || stage.status != AiStageStatus::Accepted
-            || stage.model != config.model
+            || stage.model != expected_model
             || stage.prompt_version != config.prompt_version
             || stage.error.is_some()
         {
@@ -1969,7 +2016,7 @@ pub fn validate_pipeline_bundle_with_context(
                 "checkpointed {expected_task:?} stage has no response"
             ))
         })?;
-        validate_model_response_for_pack(&config.model, &config.prompt_version, pack, response)?;
+        validate_model_response_for_pack(expected_model, &config.prompt_version, pack, response)?;
         let output_sha256 = sha256_json(response);
         if stage.output_sha256.as_deref() != Some(output_sha256.as_str()) {
             return Err(AiError::InvalidResponse(format!(
@@ -2001,6 +2048,7 @@ pub fn unavailable_pipeline_bundle(
     let AiPipelineConfig {
         provider_name,
         model,
+        stage_models,
         prompt_version,
         artifact_sha256,
         limits,
@@ -2010,6 +2058,7 @@ pub fn unavailable_pipeline_bundle(
     let stages = ModelTask::ALL
         .into_iter()
         .map(|task| {
+            let stage_model = stage_models.model_for(task, &model).to_owned();
             let pack = EvidencePack::bounded_from_analysis(
                 task,
                 artifact_sha256.clone(),
@@ -2020,7 +2069,7 @@ pub fn unavailable_pipeline_bundle(
             AiStageResult {
                 task,
                 status: AiStageStatus::NotAvailable,
-                model: model.clone(),
+                model: stage_model,
                 prompt_version: prompt_version.clone(),
                 input_sha256: sha256_json(&pack),
                 output_sha256: None,
@@ -3051,6 +3100,20 @@ mod tests {
         }
     }
 
+    struct ModelRecordingProvider {
+        requests: Arc<Mutex<Vec<(ModelTask, String)>>>,
+    }
+
+    impl ModelProvider for ModelRecordingProvider {
+        fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((request.task, request.model.clone()));
+            EchoProvider.generate_structured(request)
+        }
+    }
+
     struct FlakyProvider {
         attempts: Arc<AtomicUsize>,
     }
@@ -3341,6 +3404,7 @@ mod tests {
             AiPipelineConfig {
                 provider_name: "test-provider".into(),
                 model: "test-model".into(),
+                stage_models: AiStageModels::default(),
                 prompt_version: "sos-v1".into(),
                 artifact_sha256: Some("artifact".into()),
                 limits: EvidencePackLimits::default(),
@@ -3366,6 +3430,62 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_routes_and_revalidates_stage_specific_models() {
+        let pack = empty_pack();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let config = AiPipelineConfig {
+            provider_name: "test-provider".into(),
+            model: "default-model".into(),
+            stage_models: AiStageModels {
+                structure_recovery: Some("structure-model".into()),
+                semantic_labeling: Some("semantic-model".into()),
+                explanation: None,
+                refinement: Some("refinement-model".into()),
+            },
+            prompt_version: "sos-v3".into(),
+            artifact_sha256: Some("artifact".into()),
+            limits: EvidencePackLimits::default(),
+            max_attempts: 1,
+        };
+        let bundle = run_pipeline(
+            ModelRecordingProvider {
+                requests: requests.clone(),
+            },
+            config.clone(),
+            &pack.analysis,
+            &pack.semantics,
+        );
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                (ModelTask::StructureRecovery, "structure-model".into()),
+                (ModelTask::SemanticLabeling, "semantic-model".into()),
+                (ModelTask::Explanation, "default-model".into()),
+                (ModelTask::Refinement, "refinement-model".into()),
+            ]
+        );
+        assert!(validate_pipeline_bundle_with_context(
+            &config,
+            &pack.analysis,
+            &pack.semantics,
+            &[],
+            &bundle,
+        )
+        .is_ok());
+
+        let mut changed = config;
+        changed.stage_models.refinement = Some("different-refinement-model".into());
+        assert!(validate_pipeline_bundle_with_context(
+            &changed,
+            &pack.analysis,
+            &pack.semantics,
+            &[],
+            &bundle,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn pipeline_passes_accepted_stage_output_forward_as_untrusted_context() {
         let pack = empty_pack();
         let prior_counts = Arc::new(Mutex::new(Vec::new()));
@@ -3376,6 +3496,7 @@ mod tests {
             AiPipelineConfig {
                 provider_name: "test-provider".into(),
                 model: "test-model".into(),
+                stage_models: AiStageModels::default(),
                 prompt_version: "sos-v2".into(),
                 artifact_sha256: None,
                 limits: EvidencePackLimits::default(),
@@ -3404,6 +3525,7 @@ mod tests {
             AiPipelineConfig {
                 provider_name: "test-provider".into(),
                 model: "test-model".into(),
+                stage_models: AiStageModels::default(),
                 prompt_version: "sos-v2".into(),
                 artifact_sha256: None,
                 limits: EvidencePackLimits::default(),
@@ -3422,6 +3544,7 @@ mod tests {
         let config = AiPipelineConfig {
             provider_name: "test-provider".into(),
             model: "test-model".into(),
+            stage_models: AiStageModels::default(),
             prompt_version: "sos-v2".into(),
             artifact_sha256: Some("artifact".into()),
             limits: EvidencePackLimits::default(),

@@ -98,6 +98,11 @@ are not silently treated as reviewed open weights. Credentials, model
 placeholders, request boundaries, and Patina-inspired stage isolation are
 documented in [AGENT_PROVIDERS.md](AGENT_PROVIDERS.md).
 
+The default `--model` can be overridden independently with
+`--structure-model`, `--semantic-model`, `--explanation-model`, and
+`--refinement-model`. Each stage records the selected model, and checkpoint
+validation rejects any bundle created with a different stage assignment.
+
 ## Running a lift
 
 ### Hosted (recommended on lower-memory machines)

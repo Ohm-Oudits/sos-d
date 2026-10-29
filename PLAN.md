@@ -72,6 +72,9 @@ Already implemented in this workspace:
   environment-only credentials, operator-selected model IDs, strict structured
   output, bounded responses, redacted debug state, and the same local evidence
   and anti-cheese validation used by reviewed open-weight providers.
+- Patina-style per-stage model routing for structure recovery, semantic labeling,
+  explanation, refinement, and compiler-repair rounds; stage identities are
+  recorded in audit results and participate in checkpoint request validation.
 - Deterministic no-model pseudocode humanizer for common Ghidra/IDA C syntax,
   including evidence-linked type spelling, guards, returns, pointer reads/writes,
   calls, explicit untranslated-line preservation, and an audited fallback path

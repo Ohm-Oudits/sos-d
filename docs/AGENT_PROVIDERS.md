@@ -45,15 +45,43 @@ The current agent chain is:
    evidence-free output and compare rebuilt candidates when a compiler is
    available.
 
-Each stage has a distinct JSON schema and request hash. Outputs become bounded,
-explicitly untrusted context for later stages. Checkpoints are scoped by source
-hash, provider, model, prompt version, stage input, and stage output. A changed
-provider or model cannot silently reuse another provider's result.
+Each stage has a distinct JSON schema, model identity, task-specific output
+budget, and request hash. Outputs become bounded, explicitly untrusted context
+for later stages. Checkpoints are scoped by source hash, provider, default and
+stage model identities, prompt version, stage input, and stage output. A changed
+provider or stage model cannot silently reuse another result.
 
-SOS currently uses one selected model identity across the four model stages.
-The durable sidecar format is intentionally stage-specific so later releases
-can choose a smaller model for labeling and a stronger model for reconstruction
-without changing the deterministic evidence contract.
+`--model` selects the default agent model. The following optional overrides
+implement Patina-style role specialization while retaining one provider and one
+credential boundary per run:
+
+| Stage | Override |
+| --- | --- |
+| Structure recovery | `--structure-model MODEL` |
+| Semantic labeling | `--semantic-model MODEL` |
+| Explanation | `--explanation-model MODEL` |
+| Refinement and compiler repair | `--refinement-model MODEL` |
+
+For example, an API provider can use a stronger reconstruction/refinement model
+and a smaller labeling/explanation model:
+
+```bash
+sos lift ./analysis \
+  --provider openai \
+  --model default-model-id \
+  --structure-model reconstruction-model-id \
+  --semantic-model labeling-model-id \
+  --explanation-model explanation-model-id \
+  --refinement-model reconstruction-model-id \
+  --resume \
+  --out ./analysis/lifted
+```
+
+Every model identity appears in its stage audit record. Compiler-driven repair
+uses the refinement model. Hosted providers that SOS pins to one reviewed model
+(Groq, Hugging Face, and Cloudflare) reject a different override rather than
+quietly routing to unreviewed weights. Ollama overrides must remain in the
+reviewed registry unless `--allow-unreviewed-model` is explicitly supplied.
 
 ## Provider choices
 
@@ -116,6 +144,8 @@ variable:
 sos inspect <PROGRAM_ADDRESS> \
   --provider openai \
   --model your-explicit-model-id \
+  --structure-model your-reconstruction-model-id \
+  --refinement-model your-reconstruction-model-id \
   --resume \
   --out ./reports/<PROGRAM_ADDRESS>
 ```
