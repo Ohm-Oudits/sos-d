@@ -1,0 +1,6 @@
+name = "sos-c-fixture"
+category = "c"
+source = "programs/c-fixture/src/sos_c_fixture/sos_c_fixture.c"
+artifact = "target/deploy/sos_c_fixture.so"
+optimization = "release"
+toolchain = "Solana platform-tools SBF SDK"

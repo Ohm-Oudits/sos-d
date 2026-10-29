@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sos-decompiler.dev/schema/v1/artifact-manifest.json",
+  "title": "SOS artifact manifest",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version", "program_address", "loader", "raw_account_data_length",
+    "elf_offset", "elf_length", "raw_account_sha256", "elf_sha256",
+    "sos_version", "analysis_schema_version"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "program_address": { "type": "string", "minLength": 1 },
+    "cluster": { "type": ["string", "null"] },
+    "rpc_endpoint_id": { "type": ["string", "null"] },
+    "commitment": { "type": ["string", "null"] },
+    "context_slot": { "type": ["integer", "null"], "minimum": 0 },
+    "requested_slot": { "type": ["integer", "null"], "minimum": 0 },
+    "loader": { "type": "string" },
+    "programdata_address": { "type": ["string", "null"] },
+    "deployment_slot": { "type": ["integer", "null"], "minimum": 0 },
+    "upgrade_authority": { "type": ["string", "null"] },
+    "raw_account_data_length": { "type": "integer", "minimum": 0 },
+    "elf_offset": { "type": "integer", "minimum": 0 },
+    "elf_length": { "type": "integer", "minimum": 1 },
+    "raw_account_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "elf_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "sbpf_version": { "type": ["string", "null"] },
+    "sos_version": { "type": "string", "minLength": 1 },
+    "analysis_schema_version": { "const": 1 }
+  }
+}

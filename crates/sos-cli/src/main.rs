@@ -1,0 +1,2086 @@
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    time::Duration,
+};
+
+use sos_ai::{
+    compile_refinement_output, run_pipeline, run_refinement_loop, unavailable_pipeline_bundle,
+    AiPipelineBundle, AiPipelineConfig, CommandModelProvider, EvidencePack, EvidencePackLimits,
+    HttpModelProvider, ModelGateway, ModelProvider, ModelTask, RefinementFeedback,
+    RefinementLoopResult, RefinementOutput, RefinementValidation, VALIDATION_BUNDLE_SCHEMA_VERSION,
+};
+use sos_analysis::{analyze_elf, build_canonical_ir};
+use sos_artifact::{
+    build_manifest, local_artifact, sha256_hex, FileArtifactStore, ManifestContext,
+};
+use sos_core::read_elf_facts;
+use sos_loader::default_registry;
+#[cfg(feature = "litesvm")]
+use sos_replay::LiteSvmReplayEngine;
+#[cfg(not(feature = "litesvm"))]
+use sos_replay::UnavailableReplayEngine;
+use sos_replay::{compare_candidate_observations, compare_semantics, ExecutionTrace, ReplayEngine};
+use sos_report::{
+    render_ai_markdown, render_c_pseudocode, render_cfg_dot, render_markdown, render_pseudocode,
+    render_sarif,
+};
+use sos_rpc::{ChainProvider, JsonRpcProvider};
+use sos_solana::analyze as analyze_semantics;
+use sos_storage::MetadataStore;
+use sos_types::{ArtifactManifest, ProgramArtifact};
+
+fn main() -> ExitCode {
+    let mut args = env::args().skip(1);
+    let command = args.next().unwrap_or_default();
+
+    match command.as_str() {
+        "artifact-info" => artifact_info_command(args.collect()),
+        "manifest" => match args.next() {
+            Some(path) => match local_artifact(&path, "local-artifact") {
+                Ok((_artifact, manifest)) => match serde_json::to_string_pretty(&manifest) {
+                    Ok(json) => {
+                        println!("{json}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        ExitCode::from(1)
+                    }
+                },
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::from(1)
+                }
+            },
+            None => usage(),
+        },
+        "fetch" => fetch_command(args.collect()),
+        "inspect" => inspect_command(args.collect()),
+        "analyze" | "analyze-elf" => analyze_elf_command(args.collect()),
+        "detect" => detect_command(args.collect()),
+        "validate" => validate_command(args.collect()),
+        "explain" => explain_command(args.collect()),
+        "replay" => replay_command(args.collect()),
+        "report" => report_command(args.collect()),
+        "decompile" => decompile_command(args.collect()),
+        "benchmark" => benchmark_command(args.collect()),
+        _ => usage(),
+    }
+}
+
+fn benchmark_command(args: Vec<String>) -> ExitCode {
+    let options = match BenchmarkOptions::parse(args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let bytes = match fs::read(&options.artifact) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("error: {}: {error}", options.artifact.display());
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut baseline_json = None;
+    let mut analysis = None;
+    let mut deterministic = true;
+    for _ in 0..options.repeats {
+        let current = match analyze_elf(&bytes) {
+            Ok(analysis) => analysis,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        let current_json = match serde_json::to_vec(&current) {
+            Ok(json) => json,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        if let Some(baseline) = &baseline_json {
+            deterministic &= baseline == &current_json;
+        } else {
+            baseline_json = Some(current_json);
+        }
+        analysis = Some(current);
+    }
+    let analysis = analysis.expect("benchmark repeats is at least one");
+    let semantics = analyze_semantics(&analysis);
+    let security = sos_solana::detect(&analysis, &semantics);
+    let analysis_json = match serde_json::to_vec(&analysis) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let result = serde_json::json!({
+        "schema_version": 1,
+        "tool_version": env!("CARGO_PKG_VERSION"),
+        "artifact": options.artifact,
+        "artifact_sha256": sha256_hex(&bytes),
+        "analysis_sha256": sha256_hex(&analysis_json),
+        "repeats": options.repeats,
+        "deterministic": deterministic,
+        "binary": {
+            "sbpf_version": analysis.sbpf_version,
+            "entrypoint": analysis.entrypoint,
+            "instructions": analysis.instructions.len(),
+            "functions": analysis.functions.len(),
+            "basic_blocks": analysis.basic_blocks.len(),
+            "calls": analysis.calls.len(),
+            "memory_accesses": analysis.memory_accesses.len(),
+            "stack_accesses": analysis.stack_accesses.len(),
+            "strings": analysis.strings.len(),
+            "public_key_candidates": analysis.public_key_candidates.len(),
+            "relocations": analysis.relocations.len(),
+            "sccs": analysis.sccs.len(),
+            "dataflow_edges": analysis.dataflow_edges.len(),
+            "verifier_diagnostics": analysis.verifier_diagnostics.len(),
+        },
+        "semantic": {
+            "syscalls": semantics.syscalls.len(),
+            "instruction_candidates": semantics.instruction_candidates.len(),
+            "anchor_global_discriminator_candidates": semantics.dispatch_candidates.iter()
+                .filter(|candidate| candidate.interpretations.iter().any(|value| value.starts_with("anchor_global_discriminator:")))
+                .count(),
+            "anchor_account_discriminator_candidates": semantics.constant_candidates.iter()
+                .filter(|candidate| candidate.interpretations.iter().any(|value| value == "anchor_account_discriminator_candidate"))
+                .count(),
+            "argument_candidates": semantics.argument_candidates.len(),
+            "account_candidates": semantics.account_candidates.len(),
+            "account_field_candidates": semantics.account_field_candidates.len(),
+            "cpi_candidates": semantics.cpi_candidates.len(),
+            "pda_candidates": semantics.pda_candidates.len(),
+            "protocol_fingerprints": semantics.protocol_fingerprints.len(),
+            "validation_checks": semantics.validation_checks.len(),
+            "log_candidates": semantics.log_candidates.len(),
+            "error_candidates": semantics.error_candidates.len(),
+        },
+        "security": {
+            "findings": security.findings.len(),
+        },
+    });
+    let json = match serde_json::to_string_pretty(&result) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(path) = options.output {
+        if let Err(error) = fs::write(&path, json) {
+            eprintln!("error: {}: {error}", path.display());
+            return ExitCode::from(1);
+        }
+        println!("benchmark={}", path.display());
+    } else {
+        println!("{json}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn analyze_elf_command(args: Vec<String>) -> ExitCode {
+    let Some(path) = args.first() else {
+        return usage();
+    };
+    let output = match parse_output_path(&args) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let json_requested = args.iter().skip(1).any(|argument| argument == "--json");
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match analyze_elf(&bytes) {
+        Ok(analysis) => {
+            let Some(output) = output else {
+                return match serde_json::to_string_pretty(&analysis) {
+                    Ok(json) => {
+                        println!("{json}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        ExitCode::from(1)
+                    }
+                };
+            };
+            if let Err(error) = fs::create_dir_all(&output) {
+                eprintln!("error: {}: {error}", output.display());
+                return ExitCode::from(1);
+            }
+            let analysis_path = output.join("analysis.json");
+            let semantics = analyze_semantics(&analysis);
+            let ir = build_canonical_ir(&analysis);
+            let security = sos_solana::detect(&analysis, &semantics);
+            let writes = [
+                (
+                    analysis_path,
+                    serde_json::to_vec_pretty(&analysis).map_err(|error| error.to_string()),
+                ),
+                (
+                    output.join("semantics.json"),
+                    serde_json::to_vec_pretty(&semantics).map_err(|error| error.to_string()),
+                ),
+                (
+                    output.join("ir.json"),
+                    serde_json::to_vec_pretty(&ir).map_err(|error| error.to_string()),
+                ),
+                (
+                    output.join("security.json"),
+                    serde_json::to_vec_pretty(&security).map_err(|error| error.to_string()),
+                ),
+            ];
+            for (path, bytes) in writes {
+                let bytes = match bytes {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        return ExitCode::from(1);
+                    }
+                };
+                if let Err(error) = fs::write(&path, bytes) {
+                    eprintln!("error: {}: {error}", path.display());
+                    return ExitCode::from(1);
+                }
+            }
+            if let Err(error) = fs::write(
+                output.join("report.md"),
+                render_markdown(&analysis, &semantics),
+            ) {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+            if let Err(error) = fs::write(
+                output.join("pseudocode.rs"),
+                render_pseudocode(&analysis, &semantics),
+            ) {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+            if let Err(error) = fs::write(
+                output.join("pseudocode.c"),
+                render_c_pseudocode(&analysis, &semantics),
+            ) {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+            if json_requested {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "analysis": output.join("analysis.json"),
+                        "semantics": output.join("semantics.json"),
+                        "ir": output.join("ir.json"),
+                        "security": output.join("security.json"),
+                        "report": output.join("report.md"),
+                        "pseudocode": output.join("pseudocode.rs"),
+                        "pseudocode_c": output.join("pseudocode.c"),
+                    }))
+                    .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}"))
+                );
+            } else {
+                println!("analysis={}", output.join("analysis.json").display());
+                println!("semantics={}", output.join("semantics.json").display());
+                println!("ir={}", output.join("ir.json").display());
+                println!("security={}", output.join("security.json").display());
+                println!("report={}", output.join("report.md").display());
+                println!("pseudocode={}", output.join("pseudocode.rs").display());
+                println!("pseudocode_c={}", output.join("pseudocode.c").display());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn artifact_info_command(args: Vec<String>) -> ExitCode {
+    let Some(path) = args.first() else {
+        return usage();
+    };
+    let json = args.iter().skip(1).any(|argument| argument == "--json");
+    if let Some(argument) = args
+        .iter()
+        .skip(1)
+        .find(|argument| argument.as_str() != "--json")
+    {
+        eprintln!("error: unknown artifact-info option: {argument}");
+        return ExitCode::from(2);
+    }
+    match read_elf_facts(path) {
+        Ok(facts) if json => match serde_json::to_string_pretty(&serde_json::json!({
+            "path": path,
+            "machine": facts.machine,
+            "sbpf": facts.is_sbpf(),
+            "entrypoint": facts.entrypoint,
+        })) {
+            Ok(value) => {
+                println!("{value}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::from(1)
+            }
+        },
+        Ok(facts) => {
+            println!("path={path}");
+            println!("machine=0x{:x}", facts.machine);
+            println!("sbpf={}", facts.is_sbpf());
+            println!("entrypoint=0x{:x}", facts.entrypoint);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn detect_command(args: Vec<String>) -> ExitCode {
+    let Some(directory) = args.first() else {
+        eprintln!("usage: sos detect <analysis-directory> [--format json|sarif] [--out PATH]");
+        return ExitCode::from(2);
+    };
+    let (output, format) = match parse_detect_options(&args) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let directory = PathBuf::from(directory);
+    let analysis = match read_json::<sos_analysis::StaticAnalysis>(&directory.join("analysis.json"))
+    {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let semantics = read_json::<sos_solana::SemanticAnalysis>(&directory.join("semantics.json"))
+        .unwrap_or_else(|_| analyze_semantics(&analysis));
+    let report = sos_solana::detect(&analysis, &semantics);
+    let rendered = if format == "sarif" {
+        render_sarif(&report)
+    } else {
+        match serde_json::to_string_pretty(&report) {
+            Ok(json) => json,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        }
+    };
+    if let Some(path) = output {
+        if let Err(error) = fs::write(&path, rendered) {
+            eprintln!("error: {}: {error}", path.display());
+            return ExitCode::from(1);
+        }
+        println!("security={}", path.display());
+    } else {
+        println!("{rendered}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn parse_detect_options(args: &[String]) -> Result<(Option<PathBuf>, String), String> {
+    let mut index = 1;
+    let mut output = None;
+    let mut format = "json".to_owned();
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                format = "json".into();
+                index += 1;
+            }
+            "--format" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --format".into());
+                };
+                if !matches!(value.as_str(), "json" | "sarif") {
+                    return Err(format!("unsupported detect format: {value}"));
+                }
+                format = value.clone();
+                index += 2;
+            }
+            "--out" => {
+                let Some(path) = args.get(index + 1) else {
+                    return Err("missing value for --out".into());
+                };
+                output = Some(PathBuf::from(path));
+                index += 2;
+            }
+            option => return Err(format!("unknown detect option: {option}")),
+        }
+    }
+    Ok((output, format))
+}
+
+fn validate_command(args: Vec<String>) -> ExitCode {
+    validate_command_inner(args, true)
+}
+
+fn validate_command_inner(args: Vec<String>, announce_output: bool) -> ExitCode {
+    let Some(directory) = args.first() else {
+        eprintln!(
+            "usage: sos validate <analysis-directory> [--compiler PATH|--no-compile] [--trace PATH] [--repair --model-command PATH --repair-rounds N] [--out PATH]"
+        );
+        return ExitCode::from(2);
+    };
+    let options = match parse_validate_options(&args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let ValidateOptions {
+        compiler,
+        trace_path,
+        output,
+        repair,
+        model_command,
+        repair_rounds,
+    } = options;
+    let directory = PathBuf::from(directory);
+    let bundle = match read_json::<AiPipelineBundle>(&directory.join("model.json")) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut refinement = bundle
+        .stages
+        .iter()
+        .find(|stage| stage.task == ModelTask::Refinement && stage.response.is_some())
+        .and_then(|stage| stage.response.as_ref())
+        .and_then(|response| {
+            serde_json::from_value::<RefinementOutput>(response.structured_output.clone()).ok()
+        });
+    let mut repair_result: Option<RefinementLoopResult> = None;
+    if repair {
+        let Some(model_command) = model_command else {
+            eprintln!("error: --repair requires --model-command PATH");
+            return ExitCode::from(2);
+        };
+        let analysis =
+            match read_json::<sos_analysis::StaticAnalysis>(&directory.join("analysis.json")) {
+                Ok(analysis) => analysis,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(1);
+                }
+            };
+        let semantics =
+            match read_json::<sos_solana::SemanticAnalysis>(&directory.join("semantics.json")) {
+                Ok(semantics) => semantics,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(1);
+                }
+            };
+        let pack = EvidencePack::bounded_from_analysis(
+            ModelTask::Refinement,
+            bundle.artifact_sha256.clone(),
+            &analysis,
+            &semantics,
+            EvidencePackLimits::default(),
+        );
+        let repair_trace = trace_path
+            .as_deref()
+            .and_then(|path| read_json::<ExecutionTrace>(path).ok());
+        let repair_compiler = compiler.clone();
+        let loop_result = run_refinement_loop(
+            CommandModelProvider::new(model_command).with_timeout(Duration::from_secs(60)),
+            pack,
+            bundle.model.clone(),
+            bundle
+                .stages
+                .iter()
+                .find(|stage| stage.task == ModelTask::Refinement)
+                .map(|stage| stage.prompt_version.clone())
+                .unwrap_or_else(|| "sos-v1".into()),
+            2,
+            repair_rounds,
+            move |candidate| {
+                let compilation = compile_refinement_output(
+                    candidate,
+                    repair_compiler.as_deref(),
+                    Duration::from_secs(30),
+                );
+                let (behavioral_status, mismatches, limitations) = match repair_trace.as_ref() {
+                    Some(trace) if !candidate.observations.is_empty() => {
+                        let comparison =
+                            compare_candidate_observations(&candidate.observations, trace);
+                        let status = match comparison.status {
+                            sos_types::EvidenceStatus::BehaviorallyValidated => {
+                                "behaviorally_validated"
+                            }
+                            sos_types::EvidenceStatus::NotAvailable => "not_available",
+                            _ => "unverified",
+                        };
+                        (status.into(), comparison.mismatches, comparison.limitations)
+                    }
+                    Some(_) => (
+                        "unverified".into(),
+                        Vec::new(),
+                        vec!["candidate supplied no directly comparable observations".into()],
+                    ),
+                    None => (
+                        "not_requested".into(),
+                        Vec::new(),
+                        vec!["candidate replay comparison was not requested".into()],
+                    ),
+                };
+                RefinementFeedback {
+                    compilation: compilation.status,
+                    compiler_diagnostics: compilation.diagnostics,
+                    behavioral_status,
+                    mismatches,
+                    limitations,
+                }
+            },
+        );
+        if let Some(final_output) = loop_result.final_output.clone() {
+            refinement = Some(final_output);
+        }
+        repair_result = Some(loop_result);
+    }
+    let empty_refinement = RefinementOutput {
+        schema_version: sos_ai::REFINEMENT_SCHEMA_VERSION,
+        patches: Vec::new(),
+        observations: Vec::new(),
+        validation: RefinementValidation {
+            status: "not_available".into(),
+            notes: Vec::new(),
+        },
+    };
+    let compilation = compile_refinement_output(
+        refinement.as_ref().unwrap_or(&empty_refinement),
+        compiler.as_deref(),
+        Duration::from_secs(30),
+    );
+    let (behavioral_status, behavioral_evidence, behavioral_mismatches, behavioral_limitations) =
+        match trace_path.as_deref() {
+            Some(path) => match read_json::<ExecutionTrace>(path) {
+                Ok(trace) => {
+                    let candidate_comparison = refinement.as_ref().and_then(|candidate| {
+                        (!candidate.observations.is_empty()).then(|| {
+                            compare_candidate_observations(&candidate.observations, &trace)
+                        })
+                    });
+                    match candidate_comparison.or_else(|| trace.behavioral_comparison.clone()) {
+                        Some(comparison) => (
+                            match comparison.status {
+                                sos_types::EvidenceStatus::BehaviorallyValidated => {
+                                    "behaviorally_validated"
+                                }
+                                sos_types::EvidenceStatus::NotAvailable => "not_available",
+                                _ if comparison.mismatches.is_empty() => "unverified",
+                                _ => "mismatch",
+                            },
+                            comparison.matched_evidence,
+                            comparison.mismatches,
+                            comparison.limitations,
+                        ),
+                        None => (
+                            "unverified",
+                            Vec::new(),
+                            Vec::new(),
+                            vec!["trace did not contain a behavioral comparison".into()],
+                        ),
+                    }
+                }
+                Err(error) => (
+                    "not_available",
+                    Vec::new(),
+                    Vec::new(),
+                    vec![format!("unable to read replay trace: {error}")],
+                ),
+            },
+            None => (
+                "not_requested",
+                Vec::new(),
+                Vec::new(),
+                vec!["candidate replay comparison was not requested".into()],
+            ),
+        };
+    let refinement_output_sha256 = if repair {
+        refinement.as_ref().and_then(|candidate| {
+            serde_json::to_vec(candidate)
+                .ok()
+                .map(|bytes| sha256_hex(&bytes))
+        })
+    } else {
+        bundle
+            .stages
+            .iter()
+            .find(|stage| stage.task == ModelTask::Refinement)
+            .and_then(|stage| stage.output_sha256.clone())
+    };
+    let value = serde_json::json!({
+        "schema_version": VALIDATION_BUNDLE_SCHEMA_VERSION,
+        "artifact_sha256": bundle.artifact_sha256,
+        "refinement_output_sha256": refinement_output_sha256,
+        "compilation": compilation,
+        "behavioral_status": behavioral_status,
+        "behavioral_evidence": behavioral_evidence,
+        "behavioral_mismatches": behavioral_mismatches,
+        "repair": repair_result,
+        "limitations": behavioral_limitations.into_iter().chain([
+            "successful compilation does not establish behavioral agreement".into(),
+            "trace comparison describes observed deterministic semantics and does not execute the generated candidate".into()
+        ]).collect::<Vec<_>>()
+    });
+    let json = match serde_json::to_string_pretty(&value) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(path) = output {
+        if let Err(error) = fs::write(&path, json) {
+            eprintln!("error: {}: {error}", path.display());
+            return ExitCode::from(1);
+        }
+        if announce_output {
+            println!("validation={}", path.display());
+        }
+    } else {
+        println!("{json}");
+    }
+    ExitCode::SUCCESS
+}
+
+struct ValidateOptions {
+    compiler: Option<PathBuf>,
+    trace_path: Option<PathBuf>,
+    output: Option<PathBuf>,
+    repair: bool,
+    model_command: Option<PathBuf>,
+    repair_rounds: usize,
+}
+
+fn parse_validate_options(args: &[String]) -> Result<ValidateOptions, String> {
+    let mut compiler = Some(PathBuf::from("rustc"));
+    let mut trace = None;
+    let mut output = None;
+    let mut repair = false;
+    let mut model_command = None;
+    let mut repair_rounds = 2;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--no-compile" => {
+                compiler = None;
+                index += 1;
+            }
+            "--compiler" => {
+                let Some(path) = args.get(index + 1) else {
+                    return Err("missing value for --compiler".into());
+                };
+                compiler = Some(PathBuf::from(path));
+                index += 2;
+            }
+            "--trace" => {
+                let Some(path) = args.get(index + 1) else {
+                    return Err("missing value for --trace".into());
+                };
+                trace = Some(PathBuf::from(path));
+                index += 2;
+            }
+            "--repair" => {
+                repair = true;
+                index += 1;
+            }
+            "--model-command" => {
+                let Some(path) = args.get(index + 1) else {
+                    return Err("missing value for --model-command".into());
+                };
+                model_command = Some(PathBuf::from(path));
+                index += 2;
+            }
+            "--repair-rounds" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --repair-rounds".into());
+                };
+                repair_rounds = value
+                    .parse::<usize>()
+                    .map_err(|_| "--repair-rounds must be an integer".to_string())?
+                    .clamp(1, 8);
+                index += 2;
+            }
+            "--out" => {
+                let Some(path) = args.get(index + 1) else {
+                    return Err("missing value for --out".into());
+                };
+                output = Some(PathBuf::from(path));
+                index += 2;
+            }
+            option => return Err(format!("unknown validate option: {option}")),
+        }
+    }
+    Ok(ValidateOptions {
+        compiler,
+        trace_path: trace,
+        output,
+        repair,
+        model_command,
+        repair_rounds,
+    })
+}
+
+fn explain_command(args: Vec<String>) -> ExitCode {
+    let options = match ExplainOptions::parse(args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let response = match run_model(
+        &options.directory,
+        options.model_command.as_deref(),
+        options.model_endpoint.as_deref(),
+        &options.model,
+        options.task,
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let json = match serde_json::to_string_pretty(&response) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(path) = options.output {
+        if let Err(error) = fs::write(&path, json) {
+            eprintln!("error: {}: {error}", path.display());
+            return ExitCode::from(1);
+        }
+        println!("explanation={}", path.display());
+    } else {
+        println!("{json}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn replay_command(args: Vec<String>) -> ExitCode {
+    let options = match ReplayOptions::parse(args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let provider = JsonRpcProvider::new(&options.rpc_url).with_commitment(&options.commitment);
+    let account = match provider.get_account(&options.program_address, options.requested_slot) {
+        Ok(account) => account,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let registry = default_registry();
+    let adapter = match registry.identify(&account) {
+        Some(adapter) => adapter,
+        None => {
+            eprintln!("error: unsupported program owner {}", account.owner);
+            return ExitCode::from(1);
+        }
+    };
+    let artifact = match adapter.resolve_artifact(&account, &provider) {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let transaction = match provider.get_transaction(&options.signature, options.requested_slot) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let addresses = transaction_account_addresses(&transaction.raw_json);
+    let mut accounts = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        match provider.get_account(&address, transaction.slot.or(options.requested_slot)) {
+            Ok(account) => accounts.push(account),
+            Err(error) => {
+                let trace = sos_replay::ExecutionTrace::not_available_for_transaction(
+                    &transaction,
+                    &accounts,
+                    format!(
+                        "historical account state unavailable for {address}: {error}; \
+                         replay was not attempted and current state was not substituted"
+                    ),
+                );
+                return emit_trace(trace, options.output.as_deref());
+            }
+        }
+    }
+    let mut trace = match replay_transaction(&artifact, &transaction, &accounts) {
+        Ok(trace) => trace,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Ok(analysis) = analyze_elf(&artifact.elf_bytes) {
+        let semantics = analyze_semantics(&analysis);
+        trace.behavioral_comparison = Some(compare_semantics(&semantics, &trace));
+    }
+    emit_trace(trace, options.output.as_deref())
+}
+
+fn emit_trace(trace: sos_replay::ExecutionTrace, output: Option<&Path>) -> ExitCode {
+    let json = match serde_json::to_string_pretty(&trace) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(path) = output {
+        if let Err(error) = fs::write(path, json) {
+            eprintln!("error: {}: {error}", path.display());
+            return ExitCode::from(1);
+        }
+        println!("trace={}", path.display());
+    } else {
+        println!("{json}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn fetch_command(args: Vec<String>) -> ExitCode {
+    let options = match RemoteOptions::parse(args, "fetch") {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let (artifact, manifest) = match resolve_remote(&options) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let store = FileArtifactStore::new(&options.output);
+    let artifact_path = match store.put(&artifact, &manifest) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let (artifact_id, metadata_path) =
+        match register_artifact_metadata(&options.output, &manifest, &artifact_path) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        };
+    let manifest_path = PathBuf::from(&options.output).join("manifest.json");
+    if let Err(error) = fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("artifact manifest is serializable"),
+    ) {
+        eprintln!("error: {error}");
+        return ExitCode::from(1);
+    }
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "artifact": artifact_path,
+                "artifact_id": artifact_id,
+                "metadata": metadata_path,
+                "manifest": manifest_path,
+                "elf_sha256": manifest.elf_sha256,
+                "loader": manifest.loader,
+                "context_slot": manifest.context_slot,
+            }))
+            .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}"))
+        );
+    } else {
+        println!("artifact={}", artifact_path.display());
+        println!("artifact_id={artifact_id}");
+        println!("metadata={}", metadata_path.display());
+        println!("manifest={}", manifest_path.display());
+        println!("elf_sha256={}", manifest.elf_sha256);
+        println!("loader={:?}", manifest.loader);
+        println!("context_slot={:?}", manifest.context_slot);
+    }
+    ExitCode::SUCCESS
+}
+
+fn inspect_command(args: Vec<String>) -> ExitCode {
+    let options = match RemoteOptions::parse(args, "inspect") {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    if (options.validate_requested || options.repair_requested) && options.model.is_none() {
+        eprintln!("error: inspect --validate/--repair requires --model");
+        return ExitCode::from(2);
+    }
+    let (artifact, manifest) = match resolve_remote(&options) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let store = FileArtifactStore::new(&options.output);
+    let artifact_path = match store.put(&artifact, &manifest) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let (artifact_id, metadata_path) =
+        match register_artifact_metadata(&options.output, &manifest, &artifact_path) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        };
+    let manifest_path = PathBuf::from(&options.output).join("manifest.json");
+    if let Err(error) = fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("artifact manifest is serializable"),
+    ) {
+        eprintln!("error: {error}");
+        return ExitCode::from(1);
+    }
+    let analysis = match analyze_elf(&artifact.elf_bytes) {
+        Ok(analysis) => analysis,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let analysis_path = PathBuf::from(&options.output).join("analysis.json");
+    let analysis_json = match serde_json::to_vec_pretty(&analysis) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(error) = fs::write(&analysis_path, analysis_json) {
+        eprintln!("error: {error}");
+        return ExitCode::from(1);
+    }
+    let semantics = analyze_semantics(&analysis);
+    let ir = build_canonical_ir(&analysis);
+    let security = sos_solana::detect(&analysis, &semantics);
+    let semantics_path = PathBuf::from(&options.output).join("semantics.json");
+    let semantics_json = match serde_json::to_vec_pretty(&semantics) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(error) = fs::write(&semantics_path, semantics_json) {
+        eprintln!("error: {error}");
+        return ExitCode::from(1);
+    }
+    let ir_path = PathBuf::from(&options.output).join("ir.json");
+    let ir_json = match serde_json::to_vec_pretty(&ir) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(error) = fs::write(&ir_path, ir_json) {
+        eprintln!("error: {error}");
+        return ExitCode::from(1);
+    }
+    let security_path = PathBuf::from(&options.output).join("security.json");
+    let security_json = match serde_json::to_vec_pretty(&security) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(error) = fs::write(&security_path, security_json) {
+        eprintln!("error: {error}");
+        return ExitCode::from(1);
+    }
+    let report_path = PathBuf::from(&options.output).join("report.md");
+    if let Err(error) = fs::write(&report_path, render_markdown(&analysis, &semantics)) {
+        eprintln!("error: {error}");
+        return ExitCode::from(1);
+    }
+    let pseudocode_path = PathBuf::from(&options.output).join("pseudocode.rs");
+    if let Err(error) = fs::write(&pseudocode_path, render_pseudocode(&analysis, &semantics)) {
+        eprintln!("error: {error}");
+        return ExitCode::from(1);
+    }
+    let pseudocode_c_path = PathBuf::from(&options.output).join("pseudocode.c");
+    if let Err(error) = fs::write(
+        &pseudocode_c_path,
+        render_c_pseudocode(&analysis, &semantics),
+    ) {
+        eprintln!("error: {error}");
+        return ExitCode::from(1);
+    }
+    let history_path = if options.history_limit > 0 {
+        let path = PathBuf::from(&options.output).join("history.json");
+        let history = collect_history(&options);
+        match serde_json::to_vec_pretty(&history) {
+            Ok(json) => {
+                if let Err(error) = fs::write(&path, json) {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(1);
+                }
+                Some(path)
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        None
+    };
+    let replay_path = if options.replay_requested {
+        let path = PathBuf::from(&options.output).join("replay.json");
+        let mut trace = replay_for_inspect(&options, &artifact);
+        trace.behavioral_comparison = Some(compare_semantics(&semantics, &trace));
+        let value = serde_json::to_value(trace).expect("replay trace is serializable");
+        if let Err(error) = fs::write(
+            &path,
+            serde_json::to_vec_pretty(&value).expect("replay status is serializable"),
+        ) {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+        Some(path)
+    } else {
+        None
+    };
+    let (model_path, ai_report_path) = if let Some(model) = &options.model {
+        let path = PathBuf::from(&options.output).join("model.json");
+        let bundle = match (
+            options.model_command.as_deref(),
+            options.model_endpoint.as_deref(),
+        ) {
+            (Some(command), _) => run_model_pipeline(
+                &analysis,
+                &semantics,
+                Some(&manifest.elf_sha256),
+                Some(Path::new(command)),
+                None,
+                model,
+            ),
+            (None, Some(endpoint)) => run_model_pipeline(
+                &analysis,
+                &semantics,
+                Some(&manifest.elf_sha256),
+                None,
+                Some(endpoint),
+                model,
+            ),
+            (None, None) => unavailable_pipeline_bundle(
+                AiPipelineConfig {
+                    provider_name: "none".into(),
+                    model: model.clone(),
+                    prompt_version: "sos-v1".into(),
+                    artifact_sha256: Some(manifest.elf_sha256.clone()),
+                    limits: EvidencePackLimits::default(),
+                    max_attempts: 2,
+                },
+                &analysis,
+                &semantics,
+                "provide --model-command PATH or --model-endpoint URL",
+            ),
+        };
+        let value = match serde_json::to_value(&bundle) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        if let Err(error) = fs::write(
+            &path,
+            serde_json::to_vec_pretty(&value).expect("model status is serializable"),
+        ) {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+        let ai_report_path = PathBuf::from(&options.output).join("ai-report.md");
+        if let Err(error) = fs::write(&ai_report_path, render_ai_markdown(&bundle)) {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+        (Some(path), Some(ai_report_path))
+    } else {
+        (None, None)
+    };
+    let validation_path = if options.validate_requested || options.repair_requested {
+        let path = PathBuf::from(&options.output).join("validation.json");
+        let mut validation_args = vec![options.output.clone()];
+        if let Some(trace) = options
+            .validation_trace
+            .clone()
+            .or_else(|| replay_path.clone())
+        {
+            validation_args.extend(["--trace".into(), trace.display().to_string()]);
+        }
+        if options.repair_requested {
+            let Some(model_command) = options.model_command.clone() else {
+                eprintln!("error: inspect --repair requires --model-command PATH");
+                return ExitCode::from(2);
+            };
+            validation_args.extend([
+                "--repair".into(),
+                "--model-command".into(),
+                model_command,
+                "--repair-rounds".into(),
+                options.repair_rounds.to_string(),
+            ]);
+        }
+        validation_args.extend(["--out".into(), path.display().to_string()]);
+        let status = validate_command_inner(validation_args, false);
+        if status != ExitCode::SUCCESS {
+            return status;
+        }
+        Some(path)
+    } else {
+        None
+    };
+    if options.json {
+        let value = serde_json::json!({
+            "artifact": artifact_path,
+            "artifact_id": artifact_id,
+            "metadata": metadata_path,
+            "manifest": manifest_path,
+            "analysis": analysis_path,
+            "semantics": semantics_path,
+            "ir": ir_path,
+            "security": security_path,
+            "report": report_path,
+            "pseudocode": pseudocode_path,
+            "pseudocode_c": pseudocode_c_path,
+            "history": history_path,
+            "replay": replay_path,
+            "model": model_path,
+            "ai_report": ai_report_path,
+            "validation": validation_path,
+            "elf_sha256": manifest.elf_sha256,
+            "sbpf_version": analysis.sbpf_version,
+            "instructions": analysis.instructions.len(),
+            "functions": analysis.functions.len(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}"))
+        );
+    } else {
+        println!("artifact={}", artifact_path.display());
+        println!("artifact_id={artifact_id}");
+        println!("metadata={}", metadata_path.display());
+        println!("manifest={}", manifest_path.display());
+        println!("analysis={}", analysis_path.display());
+        println!("semantics={}", semantics_path.display());
+        println!("ir={}", ir_path.display());
+        println!("security={}", security_path.display());
+        println!("report={}", report_path.display());
+        println!("pseudocode={}", pseudocode_path.display());
+        println!("pseudocode_c={}", pseudocode_c_path.display());
+        if let Some(path) = history_path {
+            println!("history={}", path.display());
+        }
+        if let Some(path) = replay_path {
+            println!("replay={}", path.display());
+        }
+        if let Some(path) = model_path {
+            println!("model={}", path.display());
+        }
+        if let Some(path) = ai_report_path {
+            println!("ai_report={}", path.display());
+        }
+        if let Some(path) = validation_path {
+            println!("validation={}", path.display());
+        }
+        println!("elf_sha256={}", manifest.elf_sha256);
+        println!("sbpf_version={}", analysis.sbpf_version);
+        println!("instructions={}", analysis.instructions.len());
+        println!("functions={}", analysis.functions.len());
+    }
+    ExitCode::SUCCESS
+}
+
+fn report_command(args: Vec<String>) -> ExitCode {
+    let Some(directory) = args.first() else {
+        eprintln!("usage: sos report <analysis-directory> [--out PATH]");
+        return ExitCode::from(2);
+    };
+    let (output, format) = match parse_report_options(&args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let directory = PathBuf::from(directory);
+    let analysis = match read_json::<sos_analysis::StaticAnalysis>(&directory.join("analysis.json"))
+    {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let semantics = read_json::<sos_solana::SemanticAnalysis>(&directory.join("semantics.json"))
+        .unwrap_or_else(|_| analyze_semantics(&analysis));
+    let report = match format.as_str() {
+        "markdown" => render_markdown(&analysis, &semantics),
+        "graphviz" => render_cfg_dot(&analysis),
+        "json" => match serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "analysis": analysis,
+            "semantics": semantics,
+            "security": sos_solana::detect(&analysis, &semantics),
+        })) {
+            Ok(json) => json,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        },
+        _ => unreachable!("format validated by parse_report_options"),
+    };
+    if let Some(path) = output {
+        if let Err(error) = fs::write(&path, report) {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+        println!("report={}", path.display());
+    } else {
+        print!("{report}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn parse_report_options(args: &[String]) -> Result<(Option<PathBuf>, String), String> {
+    let mut index = 1;
+    let mut output = None;
+    let mut format = "markdown".to_owned();
+    while index < args.len() {
+        match args[index].as_str() {
+            "--out" => {
+                let Some(path) = args.get(index + 1) else {
+                    return Err("missing value for --out".into());
+                };
+                output = Some(PathBuf::from(path));
+                index += 2;
+            }
+            "--format" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --format".into());
+                };
+                if !matches!(value.as_str(), "markdown" | "json" | "graphviz") {
+                    return Err(format!("unsupported report format: {value}"));
+                }
+                format = value.clone();
+                index += 2;
+            }
+            option => return Err(format!("unknown option: {option}")),
+        }
+    }
+    Ok((output, format))
+}
+
+fn decompile_command(args: Vec<String>) -> ExitCode {
+    let Some(directory) = args.first() else {
+        eprintln!("usage: sos decompile <analysis-directory> [--out PATH]");
+        return ExitCode::from(2);
+    };
+    let (output, format) = match parse_decompile_options(&args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let directory = PathBuf::from(directory);
+    let analysis = match read_json::<sos_analysis::StaticAnalysis>(&directory.join("analysis.json"))
+    {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let semantics = read_json::<sos_solana::SemanticAnalysis>(&directory.join("semantics.json"))
+        .unwrap_or_else(|_| analyze_semantics(&analysis));
+    let pseudocode = match format.as_str() {
+        "rust-like" => render_pseudocode(&analysis, &semantics),
+        "c-like" => render_c_pseudocode(&analysis, &semantics),
+        "json" => match serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "analysis": analysis,
+            "semantics": semantics,
+            "pseudocode": render_pseudocode(&analysis, &semantics),
+        })) {
+            Ok(json) => json,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        },
+        _ => unreachable!("format validated by parse_decompile_options"),
+    };
+    if let Some(path) = output {
+        if let Err(error) = fs::write(&path, pseudocode) {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+        println!("pseudocode={}", path.display());
+    } else {
+        print!("{pseudocode}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn parse_decompile_options(args: &[String]) -> Result<(Option<PathBuf>, String), String> {
+    let mut index = 1;
+    let mut output = None;
+    let mut format = "rust-like".to_owned();
+    while index < args.len() {
+        match args[index].as_str() {
+            "--out" => {
+                let Some(path) = args.get(index + 1) else {
+                    return Err("missing value for --out".into());
+                };
+                output = Some(PathBuf::from(path));
+                index += 2;
+            }
+            "--format" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --format".into());
+                };
+                if !matches!(value.as_str(), "rust-like" | "c-like" | "json") {
+                    return Err(format!("unsupported decompile format: {value}"));
+                }
+                format = value.clone();
+                index += 2;
+            }
+            option => return Err(format!("unknown option: {option}")),
+        }
+    }
+    Ok((output, format))
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T, String> {
+    let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn run_model_pipeline(
+    analysis: &sos_analysis::StaticAnalysis,
+    semantics: &sos_solana::SemanticAnalysis,
+    artifact_sha256: Option<&str>,
+    command: Option<&Path>,
+    endpoint: Option<&str>,
+    model: &str,
+) -> AiPipelineBundle {
+    let artifact_sha256 = artifact_sha256.map(str::to_owned);
+    match (command, endpoint) {
+        (Some(command), _) => run_pipeline(
+            CommandModelProvider::new(command),
+            AiPipelineConfig {
+                provider_name: "local_command".into(),
+                model: model.into(),
+                prompt_version: "sos-v1".into(),
+                artifact_sha256,
+                limits: EvidencePackLimits::default(),
+                max_attempts: 2,
+            },
+            analysis,
+            semantics,
+        ),
+        (None, Some(endpoint)) => {
+            let mut provider = HttpModelProvider::new(endpoint);
+            if let Ok(token) = env::var("SOS_MODEL_TOKEN") {
+                provider = provider.with_bearer_token(token);
+            }
+            run_pipeline(
+                provider,
+                AiPipelineConfig {
+                    provider_name: "http".into(),
+                    model: model.into(),
+                    prompt_version: "sos-v1".into(),
+                    artifact_sha256,
+                    limits: EvidencePackLimits::default(),
+                    max_attempts: 2,
+                },
+                analysis,
+                semantics,
+            )
+        }
+        (None, None) => unreachable!("inspect handles an absent model provider explicitly"),
+    }
+}
+
+fn run_model(
+    directory: &Path,
+    command: Option<&Path>,
+    endpoint: Option<&str>,
+    model: &str,
+    task: ModelTask,
+) -> Result<sos_ai::ModelResponse, String> {
+    let analysis = read_json::<sos_analysis::StaticAnalysis>(&directory.join("analysis.json"))?;
+    let semantics = read_json::<sos_solana::SemanticAnalysis>(&directory.join("semantics.json"))
+        .unwrap_or_else(|_| analyze_semantics(&analysis));
+    let artifact_sha256 =
+        read_json::<sos_types::ArtifactManifest>(&directory.join("manifest.json"))
+            .ok()
+            .map(|manifest| manifest.elf_sha256);
+    let pack = EvidencePack::bounded_from_analysis(
+        task,
+        artifact_sha256,
+        &analysis,
+        &semantics,
+        EvidencePackLimits::default(),
+    );
+    if let Some(command) = command {
+        return submit_model(CommandModelProvider::new(command), task, model, pack);
+    }
+    if let Some(endpoint) = endpoint {
+        let mut provider = HttpModelProvider::new(endpoint);
+        if let Ok(token) = env::var("SOS_MODEL_TOKEN") {
+            provider = provider.with_bearer_token(token);
+        }
+        return submit_model(provider, task, model, pack);
+    }
+    Err("no model provider configured".into())
+}
+
+fn submit_model<P: ModelProvider>(
+    provider: P,
+    task: ModelTask,
+    model: &str,
+    pack: EvidencePack,
+) -> Result<sos_ai::ModelResponse, String> {
+    let gateway = ModelGateway::new(provider, 4 * 1024 * 1024, 1024 * 1024);
+    gateway
+        .submit_with_retry(task, model.to_owned(), "sos-v1", pack, 2)
+        .map_err(|error| error.to_string())
+}
+
+fn parse_output_path(args: &[String]) -> Result<Option<PathBuf>, String> {
+    let mut index = 1;
+    let mut output = None;
+    while index < args.len() {
+        if args[index] == "--json" {
+            index += 1;
+            continue;
+        }
+        if args[index] != "--out" {
+            return Err(format!("unknown option: {}", args[index]));
+        }
+        let Some(path) = args.get(index + 1) else {
+            return Err("missing value for --out".into());
+        };
+        output = Some(PathBuf::from(path));
+        index += 2;
+    }
+    Ok(output)
+}
+
+struct RemoteOptions {
+    program_address: String,
+    rpc_url: String,
+    cluster: Option<String>,
+    rpc_explicit: bool,
+    output: String,
+    commitment: String,
+    requested_slot: Option<u64>,
+    history_limit: usize,
+    json: bool,
+    replay_requested: bool,
+    model: Option<String>,
+    model_command: Option<String>,
+    model_endpoint: Option<String>,
+    signature: Option<String>,
+    validate_requested: bool,
+    repair_requested: bool,
+    repair_rounds: usize,
+    validation_trace: Option<PathBuf>,
+}
+
+struct BenchmarkOptions {
+    artifact: PathBuf,
+    output: Option<PathBuf>,
+    repeats: usize,
+}
+
+impl BenchmarkOptions {
+    fn parse(args: Vec<String>) -> Result<Self, String> {
+        let Some(artifact) = args.first() else {
+            return Err("usage: sos benchmark <artifact> [--repeats N] [--out PATH]".into());
+        };
+        let mut options = Self {
+            artifact: PathBuf::from(artifact),
+            output: None,
+            repeats: 2,
+        };
+        let mut index = 1;
+        while index < args.len() {
+            let flag = &args[index];
+            let Some(value) = args.get(index + 1) else {
+                return Err(format!("missing value for {flag}"));
+            };
+            match flag.as_str() {
+                "--out" => options.output = Some(PathBuf::from(value)),
+                "--repeats" => {
+                    options.repeats = value
+                        .parse::<usize>()
+                        .map_err(|error| format!("invalid repeat count: {error}"))?;
+                    if !(1..=8).contains(&options.repeats) {
+                        return Err("--repeats must be between 1 and 8".into());
+                    }
+                }
+                _ => return Err(format!("unknown benchmark option: {flag}")),
+            }
+            index += 2;
+        }
+        Ok(options)
+    }
+}
+
+struct ReplayOptions {
+    program_address: String,
+    signature: String,
+    rpc_url: String,
+    commitment: String,
+    requested_slot: Option<u64>,
+    output: Option<PathBuf>,
+}
+
+struct ExplainOptions {
+    directory: PathBuf,
+    model_command: Option<PathBuf>,
+    model_endpoint: Option<String>,
+    model: String,
+    task: ModelTask,
+    output: Option<PathBuf>,
+}
+
+impl ExplainOptions {
+    fn parse(args: Vec<String>) -> Result<Self, String> {
+        let Some(directory) = args.first() else {
+            return Err("usage: sos explain <analysis-directory> --model-command PATH or --model-endpoint URL [options]".into());
+        };
+        let mut options = Self {
+            directory: PathBuf::from(directory),
+            model_command: None,
+            model_endpoint: None,
+            model: "local".into(),
+            task: ModelTask::Explanation,
+            output: None,
+        };
+        let mut index = 1;
+        while index < args.len() {
+            let flag = &args[index];
+            let Some(value) = args.get(index + 1) else {
+                return Err(format!("missing value for {flag}"));
+            };
+            match flag.as_str() {
+                "--model-command" => options.model_command = Some(PathBuf::from(value)),
+                "--model-endpoint" => options.model_endpoint = Some(value.clone()),
+                "--model" => options.model = value.clone(),
+                "--task" => {
+                    options.task = match value.as_str() {
+                        "structure" => ModelTask::StructureRecovery,
+                        "semantic" => ModelTask::SemanticLabeling,
+                        "explanation" => ModelTask::Explanation,
+                        "refinement" => ModelTask::Refinement,
+                        _ => return Err(format!("unsupported model task: {value}")),
+                    }
+                }
+                "--out" => options.output = Some(PathBuf::from(value)),
+                _ => return Err(format!("unknown explain option: {flag}")),
+            }
+            index += 2;
+        }
+        if options.model_command.is_none() && options.model_endpoint.is_none() {
+            return Err("provide --model-command PATH or --model-endpoint URL".into());
+        }
+        Ok(options)
+    }
+}
+
+impl ReplayOptions {
+    fn parse(args: Vec<String>) -> Result<Self, String> {
+        let Some(program_address) = args.first().cloned() else {
+            return Err(
+                "usage: sos replay <program-address> --signature SIGNATURE [options]".into(),
+            );
+        };
+        let mut signature = None;
+        let mut options = Self {
+            program_address,
+            signature: String::new(),
+            rpc_url: "https://api.mainnet.solana.com".into(),
+            commitment: "finalized".into(),
+            requested_slot: None,
+            output: None,
+        };
+        let mut index = 1;
+        while index < args.len() {
+            let flag = &args[index];
+            let Some(value) = args.get(index + 1) else {
+                return Err(format!("missing value for {flag}"));
+            };
+            match flag.as_str() {
+                "--signature" => signature = Some(value.clone()),
+                "--rpc-url" => options.rpc_url = value.clone(),
+                "--commitment" => options.commitment = value.clone(),
+                "--slot" => {
+                    options.requested_slot = Some(
+                        value
+                            .parse::<u64>()
+                            .map_err(|error| format!("invalid slot: {error}"))?,
+                    )
+                }
+                "--out" => options.output = Some(PathBuf::from(value)),
+                _ => return Err(format!("unknown replay option: {flag}")),
+            }
+            index += 2;
+        }
+        options.signature = signature.ok_or_else(|| "missing required --signature".to_owned())?;
+        Ok(options)
+    }
+}
+
+impl RemoteOptions {
+    fn parse(args: Vec<String>, command: &str) -> Result<Self, String> {
+        let Some(program_address) = args.first().cloned() else {
+            return Err(format!("usage: sos {command} <program-address> [options]"));
+        };
+        let mut options = Self {
+            program_address,
+            rpc_url: "https://api.mainnet.solana.com".into(),
+            cluster: None,
+            rpc_explicit: false,
+            output: "artifacts".into(),
+            commitment: "finalized".into(),
+            requested_slot: None,
+            history_limit: 0,
+            json: false,
+            replay_requested: false,
+            model: None,
+            model_command: None,
+            model_endpoint: None,
+            signature: None,
+            validate_requested: false,
+            repair_requested: false,
+            repair_rounds: 2,
+            validation_trace: None,
+        };
+        let mut index = 1;
+        while index < args.len() {
+            let flag = &args[index];
+            if flag == "--json" {
+                options.json = true;
+                index += 1;
+                continue;
+            }
+            if flag == "--replay" {
+                options.replay_requested = true;
+                index += 1;
+                continue;
+            }
+            if flag == "--validate" {
+                if command != "inspect" {
+                    return Err("--validate is only supported by inspect".into());
+                }
+                options.validate_requested = true;
+                index += 1;
+                continue;
+            }
+            if flag == "--repair" {
+                if command != "inspect" {
+                    return Err("--repair is only supported by inspect".into());
+                }
+                options.repair_requested = true;
+                options.validate_requested = true;
+                index += 1;
+                continue;
+            }
+            let Some(value) = args.get(index + 1) else {
+                return Err(format!("missing value for {flag}"));
+            };
+            match flag.as_str() {
+                "--rpc-url" => {
+                    options.rpc_url = value.clone();
+                    options.rpc_explicit = true;
+                }
+                "--cluster" => options.cluster = Some(value.clone()),
+                "--out" => options.output = value.clone(),
+                "--commitment" => options.commitment = value.clone(),
+                "--history" => {
+                    options.history_limit = value
+                        .parse::<usize>()
+                        .map_err(|error| format!("invalid history limit: {error}"))?;
+                }
+                "--slot" => {
+                    options.requested_slot = Some(
+                        value
+                            .parse::<u64>()
+                            .map_err(|error| format!("invalid slot: {error}"))?,
+                    );
+                }
+                "--model" => options.model = Some(value.clone()),
+                "--model-command" => options.model_command = Some(value.clone()),
+                "--model-endpoint" => options.model_endpoint = Some(value.clone()),
+                "--signature" => options.signature = Some(value.clone()),
+                "--repair-rounds" if command == "inspect" => {
+                    options.repair_rounds = value
+                        .parse::<usize>()
+                        .map_err(|_| "--repair-rounds must be an integer".to_string())?
+                        .clamp(1, 8);
+                }
+                "--validation-trace" if command == "inspect" => {
+                    options.validation_trace = Some(PathBuf::from(value));
+                }
+                _ => return Err(format!("unknown {command} option: {flag}")),
+            }
+            index += 2;
+        }
+        if !options.rpc_explicit {
+            if let Some(cluster) = options.cluster.as_deref() {
+                options.rpc_url = match cluster {
+                    "mainnet-beta" | "mainnet" => "https://api.mainnet.solana.com".into(),
+                    "devnet" => "https://api.devnet.solana.com".into(),
+                    "testnet" => "https://api.testnet.solana.com".into(),
+                    "localnet" | "localhost" => "http://127.0.0.1:8899".into(),
+                    value => return Err(format!("unsupported cluster: {value}")),
+                };
+            }
+        }
+        Ok(options)
+    }
+}
+
+fn resolve_remote(options: &RemoteOptions) -> Result<(ProgramArtifact, ArtifactManifest), String> {
+    let provider = JsonRpcProvider::new(&options.rpc_url).with_commitment(&options.commitment);
+    let account = provider
+        .get_account(&options.program_address, options.requested_slot)
+        .map_err(|error| error.to_string())?;
+    let registry = default_registry();
+    let adapter = registry
+        .identify(&account)
+        .ok_or_else(|| format!("unsupported program owner {}", account.owner))?;
+    let artifact = adapter
+        .resolve_artifact(&account, &provider)
+        .map_err(|error| error.to_string())?;
+    let sbpf_version = analyze_elf(&artifact.elf_bytes)
+        .map_err(|error| format!("unable to determine SBPF version: {error}"))?
+        .sbpf_version;
+    let context = ManifestContext {
+        cluster: options.cluster.clone(),
+        rpc_endpoint_id: Some(options.rpc_url.clone()),
+        commitment: Some(options.commitment.clone()),
+        context_slot: account.context_slot,
+        requested_slot: options.requested_slot,
+        sbpf_version: Some(sbpf_version),
+        sos_version: env!("CARGO_PKG_VERSION").into(),
+    };
+    let manifest = build_manifest(&artifact, &context).map_err(|error| error.to_string())?;
+    Ok((artifact, manifest))
+}
+
+fn register_artifact_metadata(
+    output: &str,
+    manifest: &ArtifactManifest,
+    artifact_path: &Path,
+) -> Result<(String, PathBuf), String> {
+    let metadata_path = PathBuf::from(output).join("metadata.sqlite");
+    let store = MetadataStore::open(&metadata_path).map_err(|error| error.to_string())?;
+    let record = store
+        .register_artifact(manifest, artifact_path)
+        .map_err(|error| error.to_string())?;
+    Ok((record.artifact_id, metadata_path))
+}
+
+fn replay_for_inspect(
+    options: &RemoteOptions,
+    artifact: &ProgramArtifact,
+) -> sos_replay::ExecutionTrace {
+    let provider = JsonRpcProvider::new(&options.rpc_url).with_commitment(&options.commitment);
+    let signature = match options.signature.clone() {
+        Some(signature) => signature,
+        None => match provider.get_signatures(&options.program_address, 1) {
+            Ok(signatures) => match signatures.first() {
+                Some(signature) => signature.signature.clone(),
+                None => {
+                    return sos_replay::ExecutionTrace::not_available(
+                        "inspect",
+                        "no transaction signatures were found for the program",
+                    )
+                }
+            },
+            Err(error) => {
+                return sos_replay::ExecutionTrace::not_available(
+                    "inspect",
+                    format!("transaction history unavailable: {error}"),
+                )
+            }
+        },
+    };
+    let transaction = match provider.get_transaction(&signature, options.requested_slot) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            return sos_replay::ExecutionTrace::not_available(
+                signature,
+                format!("transaction evidence unavailable: {error}"),
+            )
+        }
+    };
+    let slot = transaction.slot.or(options.requested_slot);
+    let mut accounts = Vec::new();
+    for address in transaction_account_addresses(&transaction.raw_json) {
+        match provider.get_account(&address, slot) {
+            Ok(account) => accounts.push(account),
+            Err(error) => {
+                return sos_replay::ExecutionTrace::not_available_for_transaction(
+                    &transaction,
+                    &accounts,
+                    format!(
+                        "historical account state unavailable for {address}: {error}; \
+                         replay was not attempted and current state was not substituted"
+                    ),
+                )
+            }
+        }
+    }
+    match replay_transaction(artifact, &transaction, &accounts) {
+        Ok(trace) => trace,
+        Err(error) => sos_replay::ExecutionTrace::not_available_for_transaction(
+            &transaction,
+            &accounts,
+            format!("replay backend unavailable: {error}"),
+        ),
+    }
+}
+
+fn collect_history(options: &RemoteOptions) -> serde_json::Value {
+    let provider = JsonRpcProvider::new(&options.rpc_url).with_commitment(&options.commitment);
+    let signatures = match provider.get_signatures(&options.program_address, options.history_limit)
+    {
+        Ok(signatures) => signatures,
+        Err(error) => {
+            return serde_json::json!({
+                "program_address": options.program_address,
+                "status": "not_available",
+                "error": error.to_string(),
+            });
+        }
+    };
+    let transactions = signatures
+        .iter()
+        .map(
+            |signature| match provider.get_transaction(&signature.signature, signature.slot) {
+                Ok(transaction) => serde_json::json!({
+                    "status": "available",
+                    "transaction": transaction,
+                }),
+                Err(error) => serde_json::json!({
+                    "status": "not_available",
+                    "signature": signature.signature,
+                    "slot": signature.slot,
+                    "error": error.to_string(),
+                }),
+            },
+        )
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "program_address": options.program_address,
+        "commitment": options.commitment,
+        "limit": options.history_limit,
+        "signatures": signatures,
+        "transactions": transactions,
+    })
+}
+
+fn replay_transaction(
+    artifact: &ProgramArtifact,
+    transaction: &sos_types::TransactionEvidence,
+    accounts: &[sos_types::AccountSnapshot],
+) -> Result<sos_replay::ExecutionTrace, sos_replay::ReplayError> {
+    #[cfg(feature = "litesvm")]
+    {
+        LiteSvmReplayEngine.replay(artifact, transaction, accounts)
+    }
+    #[cfg(not(feature = "litesvm"))]
+    {
+        let _ = accounts;
+        UnavailableReplayEngine.replay(artifact, transaction, accounts)
+    }
+}
+
+fn transaction_account_addresses(raw_json: &serde_json::Value) -> Vec<String> {
+    let mut addresses = std::collections::BTreeSet::new();
+    let transaction = raw_json.get("transaction").unwrap_or(raw_json);
+    let message = transaction.get("message");
+    if let Some(account_keys) = message
+        .and_then(|message| message.get("accountKeys"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for account in account_keys {
+            if let Some(address) = account
+                .get("pubkey")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| account.as_str())
+            {
+                addresses.insert(address.to_owned());
+            }
+        }
+    }
+    if let Some(loaded) = raw_json
+        .get("meta")
+        .and_then(|meta| meta.get("loadedAddresses"))
+    {
+        for field in ["writable", "readonly"] {
+            if let Some(values) = loaded.get(field).and_then(serde_json::Value::as_array) {
+                for address in values.iter().filter_map(serde_json::Value::as_str) {
+                    addresses.insert(address.to_owned());
+                }
+            }
+        }
+    }
+    addresses.into_iter().collect()
+}
+
+fn usage() -> ExitCode {
+    eprintln!("usage: sos artifact-info <path-to-sbf-elf> [--json]");
+    eprintln!("       sos manifest <path-to-sbf-elf>");
+    eprintln!("       sos fetch <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--commitment LEVEL] [--json]");
+    eprintln!("       sos inspect <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--history N] [--replay] [--signature SIGNATURE] [--model NAME] [--model-command PATH|--model-endpoint URL] [--validate] [--repair --repair-rounds N] [--validation-trace PATH] [--commitment LEVEL] [--json]");
+    eprintln!("       sos analyze <path-to-sbf-elf> [--out DIR]");
+    eprintln!("       sos detect <analysis-directory> [--format json|sarif] [--out PATH]");
+    eprintln!("       sos validate <analysis-directory> [--compiler PATH|--no-compile] [--trace PATH] [--repair --model-command PATH --repair-rounds N] [--out PATH]");
+    eprintln!("       sos explain <analysis-directory> --model-command PATH|--model-endpoint URL [--model NAME] [--task structure|semantic|explanation|refinement] [--out PATH]");
+    eprintln!(
+        "       sos replay <program-address> --signature SIGNATURE [--rpc-url URL] [--out PATH]"
+    );
+    eprintln!(
+        "       sos report <analysis-directory> [--format markdown|json|graphviz] [--out PATH]"
+    );
+    eprintln!(
+        "       sos decompile <analysis-directory> [--format rust-like|c-like|json] [--out PATH]"
+    );
+    eprintln!("       sos benchmark <artifact> [--repeats N] [--out PATH]");
+    ExitCode::from(2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{transaction_account_addresses, BenchmarkOptions, ExplainOptions};
+
+    #[test]
+    fn transaction_accounts_include_static_and_loaded_keys_without_duplicates() {
+        let value = serde_json::json!({
+            "transaction": {
+                "message": {
+                    "accountKeys": [
+                        {"pubkey": "static-a"},
+                        {"pubkey": "static-b"},
+                        {"pubkey": "static-a"}
+                    ]
+                }
+            },
+            "meta": {
+                "loadedAddresses": {
+                    "writable": ["loaded-a"],
+                    "readonly": ["static-b", "loaded-b"]
+                }
+            }
+        });
+        assert_eq!(
+            transaction_account_addresses(&value),
+            vec![
+                "loaded-a".to_owned(),
+                "loaded-b".to_owned(),
+                "static-a".to_owned(),
+                "static-b".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn explain_accepts_a_hosted_model_endpoint_without_a_local_command() {
+        let options = ExplainOptions::parse(vec![
+            "./analysis".into(),
+            "--model".into(),
+            "hosted".into(),
+            "--model-endpoint".into(),
+            "http://127.0.0.1:8080/generate".into(),
+        ])
+        .unwrap();
+        assert!(options.model_command.is_none());
+        assert_eq!(
+            options.model_endpoint.as_deref(),
+            Some("http://127.0.0.1:8080/generate")
+        );
+    }
+
+    #[test]
+    fn benchmark_options_bound_repeat_count() {
+        let options =
+            BenchmarkOptions::parse(vec!["program.so".into(), "--repeats".into(), "4".into()])
+                .unwrap();
+        assert_eq!(options.repeats, 4);
+        assert!(BenchmarkOptions::parse(
+            vec!["program.so".into(), "--repeats".into(), "9".into(),]
+        )
+        .is_err());
+    }
+}

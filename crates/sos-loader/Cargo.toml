@@ -1,0 +1,13 @@
+[package]
+name = "sos-loader"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+bincode = "1.3"
+sos-rpc = { path = "../sos-rpc" }
+sos-types = { path = "../sos-types" }
+solana-loader-v3-interface = { version = "5.0.0", features = ["bincode"] }
+solana-loader-v4-interface = "2.2.1"

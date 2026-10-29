@@ -1,0 +1,29 @@
+[package]
+name = "sos-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+litesvm = ["sos-replay/litesvm"]
+
+[[bin]]
+name = "sos"
+path = "src/main.rs"
+
+[dependencies]
+serde = "1.0"
+serde_json = "1.0"
+sos-ai = { path = "../sos-ai" }
+sos-artifact = { path = "../sos-artifact" }
+sos-analysis = { path = "../sos-analysis" }
+sos-core = { path = "../sos-core" }
+sos-loader = { path = "../sos-loader" }
+sos-rpc = { path = "../sos-rpc" }
+sos-replay = { path = "../sos-replay" }
+sos-report = { path = "../sos-report" }
+sos-solana = { path = "../sos-solana" }
+ sos-storage = { path = "../sos-storage" }
+sos-types = { path = "../sos-types" }

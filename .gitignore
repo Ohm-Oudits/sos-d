@@ -1,0 +1,19 @@
+/target/
+/fuzz/target/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.DS_Store
+
+# Local analysis and model output bundles.
+/analysis/
+/artifacts/
+/reports/
+/traces/
+
+# Credentials and local provider configuration.
+.env
+.env.*
+*.pem
+*.key
+*.seed

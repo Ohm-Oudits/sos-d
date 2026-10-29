@@ -1,0 +1,12 @@
+[package]
+name = "sos-pinocchio-fixture"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pinocchio = { version = "=0.9.0", default-features = false, features = ["std"] }

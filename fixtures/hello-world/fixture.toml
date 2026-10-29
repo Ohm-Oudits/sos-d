@@ -1,0 +1,9 @@
+name = "sos-hello-world"
+source = "programs/hello-world/src/lib.rs"
+artifact = "target/deploy/sos_hello_world.so"
+loader = "upgradeable-v3-or-legacy-direct"
+framework = "native-rust"
+expected_elf_machine = 263
+expected_sbpf = true
+semantic_targets = ["log_candidate", "instruction_data_length"]
+notes = "Build with scripts/build-example.sh; deploy locally with scripts/deploy-local.sh."

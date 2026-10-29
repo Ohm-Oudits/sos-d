@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sos-decompiler.dev/schema/v1/refinement.schema.json",
+  "title": "SOS AI refinement output",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "patches", "observations", "validation"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "patches": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "required": ["function_id", "replacement", "evidence"],
+        "properties": {
+          "function_id": {"type": "string", "minLength": 1},
+          "replacement": {"type": "string", "maxLength": 65536},
+          "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence_ref"}}
+        }
+      }
+    },
+    "observations": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "required": ["kind", "value", "evidence"],
+        "properties": {
+          "kind": {"enum": ["log_contains", "cpi_target", "status", "return_data_base64"]},
+          "value": {"type": "string", "maxLength": 512},
+          "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence_ref"}}
+        }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "required": ["status", "notes"],
+      "properties": {
+        "status": {"enum": ["validated", "unverified", "rejected", "not_available"]},
+        "notes": {"type": "array", "items": {"type": "string", "maxLength": 2048}}
+      }
+    }
+  },
+  "$defs": {
+    "evidence_ref": {
+      "type": "object",
+      "required": ["source", "location"],
+      "properties": {
+        "source": {"type": "string"},
+        "location": {"type": "string"},
+        "detail": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

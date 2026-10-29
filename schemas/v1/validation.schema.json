@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sos-decompiler.dev/schema/v1/validation.schema.json",
+  "title": "SOS candidate validation bundle",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "artifact_sha256",
+    "refinement_output_sha256",
+    "compilation",
+    "behavioral_status",
+    "behavioral_evidence",
+    "behavioral_mismatches",
+    "repair",
+    "limitations"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "artifact_sha256": {"type": ["string", "null"]},
+    "refinement_output_sha256": {"type": ["string", "null"]},
+    "compilation": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "status",
+        "compiler",
+        "source_sha256",
+        "diagnostics",
+        "limitations"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "status": {"enum": ["passed", "failed", "timed_out", "not_available"]},
+        "compiler": {"type": ["string", "null"]},
+        "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "limitations": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "behavioral_status": {
+      "enum": ["not_requested", "not_available", "behaviorally_validated", "mismatch", "unverified"]
+    },
+    "behavioral_evidence": {"type": "array", "items": {"type": "string"}},
+    "behavioral_mismatches": {"type": "array", "items": {"type": "string"}},
+    "repair": {
+      "type": ["object", "null"],
+      "required": ["schema_version", "model", "prompt_version", "status", "rounds", "final_output", "limitations"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "model": {"type": "string"},
+        "prompt_version": {"type": "string"},
+        "status": {
+          "enum": ["behaviorally_validated", "compiled_unverified", "exhausted", "not_available", "rejected"]
+        },
+        "rounds": {"type": "array", "maxItems": 8},
+        "final_output": {"type": ["object", "null"]},
+        "limitations": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "limitations": {"type": "array", "items": {"type": "string"}}
+  }
+}

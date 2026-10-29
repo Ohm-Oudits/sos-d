@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sos-analysis",
+    "crates/sos-ai",
+    "crates/sos-artifact",
+    "crates/sos-core",
+    "crates/sos-cli",
+    "crates/sos-loader",
+    "crates/sos-rpc",
+    "crates/sos-replay",
+    "crates/sos-report",
+    "crates/sos-solana",
+    "crates/sos-storage",
+    "crates/sos-types",
+    "programs/hello-world",
+    "programs/native-abi",
+    "programs/pinocchio-fixture",
+    "programs/anchor-fixture",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"

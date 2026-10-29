@@ -1,0 +1,71 @@
+version = 1
+
+[[fixture]]
+name = "sos-hello-world"
+category = "native-rust"
+source = "programs/hello-world/src/lib.rs"
+artifact = "target/deploy/sos_hello_world.so"
+optimization = "release"
+status = "available"
+
+[[fixture]]
+name = "sos-native-abi"
+category = "native-rust"
+source = "programs/native-abi/src/lib.rs"
+artifact = "target/deploy/sos_native_abi.so"
+optimization = "release"
+status = "available"
+
+[[fixture]]
+name = "sos-pinocchio-fixture"
+category = "pinocchio"
+source = "programs/pinocchio-fixture/src/lib.rs"
+artifact = "target/deploy/sos_pinocchio_fixture.so"
+optimization = "release"
+status = "available"
+notes = "Pinned Pinocchio 0.9.0 fixture; build requires the Solana SBF toolchain."
+
+[[fixture]]
+name = "sos-anchor-fixture"
+category = "anchor"
+source = "programs/anchor-fixture/src/lib.rs"
+artifact = "target/deploy/sos_anchor_fixture.so"
+optimization = "release"
+status = "available"
+notes = "Pinned Anchor 0.31.1 fixture; build requires the Solana SBF toolchain."
+
+[[fixture]]
+name = "sos-c-fixture"
+category = "c"
+source = "programs/c-fixture/src/sos_c_fixture/sos_c_fixture.c"
+artifact = "target/deploy/sos_c_fixture.so"
+optimization = "release"
+status = "available"
+notes = "Built with the active Solana platform-tools C/SBF SDK; see fixtures/c/fixture.toml."
+
+[[fixture]]
+name = "anchor-reference"
+category = "anchor"
+source = "external/corpus/anchor-reference"
+artifact = "external/corpus/anchor-reference.so"
+optimization = "release"
+status = "planned"
+notes = "Add a pinned source/build recipe before publishing accuracy metrics."
+
+[[fixture]]
+name = "pinocchio-reference"
+category = "pinocchio"
+source = "external/corpus/pinocchio-reference"
+artifact = "external/corpus/pinocchio-reference.so"
+optimization = "release"
+status = "planned"
+notes = "Add a pinned source/build recipe before publishing accuracy metrics."
+
+[[fixture]]
+name = "c-reference"
+category = "c"
+source = "external/corpus/c-reference"
+artifact = "external/corpus/c-reference.so"
+optimization = "release"
+status = "planned"
+notes = "Requires a pinned C-to-SBF toolchain and source license review."

@@ -1,0 +1,9 @@
+version = 1
+name = "sos-pinocchio-fixture"
+category = "pinocchio"
+framework_version = "0.9.0"
+source = "programs/pinocchio-fixture/src/lib.rs"
+artifact = "target/deploy/sos_pinocchio_fixture.so"
+optimization = "release"
+status = "available"
+semantic_targets = ["explicit_tag_dispatch", "signer_check", "owner_check", "log_syscall"]

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sos-decompiler.dev/schema/v1/evidence-pack.json",
+  "title": "SOS AI evidence pack",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "task", "analysis", "ir", "semantics", "untrusted_evidence"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "task": { "type": "string" },
+    "artifact_sha256": { "type": ["string", "null"] },
+    "analysis": { "$ref": "static-analysis.schema.json" },
+    "ir": { "$ref": "canonical-ir.schema.json" },
+    "semantics": { "type": "object", "required": ["schema_version"], "properties": { "schema_version": { "const": 1 } } },
+    "untrusted_evidence": { "type": "array", "items": { "type": "object", "required": ["source", "content"] } }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "program_address": "local-artifact",
+  "cluster": null,
+  "rpc_endpoint_id": null,
+  "commitment": null,
+  "context_slot": null,
+  "requested_slot": null,
+  "loader": "legacy-bpf",
+  "programdata_address": null,
+  "deployment_slot": null,
+  "upgrade_authority": null,
+  "raw_account_data_length": 17888,
+  "elf_offset": 0,
+  "elf_length": 17888,
+  "raw_account_sha256": "b6c63b496be93fe679f2382899d4cc006532f52468f28e2d939f1cf5b0ec46d0",
+  "elf_sha256": "b6c63b496be93fe679f2382899d4cc006532f52468f28e2d939f1cf5b0ec46d0",
+  "sbpf_version": null,
+  "sos_version": "0.1.0",
+  "analysis_schema_version": 1
+}

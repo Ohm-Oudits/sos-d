@@ -1,0 +1,9 @@
+name = "sos-native-abi"
+source = "programs/native-abi/src/lib.rs"
+artifact = "target/deploy/sos_native_abi.so"
+loader = "upgradeable-v3-or-legacy-direct"
+framework = "native-rust"
+expected_elf_machine = 263
+expected_sbpf = true
+semantic_targets = ["instruction_tag", "signer_check", "owner_check", "log_candidate"]
+notes = "Native Rust fixture with explicit instruction dispatch and account validation."

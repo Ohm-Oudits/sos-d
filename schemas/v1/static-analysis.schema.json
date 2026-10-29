@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sos-decompiler.dev/schema/v1/static-analysis.json",
+  "title": "SOS deterministic static analysis",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version", "sbpf_version", "entrypoint", "instructions", "functions",
+    "basic_blocks", "memory_accesses", "stack_accesses", "strings",
+    "public_key_candidates", "immediate_constants", "register_uses", "calls",
+    "relocations", "sccs", "dataflow_edges", "verifier_diagnostics"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "sbpf_version": { "type": "string", "minLength": 1 },
+    "entrypoint": { "type": "integer", "minimum": 0 },
+    "instructions": { "type": "array", "items": { "type": "object" } },
+    "functions": { "type": "array", "items": { "type": "object" } },
+    "basic_blocks": { "type": "array", "items": { "type": "object" } },
+    "memory_accesses": { "type": "array", "items": { "type": "object" } },
+    "stack_accesses": { "type": "array", "items": { "type": "object" } },
+    "strings": { "type": "array", "items": { "type": "object" } },
+    "public_key_candidates": { "type": "array", "items": { "type": "object" } },
+    "immediate_constants": { "type": "array", "items": { "type": "object" } },
+    "register_uses": { "type": "array", "items": { "type": "object" } },
+    "calls": { "type": "array", "items": { "type": "object" } },
+    "relocations": { "type": "array", "items": { "type": "object" } },
+    "sccs": { "type": "array", "items": { "type": "object" } },
+    "dataflow_edges": { "type": "array", "items": { "type": "object" } },
+    "verifier_diagnostics": { "type": "array", "items": { "type": "string" } }
+  }
+}

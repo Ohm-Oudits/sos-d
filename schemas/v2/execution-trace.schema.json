@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sos-decompiler.dev/schema/v2/execution-trace.json",
+  "title": "SOS replay execution trace",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version", "transaction_signature", "status", "error", "logs",
+    "compute_units", "cpis", "account_diffs", "return_data_base64", "path_coverage",
+    "transaction_slot", "account_state", "limitations"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "transaction_signature": { "type": "string" },
+    "status": { "enum": ["success", "failure", "not_available", "unverified"] },
+    "error": { "type": ["string", "null"] },
+    "logs": { "type": "array", "items": { "type": "string" } },
+    "compute_units": { "type": ["integer", "null"], "minimum": 0 },
+    "cpis": { "type": "array", "items": { "type": "object" } },
+    "account_diffs": { "type": "array", "items": { "type": "object" } },
+    "return_data_base64": { "type": ["string", "null"] },
+    "path_coverage": { "type": "array", "items": { "type": "integer", "minimum": 0 } },
+    "transaction_slot": { "type": ["integer", "null"], "minimum": 0 },
+    "account_state": { "type": "array", "items": { "type": "object" } },
+    "limitations": { "type": "array", "items": { "type": "string" } },
+    "behavioral_comparison": { "type": ["object", "null"] }
+  }
+}

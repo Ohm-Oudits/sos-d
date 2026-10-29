@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sos-decompiler.dev/schema/v1/security-report.json",
+  "title": "SOS evidence-backed security report",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "findings"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["detector_id", "severity", "confidence", "title", "description", "instruction_pcs", "status", "evidence", "limitations"]
+      }
+    }
+  }
+}

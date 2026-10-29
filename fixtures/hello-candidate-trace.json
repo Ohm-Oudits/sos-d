@@ -1,0 +1,16 @@
+{
+  "schema_version": 2,
+  "transaction_signature": "sos-candidate-observation-fixture",
+  "status": "success",
+  "error": null,
+  "logs": ["Program log: SOS hello world"],
+  "compute_units": 42,
+  "cpis": [],
+  "account_diffs": [],
+  "return_data_base64": null,
+  "path_coverage": [0],
+  "transaction_slot": 1,
+  "account_state": [],
+  "limitations": ["synthetic trace fixture for candidate-observation validation"],
+  "behavioral_comparison": null
+}

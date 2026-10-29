@@ -1,0 +1,280 @@
+# SOS Decompiler
+
+Open-source, read-only Solana program reverse engineering from a deployed program
+address. The architecture is documented in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+This repository contains native Rust/SBF, low-level native-ABI, and Pinocchio
+fixtures that can be used to test the pipeline across implementation styles:
+
+```text
+source Rust -> deployable .so -> fetch by program address -> ELF/sBPF analysis
+```
+
+## Prerequisites
+
+The example expects the Solana/Agave SBF toolchain:
+
+```bash
+solana --version
+cargo-build-sbf --version
+```
+
+The build is pinned to the `solana-program` 2.x SDK because Solana CLI 3.0's SBF
+toolchain uses a Rust/Cargo version that predates edition-2024 support. The program
+does not require Anchor.
+
+## Build the example `.so`
+
+```bash
+cargo-build-sbf --manifest-path programs/hello-world/Cargo.toml
+```
+
+The deployable artifact is written to:
+
+```text
+target/deploy/sos_hello_world.so
+```
+
+Inspect it locally with:
+
+```bash
+file target/deploy/sos_hello_world.so
+shasum -a 256 target/deploy/sos_hello_world.so
+```
+
+For an on-chain program, `solana program dump` accepts the deployed address and
+writes the executable bytes to a local file:
+
+```bash
+solana program dump --url localhost <PROGRAM_ADDRESS> /tmp/sos-hello-world.dump.so
+```
+
+## Deploy to a local validator
+
+Start a local validator in another terminal:
+
+```bash
+solana-test-validator
+```
+
+Then deploy the fixture:
+
+```bash
+solana config set --url http://127.0.0.1:8899
+solana program deploy target/deploy/sos_hello_world.so
+```
+
+Run the address-first acquisition, deterministic analysis, and four-stage local
+model pipeline against a fresh validator with:
+
+```bash
+./scripts/test-local-inspect.sh
+```
+
+The Rust core scaffold can already inspect the generated ELF header:
+
+```bash
+cargo run -p sos-cli -- artifact-info target/deploy/sos_hello_world.so
+```
+
+Expected output includes:
+
+```text
+machine=0x107
+sbpf=true
+```
+
+The command prints the deployed program address. That address is the only chain
+identifier the SOS inspection command needs:
+
+```bash
+sos inspect <PROGRAM_ADDRESS> --rpc-url http://127.0.0.1:8899 --commitment processed
+```
+
+The implemented Phase 1 fetch path can already resolve a deployed address through
+the upgradeable loader, fetch its ProgramData account, extract the ELF, hash it, and
+write a content-addressed artifact plus manifest. It also creates an idempotent
+`metadata.sqlite` index containing the provenance-aware artifact ID:
+
+```bash
+cargo run -p sos-cli -- fetch <PROGRAM_ADDRESS> \
+  --rpc-url http://127.0.0.1:8899 \
+  --commitment processed \
+  --out ./artifacts
+```
+
+The inspection path composes fetching with deterministic SBPF analysis and writes an
+`analysis.json`, `ir.json`, `semantics.json`, `security.json`, `report.md`, and
+CFG-faithful `pseudocode.rs` alongside the content-addressed artifact:
+
+```bash
+cargo run -p sos-cli -- inspect <PROGRAM_ADDRESS> \
+  --cluster localnet \
+  --rpc-url http://127.0.0.1:8899 \
+  --commitment processed \
+  --out ./reports/<PROGRAM_ADDRESS>
+```
+
+Add `--history N` to save available transaction signatures and parsed transaction
+evidence as `history.json`. Missing archive state is recorded as `not_available` and
+does not prevent static analysis.
+
+`inspect --replay` selects the latest available program transaction; pass
+`--signature SIGNATURE` to select a specific transaction. If exact historical account
+state is unavailable, `replay.json` records `not_available` without substituting
+current account state.
+
+The address-first workflow can also invoke an explicitly configured local model
+adapter. It runs structure recovery, semantic labeling, explanation, and bounded
+refinement through the same gateway, writing a versioned per-stage audit bundle to
+`model.json`. Without a command, `--model` records `not_available` for every stage
+rather than contacting a hosted service:
+
+When a model is requested, `ai-report.md` is emitted alongside `model.json`; it is
+explicitly labeled as untrusted hypothesis output and retains each claim's evidence.
+
+```bash
+sos inspect <PROGRAM_ADDRESS> \
+  --rpc-url http://127.0.0.1:8899 \
+  --out ./reports/<PROGRAM_ADDRESS> \
+  --model local \
+  --model-command ./fixtures/echo-model.sh
+
+# Optional external validation and bounded repair in the same address-first run:
+sos inspect <PROGRAM_ADDRESS> \
+  --rpc-url http://127.0.0.1:8899 \
+  --out ./reports/<PROGRAM_ADDRESS> \
+  --model local \
+  --model-command ./fixtures/repair-model.sh \
+  --validate --repair --repair-rounds 3 \
+  --validation-trace ./trace.json
+```
+
+Analyze an already downloaded ELF into a reusable analysis directory:
+
+```bash
+sos analyze ./program.so --out ./analysis
+sos analyze ./program.so --out ./analysis --json
+sos detect ./analysis --out ./analysis/security.json
+sos detect ./analysis --format sarif --out ./analysis/security.sarif
+sos validate ./analysis --compiler rustc --trace ./trace.json --out ./analysis/validation.json
+sos validate ./analysis --compiler rustc --trace ./trace.json \
+  --repair --model-command ./fixtures/repair-model.sh --repair-rounds 3 \
+  --out ./analysis/validation.json
+sos decompile ./analysis --format rust-like --out ./analysis/pseudocode.rs
+sos decompile ./analysis --format c-like --out ./analysis/pseudocode.c
+sos report ./analysis --format json --out ./analysis/report.json
+sos report ./analysis --format graphviz --out ./analysis/cfg.dot
+sos explain ./analysis --model-command ./fixtures/echo-model.sh --out ./analysis/explanation.json
+```
+
+Hosted providers can implement the same provider-neutral JSON protocol through an
+HTTP endpoint:
+
+```bash
+sos explain ./analysis --model hosted --model-endpoint http://127.0.0.1:8080/generate
+```
+
+For repeatable evaluation, benchmark an artifact directly. The command records
+artifact and analysis hashes, structural/semantic/security counts, and whether
+repeated analysis runs are byte-identical:
+
+```bash
+sos benchmark ./program.so --repeats 3 --out ./benchmark.json
+```
+
+Build the currently available fixture corpus with:
+
+```bash
+./scripts/build-fixtures.sh
+```
+
+The corpus manifest is [fixtures/corpus.toml](<fixtures/corpus.toml>); the
+Pinocchio 0.9.0 and Anchor 0.31.1 fixtures are buildable with the pinned SBF
+toolchain, and the C fixture is built through the active platform-tools C/SBF
+SDK. The remaining reference entries are explicitly marked `planned` until
+their source/build recipes are pinned and reproducible.
+
+If authentication is required, `SOS_MODEL_TOKEN` is sent as a bearer token and is
+never written into reports.
+
+Replay accepts an address and transaction signature. It always records the exact
+transaction evidence and attaches a conservative semantic comparison. The default
+build emits an explicit `not_available` trace.
+For local isolated execution, build the CLI with its explicit LiteSVM feature; the
+command hydrates the transaction's account keys at the selected slot before
+simulation:
+
+```bash
+cargo run -p sos-cli --features litesvm -- \
+  replay <PROGRAM_ADDRESS> --signature <SIGNATURE> --out ./trace.json
+```
+
+The replay backend can also be exercised locally against the checked-in fixture:
+
+```bash
+cargo run -p sos-replay --features litesvm --example litesvm_fixture
+```
+
+The current implementation is an end-to-end, evidence-preserving decompiler
+foundation: deterministic recovery is always available, AI refinement is optional,
+and candidate source is never executed as proof. The normative requirements are in
+[SPEC.md](SPEC.md), and the milestone gates are in [PLAN.md](PLAN.md).
+
+Contribution and vulnerability-reporting guidance is available in
+[CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). The workspace
+declares Apache-2.0 in its Cargo metadata, and the repository is licensed under
+Apache-2.0; see [LICENSE](LICENSE).
+
+Use `finalized` for production RPCs. A just-deployed local-validator account may
+need `processed` or `confirmed` until it reaches the requested commitment.
+Pinned-slot replay requires an RPC/archive provider that returns account data at
+the exact requested context slot; a merely newer `minContextSlot` response is
+recorded as historical state unavailable.
+
+## Repository layout
+
+```text
+ARCHITECTURE.md                 research and system design
+SPEC.md                         normative product and trust specification
+PLAN.md                         phased implementation plan and acceptance gates
+LICENSE                         Apache-2.0 license
+CONTRIBUTING.md                 contribution and validation guidance
+SECURITY.md                     security reporting and threat boundaries
+crates/sos-types/               versioned manifests and evidence contracts
+crates/sos-artifact/            hashing, manifests, content-addressed storage
+crates/sos-rpc/                 provider-neutral and JSON-RPC contracts
+crates/sos-storage/             filesystem-independent SQLite metadata index
+crates/sos-replay/              versioned execution traces and replay boundary
+  examples/litesvm_fixture.rs   successful local replay acceptance fixture
+crates/sos-loader/              loader-v2/v3/v4 adapter boundaries
+crates/sos-analysis/            deterministic analysis, IR, and public-key candidates
+crates/sos-ai/                  bounded model gateway and evidence validation
+schemas/v1/                    public JSON contracts for manifests, analysis, IR, semantics, evidence, refinement, validation, and reports
+fuzz/                           offline cargo-fuzz targets for parser boundaries
+.github/workflows/ci.yml        host checks and opt-in pinned SBF fixture CI
+fixtures/echo-model.sh         local model-provider protocol fixture
+fixtures/compile-model.sh      refinement fixture for external candidate compilation
+fixtures/repair-model.sh       bounded mismatch-driven repair fixture
+fixtures/corpus.toml            labeled fixture corpus manifest
+crates/sos-solana/              syscall, protocol, and Solana semantic candidates
+crates/sos-report/              Markdown, pseudocode, and SARIF renderers
+crates/sos-cli/                 CLI entrypoint
+programs/hello-world/           native Rust/SBF fixture
+programs/native-abi/            native Rust/SBF dispatch and account-check fixture
+programs/pinocchio-fixture/     pinned Pinocchio framework fixture
+programs/anchor-fixture/        pinned Anchor framework fixture
+  Cargo.toml
+  src/lib.rs
+programs/c-fixture/             pinned C/SBF ABI fixture
+  README.md
+  src/sos_c_fixture/sos_c_fixture.c
+Cargo.toml                      workspace and release profile
+```
+
+## Design boundary
+
+The hello-world source is a known-good fixture, not a decompiler implementation. It
+gives us a controlled binary/source pair for tests. The decompiler must still treat
+the deployed `.so` as the source of truth and must label reconstructed names and
+types as hypotheses unless supported by bytecode or observed execution evidence.

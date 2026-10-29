@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sos-decompiler.dev/schema/v1/semantic-analysis.json",
+  "title": "SOS Solana semantic analysis",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version", "syscalls", "dispatch_candidates", "instruction_candidates",
+    "argument_candidates", "cpi_candidates", "pda_candidates", "framework_candidates",
+    "input_field_candidates", "account_candidates", "account_field_candidates",
+    "runtime_abi", "string_candidates", "constant_candidates", "protocol_fingerprints",
+    "validation_checks", "error_candidates", "log_candidates", "evidence"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "syscalls": { "type": "array", "items": { "type": "object" } },
+    "dispatch_candidates": { "type": "array", "items": { "type": "object" } },
+    "instruction_candidates": { "type": "array", "items": { "type": "object" } },
+    "argument_candidates": { "type": "array", "items": { "type": "object" } },
+    "cpi_candidates": { "type": "array", "items": { "type": "object" } },
+    "pda_candidates": { "type": "array", "items": { "type": "object" } },
+    "framework_candidates": { "type": "array", "items": { "type": "object" } },
+    "input_field_candidates": { "type": "array", "items": { "type": "object" } },
+    "account_candidates": { "type": "array", "items": { "type": "object" } },
+    "account_field_candidates": { "type": "array", "items": { "type": "object" } },
+    "runtime_abi": { "type": "array", "items": { "type": "object" } },
+    "string_candidates": { "type": "array", "items": { "type": "object" } },
+    "constant_candidates": { "type": "array", "items": { "type": "object" } },
+    "protocol_fingerprints": { "type": "array", "items": { "type": "object" } },
+    "validation_checks": { "type": "array", "items": { "type": "object" } },
+    "error_candidates": { "type": "array", "items": { "type": "object" } },
+    "log_candidates": { "type": "array", "items": { "type": "object" } },
+    "evidence": { "type": "array", "items": { "type": "object" } }
+  }
+}

@@ -1,0 +1,9 @@
+version = 1
+name = "sos-anchor-fixture"
+category = "anchor"
+framework_version = "0.31.1"
+source = "programs/anchor-fixture/src/lib.rs"
+artifact = "target/deploy/sos_anchor_fixture.so"
+optimization = "release"
+status = "available"
+semantic_targets = ["anchor_discriminators", "account_discriminator", "signer_check", "owner_check", "error_code", "log_syscall"]

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sos-decompiler.dev/schema/v1/report.json",
+  "title": "SOS JSON report bundle",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "analysis", "semantics"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "artifact_sha256": { "type": ["string", "null"] },
+    "analysis": { "$ref": "static-analysis.schema.json" },
+    "semantics": { "type": "object", "required": ["schema_version"] },
+    "security": { "type": ["object", "null"] },
+    "pseudocode": { "type": ["string", "null"] }
+  }
+}

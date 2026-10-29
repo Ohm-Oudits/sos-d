@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sos-decompiler.dev/schema/v1/canonical-ir.json",
+  "title": "SOS canonical IR",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "functions", "blocks", "operations", "sccs"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "functions": { "type": "array", "items": { "type": "object" } },
+    "blocks": { "type": "array", "items": { "type": "object" } },
+    "operations": { "type": "array", "items": { "type": "object" } },
+    "sccs": { "type": "array", "items": { "type": "object" } }
+  }
+}
