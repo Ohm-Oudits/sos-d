@@ -2838,6 +2838,11 @@ fn validate_structured_consistency(
         ModelTask::StructureRecovery | ModelTask::PseudocodeHumanization => {
             let parsed: StructureRecoveryOutput = serde_json::from_value(output.clone())
                 .map_err(|error| AiError::InvalidResponse(error.to_string()))?;
+            if !known_functions.is_empty() && parsed.functions.is_empty() {
+                return Err(AiError::InvalidResponse(
+                    "structure recovery returned no candidate for a known IR function".into(),
+                ));
+            }
             for function in parsed.functions {
                 if !known_functions.contains(function.function_id.as_str()) {
                     return Err(AiError::InvalidResponse(format!(
@@ -2850,6 +2855,11 @@ fn validate_structured_consistency(
         ModelTask::SignatureRecovery => {
             let parsed: SignatureRecoveryOutput = serde_json::from_value(output.clone())
                 .map_err(|error| AiError::InvalidResponse(error.to_string()))?;
+            if !known_functions.is_empty() && parsed.signatures.is_empty() {
+                return Err(AiError::InvalidResponse(
+                    "signature recovery returned no candidate for a known IR function".into(),
+                ));
+            }
             if parsed.signatures.len() > 128 {
                 return Err(AiError::InvalidResponse(
                     "signature recovery contains more than 128 signatures".into(),
@@ -3363,9 +3373,38 @@ mod tests {
 
     impl ModelProvider for EchoProvider {
         fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
+            let function_id = request
+                .evidence_pack
+                .ir
+                .functions
+                .first()
+                .map(|function| function.id.clone())
+                .unwrap_or_else(|| "fn_0".into());
+            let function_evidence = serde_json::json!({
+                "source": "ir",
+                "location": format!("function:{function_id}"),
+                "detail": "bounded IR function"
+            });
             let structured_output = match request.task {
-                ModelTask::StructureRecovery => serde_json::json!({"functions": []}),
-                ModelTask::SignatureRecovery => serde_json::json!({"signatures": []}),
+                ModelTask::StructureRecovery | ModelTask::PseudocodeHumanization => {
+                    serde_json::json!({
+                        "functions": [{
+                            "function_id": function_id,
+                            "pseudocode": format!("fn {function_id}() {{ unknown_semantics(); }}"),
+                            "evidence": [function_evidence]
+                        }]
+                    })
+                }
+                ModelTask::SignatureRecovery => serde_json::json!({
+                    "signatures": [{
+                        "function_id": function_id,
+                        "function_name": "recovered_function",
+                        "return_type": "unknown",
+                        "parameters": [],
+                        "confidence": 0.1,
+                        "evidence": [function_evidence]
+                    }]
+                }),
                 ModelTask::SemanticLabeling => serde_json::json!({"labels": []}),
                 ModelTask::Explanation => serde_json::json!({
                     "summary": "No additional explanation was generated.",
@@ -3375,9 +3414,6 @@ mod tests {
                     "patches": [],
                     "validation": {"status": "not_available", "notes": []}
                 }),
-                ModelTask::PseudocodeHumanization => {
-                    serde_json::json!({"functions": []})
-                }
             };
             Ok(ModelResponse {
                 task: request.task,
@@ -4053,6 +4089,32 @@ mod tests {
         no_evidence["signatures"][0]["function_id"] = serde_json::json!("fn_0");
         no_evidence["signatures"][0]["evidence"] = serde_json::json!([]);
         assert!(structured_evidence_refs(ModelTask::SignatureRecovery, &no_evidence).is_err());
+    }
+
+    #[test]
+    fn scoped_structure_and_signature_recovery_reject_empty_candidates() {
+        for (task, output) in [
+            (
+                ModelTask::StructureRecovery,
+                serde_json::json!({"functions": []}),
+            ),
+            (
+                ModelTask::SignatureRecovery,
+                serde_json::json!({"signatures": []}),
+            ),
+        ] {
+            let mut pack = empty_pack();
+            pack.task = task;
+            let request = ModelRequest {
+                task,
+                prompt_version: "v1".into(),
+                model: "test".into(),
+                evidence_pack: pack,
+                max_output_bytes: 10_000,
+                max_output_tokens: 1_200,
+            };
+            assert!(validate_structured_consistency(&request, &output).is_err());
+        }
     }
 
     #[test]

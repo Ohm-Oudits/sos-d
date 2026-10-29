@@ -106,6 +106,10 @@ The parallel `--structure-tokens`, `--signature-tokens`, `--semantic-tokens`,
 `--explanation-tokens`, and `--refinement-tokens` flags bound generated output;
 the selected budget is sent to the provider, recorded in AI bundle schema v3,
 and included in checkpoint validation.
+The local GPT-OSS adapter selects Ollama's `low` reasoning mode so reasoning
+tokens leave room for final schema-constrained JSON. Structure and signature
+schemas require a candidate for every scoped IR function; an empty array is not
+treated as successful decompilation.
 
 ## Running a lift
 

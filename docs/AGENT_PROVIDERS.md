@@ -69,6 +69,10 @@ Token overrides must be between 128 and 32,768. SOS sends the selected value to
 Ollama as `num_predict` and to hosted APIs through their corresponding maximum
 output-token field. It is also stored in the stage audit and checkpoint request
 identity. This makes Patina-style stage budgets enforceable and reproducible.
+For GPT-OSS through Ollama, SOS requests the model's supported `low` reasoning
+level so hidden reasoning does not consume the entire bounded generation before
+final JSON. If that still occurs, the stage is rejected with an explicit token-
+budget diagnostic rather than accepting empty output.
 
 For example, an API provider can use a stronger reconstruction/refinement model
 and a smaller labeling/explanation model:
