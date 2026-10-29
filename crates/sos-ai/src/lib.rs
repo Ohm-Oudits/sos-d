@@ -452,6 +452,12 @@ impl EvidencePack {
             .take(limits.max_semantic_items)
             .cloned()
             .collect();
+        bounded_semantics.stack_account_field_candidates = semantics
+            .stack_account_field_candidates
+            .iter()
+            .take(limits.max_semantic_items)
+            .cloned()
+            .collect();
         bounded_semantics.string_candidates = semantics
             .string_candidates
             .iter()

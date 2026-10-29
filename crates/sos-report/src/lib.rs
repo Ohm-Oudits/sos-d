@@ -128,6 +128,28 @@ pub fn render_markdown(analysis: &StaticAnalysis, semantics: &SemanticAnalysis) 
         output.push_str("No LDDW immediate constants were identified.\n");
     }
     output.push('\n');
+    output.push_str("## Recovered stack account fields\n\n");
+    if semantics.stack_account_field_candidates.is_empty() {
+        output.push_str("No complete SolAccountInfo stack layouts were recovered.\n");
+    } else {
+        for field in semantics.stack_account_field_candidates.iter().take(128) {
+            output.push_str(&format!(
+                "- `r10{:+}`: `accounts[{}].{}` width `{}`; accesses `{}` (`{:?}`).\n",
+                field.frame_offset,
+                field.account_index,
+                field.field,
+                field.width,
+                field
+                    .access_pcs
+                    .iter()
+                    .map(|pc| format!("0x{pc:x}"))
+                    .collect::<Vec<_>>()
+                    .join("`, `"),
+                field.status
+            ));
+        }
+    }
+    output.push('\n');
     output.push_str("## Recovered Solana return codes\n\n");
     if semantics.runtime_error_candidates.is_empty() {
         output.push_str("No exact Solana built-in error values were recovered.\n");
@@ -724,6 +746,55 @@ fn render_instruction(
         output.push_str(&format!(
             "{padding}r{} = {};\n",
             instruction.dst, candidate.name
+        ));
+        return;
+    }
+    let validation_load = semantics
+        .validation_checks
+        .iter()
+        .find(|check| check.load_pc == instruction.pc && check.account_field.is_some());
+    if let Some(check) = validation_load {
+        let account_index = check.account_index.unwrap_or_default();
+        let field = check.account_field.as_deref().unwrap_or("unknown_flag");
+        let variable = format!("account_{account_index}_{field}");
+        let comment_prefix = if c_like { "/*" } else { "//" };
+        let comment_suffix = if c_like { " */" } else { "" };
+        output.push_str(&format!(
+            "{padding}{comment_prefix} 0x{:x}: recovered SolAccountInfo stack field; evidence: analysis/instruction:0x{:x}{comment_suffix}\n",
+            instruction.pc, instruction.pc
+        ));
+        if c_like {
+            output.push_str(&format!(
+                "{padding}bool {variable} = accounts[{account_index}].{field};\n"
+            ));
+        } else {
+            output.push_str(&format!(
+                "{padding}let {variable} = accounts[{account_index}].{field};\n"
+            ));
+        }
+        return;
+    }
+    let validation_branch = semantics.validation_checks.iter().find(|check| {
+        check.branch_pc == instruction.pc
+            && check.account_field.is_some()
+            && check.compared_value == Some(1)
+    });
+    if let Some(check) = validation_branch {
+        let account_index = check.account_index.unwrap_or_default();
+        let field = check.account_field.as_deref().unwrap_or("unknown_flag");
+        let variable = format!("account_{account_index}_{field}");
+        let failure = check
+            .nearby_runtime_error
+            .as_deref()
+            .unwrap_or("UNKNOWN_GUARD_FAILURE");
+        let comment_prefix = if c_like { "/*" } else { "//" };
+        let comment_suffix = if c_like { " */" } else { "" };
+        output.push_str(&format!(
+            "{padding}{comment_prefix} 0x{:x}: recovered boolean account guard; evidence: analysis/instruction:0x{:x}{comment_suffix}\n",
+            instruction.pc, instruction.pc
+        ));
+        output.push_str(&format!(
+            "{padding}if !{variable} {{ return {failure}; }}\n"
         ));
         return;
     }

@@ -79,6 +79,17 @@ pub struct AccountFieldCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackAccountFieldCandidate {
+    pub account_index: usize,
+    pub field: String,
+    pub frame_offset: i16,
+    pub width: u8,
+    pub access_pcs: Vec<usize>,
+    pub status: EvidenceStatus,
+    pub evidence: Vec<EvidenceRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorCandidate {
     pub offset: usize,
     pub value: String,
@@ -273,6 +284,10 @@ pub struct ValidationCheckCandidate {
     pub compared_value: Option<i64>,
     #[serde(default)]
     pub nearby_runtime_error: Option<String>,
+    #[serde(default)]
+    pub account_index: Option<usize>,
+    #[serde(default)]
+    pub account_field: Option<String>,
     pub interpretations: Vec<String>,
     pub status: EvidenceStatus,
     pub evidence: Vec<EvidenceRef>,
@@ -295,6 +310,8 @@ pub struct SemanticAnalysis {
     pub account_candidates: Vec<AccountCandidate>,
     #[serde(default)]
     pub account_field_candidates: Vec<AccountFieldCandidate>,
+    #[serde(default)]
+    pub stack_account_field_candidates: Vec<StackAccountFieldCandidate>,
     pub runtime_abi: Vec<RuntimeAbiField>,
     pub string_candidates: Vec<StringCandidate>,
     pub constant_candidates: Vec<ConstantCandidate>,
@@ -826,7 +843,9 @@ pub fn analyze_with_registry(
     let constant_candidates = constant_candidates(analysis, &mut evidence);
     let runtime_error_candidates = runtime_error_candidates(analysis, &mut evidence);
     let protocol_fingerprints = protocol_fingerprints(analysis, protocols, &mut evidence);
-    let validation_checks = validation_checks(analysis, &mut evidence);
+    let stack_account_field_candidates = stack_account_fields(analysis, &mut evidence);
+    let validation_checks =
+        validation_checks(analysis, &stack_account_field_candidates, &mut evidence);
 
     for (instruction_index, instruction) in analysis.instructions.iter().enumerate() {
         if is_syscall(instruction) {
@@ -952,6 +971,7 @@ pub fn analyze_with_registry(
         input_field_candidates,
         account_candidates,
         account_field_candidates,
+        stack_account_field_candidates,
         runtime_abi: runtime_abi(),
         string_candidates,
         constant_candidates,
@@ -1218,6 +1238,7 @@ fn builtin_protocols() -> &'static [(&'static str, &'static str, &'static str)] 
 
 fn validation_checks(
     analysis: &StaticAnalysis,
+    stack_fields: &[StackAccountFieldCandidate],
     evidence: &mut Vec<EvidenceItem>,
 ) -> Vec<ValidationCheckCandidate> {
     let instruction_indices = analysis
@@ -1287,6 +1308,21 @@ fn validation_checks(
             if let Some(name) = nearby_runtime_error.as_deref() {
                 interpretations.push(format!("nearby_return_candidate:{name}"));
             }
+            let stack_field = (load.base_register == ebpf::FRAME_PTR_REG as u8)
+                .then(|| {
+                    stack_fields
+                        .iter()
+                        .find(|field| field.frame_offset == load.offset)
+                })
+                .flatten();
+            let account_index = stack_field.map(|field| field.account_index);
+            let account_field = stack_field.map(|field| field.field.clone());
+            if let Some(field) = stack_field {
+                interpretations.push(format!(
+                    "recovered_account_field:account[{}].{}",
+                    field.account_index, field.field
+                ));
+            }
             let mut evidence_refs = vec![memory_ref(load), instruction_ref(branch)];
             if let Some((constant, _)) = nearby_error {
                 evidence_refs.push(constant_ref(constant));
@@ -1300,6 +1336,8 @@ fn validation_checks(
                 comparison,
                 compared_value,
                 nearby_runtime_error,
+                account_index,
+                account_field,
                 interpretations,
                 status: EvidenceStatus::Hypothesis,
                 evidence: evidence_refs.clone(),
@@ -1315,6 +1353,8 @@ fn validation_checks(
                     "comparison": check.comparison,
                     "compared_value": check.compared_value,
                     "nearby_runtime_error": check.nearby_runtime_error,
+                    "account_index": check.account_index,
+                    "account_field": check.account_field,
                     "interpretations": check.interpretations,
                 }),
                 confidence: Some(0.45),
@@ -1326,6 +1366,100 @@ fn validation_checks(
         }
     }
     checks
+}
+
+fn stack_account_fields(
+    analysis: &StaticAnalysis,
+    evidence: &mut Vec<EvidenceItem>,
+) -> Vec<StackAccountFieldCandidate> {
+    const LAYOUT: [(&str, i16, u8); 9] = [
+        ("key", 0, 8),
+        ("lamports", 8, 8),
+        ("data_len", 16, 8),
+        ("data", 24, 8),
+        ("owner", 32, 8),
+        ("rent_epoch", 40, 8),
+        ("is_signer", 48, 1),
+        ("is_writable", 49, 1),
+        ("executable", 50, 1),
+    ];
+    let stores = analysis
+        .stack_accesses
+        .iter()
+        .filter(|access| access.kind == "store")
+        .collect::<Vec<_>>();
+    let mut bases = BTreeMap::<i16, usize>::new();
+    for access in &stores {
+        for (_, field_offset, _) in LAYOUT {
+            let Some(base) = access.offset.checked_sub(field_offset) else {
+                continue;
+            };
+            let complete = LAYOUT.iter().all(|(_, offset, width)| {
+                base.checked_add(*offset).is_some_and(|expected| {
+                    stores
+                        .iter()
+                        .any(|store| store.offset == expected && store.width == *width)
+                })
+            });
+            if complete {
+                bases.entry(base).or_default();
+            }
+        }
+    }
+    for (index, account_index) in bases.values_mut().enumerate() {
+        *account_index = index;
+    }
+
+    let mut candidates = Vec::new();
+    for (base, account_index) in bases {
+        for (field, field_offset, width) in LAYOUT {
+            let Some(frame_offset) = base.checked_add(field_offset) else {
+                continue;
+            };
+            let matching = analysis
+                .stack_accesses
+                .iter()
+                .filter(|access| access.offset == frame_offset && access.width == width)
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                continue;
+            }
+            let evidence_refs = matching
+                .iter()
+                .filter_map(|access| {
+                    analysis
+                        .instructions
+                        .iter()
+                        .find(|instruction| instruction.pc == access.pc)
+                        .map(instruction_ref)
+                })
+                .collect::<Vec<_>>();
+            let candidate = StackAccountFieldCandidate {
+                account_index,
+                field: field.into(),
+                frame_offset,
+                width,
+                access_pcs: matching.iter().map(|access| access.pc).collect(),
+                status: EvidenceStatus::Recovered,
+                evidence: evidence_refs.clone(),
+            };
+            evidence.push(EvidenceItem {
+                kind: "stack_account_field".into(),
+                value: serde_json::json!({
+                    "account_index": candidate.account_index,
+                    "field": candidate.field,
+                    "frame_offset": candidate.frame_offset,
+                    "width": candidate.width,
+                    "access_pcs": candidate.access_pcs,
+                }),
+                confidence: Some(0.95),
+                status: EvidenceStatus::Recovered,
+                evidence: evidence_refs,
+            });
+            candidates.push(candidate);
+        }
+    }
+    candidates
 }
 
 fn block_for_instruction(
@@ -2481,6 +2615,67 @@ mod tests {
         assert!(result.validation_checks[0]
             .interpretations
             .contains(&"stack_materialized_runtime_field_candidate".into()));
+    }
+
+    #[test]
+    fn recovers_complete_sol_account_info_layout_from_stack_alias_facts() {
+        let layout = [
+            (0, 8),
+            (8, 8),
+            (16, 8),
+            (24, 8),
+            (32, 8),
+            (40, 8),
+            (48, 1),
+            (49, 1),
+            (50, 1),
+        ];
+        let stack_accesses = layout
+            .into_iter()
+            .enumerate()
+            .map(
+                |(pc, (field_offset, width))| sos_analysis::StackAccessFact {
+                    pc,
+                    kind: "store".into(),
+                    width,
+                    offset: -112 + field_offset,
+                    value_register: Some(0),
+                    immediate: None,
+                    frame_register: ebpf::FRAME_PTR_REG as u8,
+                    assembly: "stack store".into(),
+                },
+            )
+            .collect();
+        let analysis = StaticAnalysis {
+            schema_version: sos_types::ANALYSIS_SCHEMA_VERSION,
+            sbpf_version: "V0".into(),
+            entrypoint: 0,
+            instructions: Vec::new(),
+            functions: Vec::new(),
+            basic_blocks: Vec::new(),
+            memory_accesses: Vec::new(),
+            stack_accesses,
+            strings: Vec::new(),
+            public_key_candidates: Vec::new(),
+            immediate_constants: Vec::new(),
+            register_uses: Vec::new(),
+            calls: Vec::new(),
+            relocations: Vec::new(),
+            sccs: Vec::new(),
+            dataflow_edges: Vec::new(),
+            verifier_diagnostics: Vec::new(),
+        };
+        let mut evidence = Vec::new();
+
+        let fields = stack_account_fields(&analysis, &mut evidence);
+
+        assert_eq!(fields.len(), 9);
+        assert!(fields.iter().any(|field| {
+            field.account_index == 0 && field.field == "is_signer" && field.frame_offset == -64
+        }));
+        assert!(fields.iter().any(|field| {
+            field.account_index == 0 && field.field == "is_writable" && field.frame_offset == -63
+        }));
     }
 
     #[test]

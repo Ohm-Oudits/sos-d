@@ -477,21 +477,7 @@ fn convert_analysis(
         })
         .collect();
     let memory_accesses = instructions.iter().filter_map(memory_access).collect();
-    let stack_accesses = instructions
-        .iter()
-        .filter_map(memory_access)
-        .filter(|access| access.base_register == 10)
-        .map(|access| StackAccessFact {
-            pc: access.pc,
-            kind: access.kind,
-            width: access.width,
-            offset: access.offset,
-            value_register: access.value_register,
-            immediate: access.immediate,
-            frame_register: access.base_register,
-            assembly: access.assembly,
-        })
-        .collect();
+    let stack_accesses = collect_stack_accesses(&instructions, &functions);
     let immediate_constants = instructions
         .iter()
         .filter(|instruction| instruction.opcode == solana_sbpf::ebpf::LD_DW_IMM)
@@ -987,6 +973,81 @@ fn memory_access(instruction: &InstructionFact) -> Option<MemoryAccessFact> {
     })
 }
 
+/// Recover stack accesses made through registers that are simple aliases of
+/// r10. This deliberately tracks only MOV64 plus immediate ADD/SUB chains and
+/// invalidates aliases on calls or any unsupported register write.
+fn collect_stack_accesses(
+    instructions: &[InstructionFact],
+    functions: &[FunctionFact],
+) -> Vec<StackAccessFact> {
+    use solana_sbpf::ebpf;
+
+    let function_starts = functions
+        .iter()
+        .map(|function| function.pc)
+        .collect::<HashSet<_>>();
+    let mut aliases = [None::<i64>; 11];
+    aliases[ebpf::FRAME_PTR_REG] = Some(0);
+    let mut accesses = Vec::new();
+
+    for instruction in instructions {
+        if function_starts.contains(&instruction.pc) {
+            aliases = [None; 11];
+            aliases[ebpf::FRAME_PTR_REG] = Some(0);
+        }
+
+        if let Some(access) = memory_access(instruction) {
+            if let Some(base_offset) = aliases
+                .get(access.base_register as usize)
+                .copied()
+                .flatten()
+            {
+                let effective_offset = base_offset.saturating_add(i64::from(access.offset));
+                if let Ok(effective_offset) = i16::try_from(effective_offset) {
+                    accesses.push(StackAccessFact {
+                        pc: access.pc,
+                        kind: access.kind,
+                        width: access.width,
+                        offset: effective_offset,
+                        value_register: access.value_register,
+                        immediate: access.immediate,
+                        frame_register: ebpf::FRAME_PTR_REG as u8,
+                        assembly: access.assembly,
+                    });
+                }
+            }
+        }
+
+        match instruction.opcode {
+            ebpf::MOV64_REG => {
+                aliases[instruction.dst as usize] =
+                    aliases.get(instruction.src as usize).copied().flatten();
+            }
+            ebpf::ADD64_IMM => {
+                if let Some(alias) = aliases[instruction.dst as usize].as_mut() {
+                    *alias = alias.saturating_add(instruction.immediate);
+                }
+            }
+            ebpf::SUB64_IMM => {
+                if let Some(alias) = aliases[instruction.dst as usize].as_mut() {
+                    *alias = alias.saturating_sub(instruction.immediate);
+                }
+            }
+            ebpf::CALL_IMM | ebpf::CALL_REG => {
+                for alias in aliases.iter_mut().take(6) {
+                    *alias = None;
+                }
+            }
+            _ if writes_register(instruction.opcode) => {
+                aliases[instruction.dst as usize] = None;
+            }
+            _ => {}
+        }
+        aliases[ebpf::FRAME_PTR_REG] = Some(0);
+    }
+    accesses
+}
+
 #[cfg(test)]
 mod static_tests {
     use super::*;
@@ -1026,6 +1087,53 @@ mod static_tests {
         assert_eq!(facts[0].width, 8);
         assert_eq!(facts[1].kind, "store");
         assert_eq!(facts[1].immediate, Some(7));
+    }
+
+    #[test]
+    fn recovers_stack_accesses_through_frame_pointer_aliases() {
+        use solana_sbpf::ebpf;
+
+        let instructions = vec![
+            InstructionFact {
+                pc: 0,
+                opcode: ebpf::MOV64_REG,
+                dst: 2,
+                src: ebpf::FRAME_PTR_REG as u8,
+                offset: 0,
+                immediate: 0,
+                assembly: "mov64 r2, r10".into(),
+            },
+            InstructionFact {
+                pc: 1,
+                opcode: ebpf::ADD64_IMM,
+                dst: 2,
+                src: 0,
+                offset: 0,
+                immediate: -62,
+                assembly: "add64 r2, -62".into(),
+            },
+            InstructionFact {
+                pc: 2,
+                opcode: ebpf::ST_B_REG,
+                dst: 2,
+                src: 0,
+                offset: -2,
+                immediate: 0,
+                assembly: "stxb [r2-2], r0".into(),
+            },
+        ];
+        let functions = vec![FunctionFact {
+            pc: 0,
+            symbol_hash: 0,
+            name: "entrypoint".into(),
+        }];
+
+        let accesses = collect_stack_accesses(&instructions, &functions);
+
+        assert_eq!(accesses.len(), 1);
+        assert_eq!(accesses[0].offset, -64);
+        assert_eq!(accesses[0].kind, "store");
+        assert_eq!(accesses[0].frame_register, ebpf::FRAME_PTR_REG as u8);
     }
 
     #[test]
