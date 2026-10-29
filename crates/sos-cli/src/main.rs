@@ -1412,7 +1412,7 @@ impl LiftOptions {
             output: PathBuf::from(directory).join("lifted"),
             ollama_url: "http://127.0.0.1:11434".into(),
             model: "gpt-oss:20b".into(),
-            context_tokens: 65_536,
+            context_tokens: 32_768,
             allow_unreviewed_model: false,
             function_id: None,
         };

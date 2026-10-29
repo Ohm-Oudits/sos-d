@@ -59,7 +59,7 @@ impl OllamaModelProvider {
             endpoint: normalize_chat_endpoint(endpoint.into()),
             agent,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
-            context_tokens: 65_536,
+            context_tokens: 32_768,
         }
     }
 
