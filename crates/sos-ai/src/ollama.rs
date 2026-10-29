@@ -76,9 +76,10 @@ impl OllamaModelProvider {
 
 impl ModelProvider for OllamaModelProvider {
     fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
-        let evidence_json = serde_json::to_string(&request.evidence_pack).map_err(|error| {
-            AiError::Provider(format!("evidence serialization failed: {error}"))
-        })?;
+        let evidence_json = serde_json::to_string(&compact_model_evidence(&request.evidence_pack))
+            .map_err(|error| {
+                AiError::Provider(format!("evidence serialization failed: {error}"))
+            })?;
         let body = serde_json::json!({
             "model": request.model,
             "stream": false,
@@ -135,6 +136,39 @@ impl ModelProvider for OllamaModelProvider {
             evidence: Vec::new(),
         })
     }
+}
+
+/// Keep one authoritative instruction stream (the canonical IR) in the model
+/// context. The gateway still hashes and validates the complete EvidencePack;
+/// this is only a transport projection for context-efficient local inference.
+fn compact_model_evidence(pack: &crate::EvidencePack) -> serde_json::Value {
+    let mut semantics = serde_json::to_value(&pack.semantics)
+        .expect("SemanticAnalysis serialization is infallible for JSON-compatible fields");
+    if let Some(object) = semantics.as_object_mut() {
+        // Candidate records already carry their direct evidence references.
+        // The flattened evidence ledger repeats those records and remains in
+        // the full audited pack used by the gateway.
+        object.remove("evidence");
+    }
+    serde_json::json!({
+        "schema_version": pack.schema_version,
+        "task": pack.task,
+        "artifact_sha256": pack.artifact_sha256,
+        "analysis_context": {
+            "schema_version": pack.analysis.schema_version,
+            "sbpf_version": pack.analysis.sbpf_version,
+            "entrypoint": pack.analysis.entrypoint,
+            "calls": pack.analysis.calls,
+            "strings": pack.analysis.strings,
+            "public_key_candidates": pack.analysis.public_key_candidates,
+            "relocations": pack.analysis.relocations,
+            "dataflow_edge_count": pack.analysis.dataflow_edges.len(),
+            "verifier_diagnostics": pack.analysis.verifier_diagnostics,
+        },
+        "canonical_ir": pack.ir,
+        "semantic_facts": semantics,
+        "prior_stage_output_untrusted": pack.untrusted_evidence,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -320,6 +354,59 @@ mod tests {
         for task in ModelTask::ALL {
             assert_eq!(output_schema(task)["type"], "object");
         }
+    }
+
+    #[test]
+    fn compact_model_evidence_keeps_one_instruction_stream() {
+        let analysis = StaticAnalysis {
+            schema_version: 1,
+            sbpf_version: "V0".into(),
+            entrypoint: 0,
+            instructions: vec![sos_analysis::InstructionFact {
+                pc: 0,
+                opcode: 0xb7,
+                dst: 0,
+                src: 0,
+                offset: 0,
+                immediate: 0,
+                assembly: "mov64 r0, 0".into(),
+            }],
+            functions: vec![FunctionFact {
+                pc: 0,
+                symbol_hash: 0,
+                name: "entrypoint".into(),
+            }],
+            basic_blocks: vec![sos_analysis::BasicBlockFact {
+                start_pc: 0,
+                end_instruction_index: 1,
+                destinations: vec![],
+                label: "entry".into(),
+            }],
+            memory_accesses: vec![],
+            stack_accesses: vec![],
+            strings: vec![],
+            public_key_candidates: vec![],
+            immediate_constants: vec![],
+            register_uses: vec![],
+            calls: vec![],
+            relocations: vec![],
+            sccs: vec![],
+            dataflow_edges: vec![],
+            verifier_diagnostics: vec![],
+        };
+        let semantics = sos_solana::analyze(&analysis);
+        let pack = crate::EvidencePack::from_analysis(
+            ModelTask::StructureRecovery,
+            None,
+            analysis,
+            semantics,
+        );
+
+        let compact = compact_model_evidence(&pack);
+
+        assert!(compact["analysis_context"].get("instructions").is_none());
+        assert_eq!(compact["canonical_ir"]["operations"][0]["pc"], 0);
+        assert!(compact["semantic_facts"].get("evidence").is_none());
     }
 
     #[test]
