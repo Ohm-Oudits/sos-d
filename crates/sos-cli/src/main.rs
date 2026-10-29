@@ -6,15 +6,16 @@ use std::{
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
 use sos_ai::{
     compile_refinement_output, evidence_pack_from_pseudocode_unit, partition_pseudocode,
     run_pipeline, run_refinement_loop, scope_analysis_to_function, trusted_open_model,
-    unavailable_pipeline_bundle, AiPipelineBundle, AiPipelineConfig, AiStageResult, AiStageStatus,
-    CommandModelProvider, CompilationStatus, EvidencePack, EvidencePackLimits, GroqModelProvider,
-    HttpModelProvider, ModelGateway, ModelProvider, ModelResponse, ModelTask, OllamaModelProvider,
-    PseudocodeUnit, RefinementFeedback, RefinementLoopResult, RefinementOutput,
-    RefinementValidation, StructureRecoveryOutput, UntrustedEvidence,
-    VALIDATION_BUNDLE_SCHEMA_VERSION,
+    unavailable_pipeline_bundle, validate_model_response_for_pack, AiPipelineBundle,
+    AiPipelineConfig, AiStageResult, AiStageStatus, CommandModelProvider, CompilationStatus,
+    EvidencePack, EvidencePackLimits, GroqModelProvider, HttpModelProvider, ModelGateway,
+    ModelProvider, ModelResponse, ModelTask, OllamaModelProvider, PseudocodeUnit,
+    RefinementFeedback, RefinementLoopResult, RefinementOutput, RefinementValidation,
+    StructureRecoveryOutput, UntrustedEvidence, VALIDATION_BUNDLE_SCHEMA_VERSION,
 };
 use sos_analysis::{analyze_elf, build_canonical_ir};
 use sos_artifact::{
@@ -35,6 +36,10 @@ use sos_rpc::{ChainProvider, JsonRpcProvider};
 use sos_solana::analyze as analyze_semantics;
 use sos_storage::MetadataStore;
 use sos_types::{ArtifactManifest, ProgramArtifact};
+
+const HUMANIZATION_PROMPT_VERSION: &str = "sos-v1";
+const HUMANIZATION_CACHE_SCHEMA_VERSION: u32 = 1;
+const HUMANIZATION_CACHE_RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -1494,19 +1499,21 @@ struct HumanizeOptions {
     input: PathBuf,
     output: PathBuf,
     audit_output: PathBuf,
+    cache_dir: Option<PathBuf>,
     provider: LiftProvider,
     model: String,
     ollama_url: String,
     allow_unreviewed_model: bool,
     max_units: usize,
     plan_only: bool,
+    resume: bool,
 }
 
 impl HumanizeOptions {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let Some(input) = args.first().map(PathBuf::from) else {
             return Err(
-                "usage: sos humanize <pseudocode-file> [--plan] [--provider groq|ollama] [--model MODEL] [--max-units N] [--out PATH] [--audit-out PATH]".into(),
+                "usage: sos humanize <pseudocode-file> [--plan] [--resume] [--cache-dir DIR] [--provider groq|ollama] [--model MODEL] [--max-units N] [--out PATH] [--audit-out PATH]".into(),
             );
         };
         let mut output = input.clone();
@@ -1517,12 +1524,14 @@ impl HumanizeOptions {
             input,
             output,
             audit_output,
+            cache_dir: None,
             provider: LiftProvider::Groq,
             model: "openai/gpt-oss-120b".into(),
             ollama_url: "http://127.0.0.1:11434".into(),
             allow_unreviewed_model: false,
             max_units: 16,
             plan_only: false,
+            resume: false,
         };
         let mut model_explicit = false;
         let mut index = 1;
@@ -1534,6 +1543,11 @@ impl HumanizeOptions {
             }
             if args[index] == "--plan" {
                 options.plan_only = true;
+                index += 1;
+                continue;
+            }
+            if args[index] == "--resume" {
+                options.resume = true;
                 index += 1;
                 continue;
             }
@@ -1550,6 +1564,7 @@ impl HumanizeOptions {
                 "--ollama-url" => options.ollama_url = value.clone(),
                 "--out" => options.output = PathBuf::from(value),
                 "--audit-out" => options.audit_output = PathBuf::from(value),
+                "--cache-dir" => options.cache_dir = Some(PathBuf::from(value)),
                 "--max-units" => {
                     options.max_units = value
                         .parse::<usize>()
@@ -1581,7 +1596,156 @@ impl HumanizeOptions {
         if options.output == options.audit_output {
             return Err("--out and --audit-out must use different paths".into());
         }
+        if options.cache_dir.is_some() && !options.resume {
+            return Err("--cache-dir requires --resume".into());
+        }
+        if options.resume && options.cache_dir.is_none() {
+            options.cache_dir = Some(options.audit_output.with_extension("humanize-cache"));
+        }
+        if options.cache_dir.as_ref().is_some_and(|path| {
+            path == &options.input || path == &options.output || path == &options.audit_output
+        }) {
+            return Err("--cache-dir must differ from input and output files".into());
+        }
         Ok(options)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HumanizationCache {
+    directory: PathBuf,
+    source_sha256: String,
+    provider: String,
+    model: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct HumanizationCacheRecord {
+    schema_version: u32,
+    source_sha256: String,
+    provider: String,
+    model: String,
+    prompt_version: String,
+    unit_id: String,
+    unit_sha256: String,
+    request_sha256: String,
+    response: ModelResponse,
+}
+
+impl HumanizationCache {
+    fn record_path(&self, unit: &PseudocodeUnit) -> PathBuf {
+        self.directory.join(format!("{}.json", unit.id))
+    }
+
+    fn request_sha256(pack: &EvidencePack) -> Result<String, String> {
+        serde_json::to_vec(pack)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|error| format!("unable to hash evidence pack: {error}"))
+    }
+
+    fn unit_sha256(pack: &EvidencePack) -> Result<&str, String> {
+        pack.artifact_sha256
+            .as_deref()
+            .ok_or_else(|| "pseudocode evidence pack has no source hash".into())
+    }
+
+    fn load(
+        &self,
+        unit: &PseudocodeUnit,
+        pack: &EvidencePack,
+    ) -> Result<Option<ModelResponse>, String> {
+        let path = self.record_path(unit);
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        };
+        if metadata.len() > HUMANIZATION_CACHE_RECORD_MAX_BYTES {
+            return Err(format!(
+                "{}: checkpoint is {} bytes, exceeding the {} byte limit",
+                path.display(),
+                metadata.len(),
+                HUMANIZATION_CACHE_RECORD_MAX_BYTES
+            ));
+        }
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        };
+        let record: HumanizationCacheRecord = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("{}: invalid checkpoint JSON: {error}", path.display()))?;
+        let unit_sha256 = Self::unit_sha256(pack)?;
+        let request_sha256 = Self::request_sha256(pack)?;
+        if record.schema_version != HUMANIZATION_CACHE_SCHEMA_VERSION
+            || record.source_sha256 != self.source_sha256
+            || record.provider != self.provider
+            || record.model != self.model
+            || record.prompt_version != HUMANIZATION_PROMPT_VERSION
+            || record.unit_id != unit.id
+            || record.unit_sha256 != unit_sha256
+            || record.request_sha256 != request_sha256
+        {
+            return Err(format!(
+                "{}: checkpoint identity does not match the current source, provider, model, prompt, unit, or staged context",
+                path.display()
+            ));
+        }
+        validate_model_response_for_pack(
+            &self.model,
+            HUMANIZATION_PROMPT_VERSION,
+            pack.clone(),
+            &record.response,
+        )
+        .map_err(|error| format!("{}: checkpoint validation failed: {error}", path.display()))?;
+        Ok(Some(record.response))
+    }
+
+    fn store(
+        &self,
+        unit: &PseudocodeUnit,
+        pack: &EvidencePack,
+        response: &ModelResponse,
+    ) -> Result<(), String> {
+        fs::create_dir_all(&self.directory)
+            .map_err(|error| format!("{}: {error}", self.directory.display()))?;
+        let path = self.record_path(unit);
+        let record = HumanizationCacheRecord {
+            schema_version: HUMANIZATION_CACHE_SCHEMA_VERSION,
+            source_sha256: self.source_sha256.clone(),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            prompt_version: HUMANIZATION_PROMPT_VERSION.into(),
+            unit_id: unit.id.clone(),
+            unit_sha256: Self::unit_sha256(pack)?.into(),
+            request_sha256: Self::request_sha256(pack)?,
+            response: response.clone(),
+        };
+        let bytes = serde_json::to_vec_pretty(&record)
+            .map_err(|error| format!("unable to serialize checkpoint: {error}"))?;
+        let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
+        fs::write(&temporary, bytes)
+            .map_err(|error| format!("{}: {error}", temporary.display()))?;
+        fs::rename(&temporary, &path).map_err(|error| {
+            format!(
+                "unable to atomically publish {} as {}: {error}",
+                temporary.display(),
+                path.display()
+            )
+        })
+    }
+}
+
+#[derive(Clone)]
+struct UnavailableHumanizeProvider;
+
+impl ModelProvider for UnavailableHumanizeProvider {
+    fn generate_structured(
+        &self,
+        _request: sos_ai::ModelRequest,
+    ) -> Result<ModelResponse, sos_ai::AiError> {
+        Err(sos_ai::AiError::Provider(
+            "checkpoint miss requires GROQ_API_KEY for hosted inference".into(),
+        ))
     }
 }
 
@@ -1589,6 +1753,7 @@ struct HumanizationRun {
     readable_fragments: Vec<String>,
     unit_audits: Vec<serde_json::Value>,
     failures: usize,
+    reused_units: usize,
 }
 
 fn humanization_processing_order(units: &[PseudocodeUnit]) -> Vec<usize> {
@@ -1672,7 +1837,12 @@ fn build_humanization_plan(
     }))
 }
 
-fn run_humanization_units<P>(provider: P, model: &str, units: &[PseudocodeUnit]) -> HumanizationRun
+fn run_humanization_units<P>(
+    provider: P,
+    model: &str,
+    units: &[PseudocodeUnit],
+    cache: Option<&HumanizationCache>,
+) -> HumanizationRun
 where
     P: ModelProvider + Clone,
 {
@@ -1680,6 +1850,7 @@ where
         readable_fragments: vec![String::new(); units.len()],
         unit_audits: vec![serde_json::Value::Null; units.len()],
         failures: 0,
+        reused_units: 0,
     };
     let mut accepted_context = Vec::<UntrustedEvidence>::new();
     let processing_order = humanization_processing_order(units);
@@ -1719,12 +1890,45 @@ where
             .first()
             .map(|function| function.id.clone())
             .unwrap_or_else(|| "fn_unknown".into());
-        let response = submit_model(
-            provider.clone(),
-            ModelTask::PseudocodeHumanization,
-            model,
-            pack.clone(),
-        );
+        let mut checkpoint_status = "disabled";
+        let mut reused = false;
+        let response = if let Some(cache) = cache {
+            match cache.load(unit, &pack) {
+                Ok(Some(response)) => {
+                    eprintln!("reusing validated checkpoint for {}", unit.id);
+                    checkpoint_status = "reused";
+                    reused = true;
+                    run.reused_units += 1;
+                    Ok(response)
+                }
+                Ok(None) => {
+                    checkpoint_status = "missing";
+                    submit_model(
+                        provider.clone(),
+                        ModelTask::PseudocodeHumanization,
+                        model,
+                        pack.clone(),
+                    )
+                }
+                Err(error) => {
+                    eprintln!("warning: ignoring stale or invalid checkpoint: {error}");
+                    checkpoint_status = "invalid_ignored";
+                    submit_model(
+                        provider.clone(),
+                        ModelTask::PseudocodeHumanization,
+                        model,
+                        pack.clone(),
+                    )
+                }
+            }
+        } else {
+            submit_model(
+                provider.clone(),
+                ModelTask::PseudocodeHumanization,
+                model,
+                pack.clone(),
+            )
+        };
         match response {
             Ok(response) => {
                 let candidate = serde_json::from_value::<StructureRecoveryOutput>(
@@ -1738,6 +1942,20 @@ where
                         .find(|function| function.function_id == expected_function)
                 });
                 if let Some(function) = candidate {
+                    if !reused {
+                        if let Some(cache) = cache {
+                            match cache.store(unit, &pack, &response) {
+                                Ok(()) => checkpoint_status = "stored",
+                                Err(error) => {
+                                    checkpoint_status = "write_failed";
+                                    eprintln!(
+                                        "warning: accepted {} but could not store checkpoint: {error}",
+                                        unit.id
+                                    );
+                                }
+                            }
+                        }
+                    }
                     let prior = serde_json::to_string(&response.structured_output)
                         .unwrap_or_else(|_| "{}".into())
                         .chars()
@@ -1759,6 +1977,7 @@ where
                         "unit": unit,
                         "processing_position": processing_index + 1,
                         "status": "accepted_unverified",
+                        "checkpoint": checkpoint_status,
                         "evidence_pack": pack,
                         "response": response,
                     });
@@ -1775,6 +1994,7 @@ where
                         "unit": unit,
                         "processing_position": processing_index + 1,
                         "status": "rejected",
+                        "checkpoint": checkpoint_status,
                         "error": error,
                         "evidence_pack": pack,
                         "response": response,
@@ -1791,6 +2011,7 @@ where
                     "unit": unit,
                     "processing_position": processing_index + 1,
                     "status": "not_available",
+                    "checkpoint": checkpoint_status,
                     "error": error,
                     "evidence_pack": pack,
                 });
@@ -1858,28 +2079,52 @@ fn humanize_command(args: Vec<String>) -> ExitCode {
         println!("humanization_plan={}", options.audit_output.display());
         return ExitCode::SUCCESS;
     }
+    let provider_name = match options.provider {
+        LiftProvider::Groq => "groq_hosted_open_weights",
+        LiftProvider::Ollama => "ollama_local_open_weights",
+    };
+    let cache = options
+        .cache_dir
+        .as_ref()
+        .map(|directory| HumanizationCache {
+            directory: directory.clone(),
+            source_sha256: sha256_hex(source.as_bytes()),
+            provider: provider_name.into(),
+            model: options.model.clone(),
+        });
     let run = match options.provider {
-        LiftProvider::Groq => {
-            let api_key = match env::var("GROQ_API_KEY") {
-                Ok(api_key) => api_key,
-                Err(_) => {
-                    eprintln!("error: GROQ_API_KEY is required for --provider groq");
-                    return ExitCode::from(2);
-                }
-            };
-            let provider = match GroqModelProvider::new(api_key) {
-                Ok(provider) => provider,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    return ExitCode::from(2);
-                }
-            };
-            run_humanization_units(provider, &options.model, &units)
-        }
+        LiftProvider::Groq => match env::var("GROQ_API_KEY") {
+            Ok(api_key) => {
+                let provider = match GroqModelProvider::new(api_key) {
+                    Ok(provider) => provider,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        return ExitCode::from(2);
+                    }
+                };
+                run_humanization_units(provider, &options.model, &units, cache.as_ref())
+            }
+            Err(_) if options.resume => {
+                eprintln!(
+                        "GROQ_API_KEY is not set; validating checkpoints and preserving cache misses as unresolved"
+                    );
+                run_humanization_units(
+                    UnavailableHumanizeProvider,
+                    &options.model,
+                    &units,
+                    cache.as_ref(),
+                )
+            }
+            Err(_) => {
+                eprintln!("error: GROQ_API_KEY is required for --provider groq");
+                return ExitCode::from(2);
+            }
+        },
         LiftProvider::Ollama => run_humanization_units(
             OllamaModelProvider::new(&options.ollama_url),
             &options.model,
             &units,
+            cache.as_ref(),
         ),
     };
     if let Some(parent) = options
@@ -1902,11 +2147,13 @@ fn humanize_command(args: Vec<String>) -> ExitCode {
     }
     let audit = serde_json::json!({
         "schema_version": 1,
-        "provider": match options.provider { LiftProvider::Groq => "groq_hosted_open_weights", LiftProvider::Ollama => "ollama_local_open_weights" },
+        "provider": provider_name,
         "model": options.model,
         "source_sha256": sha256_hex(source.as_bytes()),
         "unit_count": units.len(),
         "failed_units": run.failures,
+        "reused_checkpoint_units": run.reused_units,
+        "checkpoint_directory": options.cache_dir,
         "units": run.unit_audits,
     });
     if let Some(parent) = options
@@ -2525,7 +2772,7 @@ fn submit_model<P: ModelProvider>(
 ) -> Result<sos_ai::ModelResponse, String> {
     let gateway = ModelGateway::new(provider, 4 * 1024 * 1024, 1024 * 1024);
     gateway
-        .submit_with_retry(task, model.to_owned(), "sos-v1", pack, 2)
+        .submit_with_retry(task, model.to_owned(), HUMANIZATION_PROMPT_VERSION, pack, 2)
         .map_err(|error| error.to_string())
 }
 
@@ -3066,7 +3313,7 @@ fn usage() -> ExitCode {
         "       sos decompile <analysis-directory> [--format rust-like|c-like|json] [--out PATH]"
     );
     eprintln!("       sos lift <analysis-directory> [--provider ollama|groq] [--function fn_ID] [--model MODEL] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]");
-    eprintln!("       sos humanize <pseudocode-file> [--plan] [--provider groq|ollama] [--model MODEL] [--max-units N] [--out PATH] [--audit-out PATH]");
+    eprintln!("       sos humanize <pseudocode-file> [--plan] [--resume] [--cache-dir DIR] [--provider groq|ollama] [--model MODEL] [--max-units N] [--out PATH] [--audit-out PATH]");
     eprintln!("       sos benchmark <artifact> [--repeats N] [--out PATH]");
     ExitCode::from(2)
 }
@@ -3078,7 +3325,7 @@ mod tests {
 
     use super::{
         run_humanization_units, transaction_account_addresses, BenchmarkOptions, ExplainOptions,
-        HumanizeOptions, LiftOptions, LiftProvider, RemoteOptions,
+        HumanizationCache, HumanizeOptions, LiftOptions, LiftProvider, RemoteOptions,
     };
     use sos_ai::{AiError, ModelProvider, ModelRequest, ModelResponse};
 
@@ -3215,9 +3462,27 @@ mod tests {
         assert_eq!(hosted.output, PathBuf::from("decompiler.readable.rs"));
         assert_eq!(hosted.max_units, 16);
         assert!(!hosted.plan_only);
+        assert!(!hosted.resume);
+        assert!(hosted.cache_dir.is_none());
 
         let plan = HumanizeOptions::parse(vec!["decompiler.txt".into(), "--plan".into()]).unwrap();
         assert!(plan.plan_only);
+
+        let resumed = HumanizeOptions::parse(vec![
+            "decompiler.txt".into(),
+            "--resume".into(),
+            "--audit-out".into(),
+            "run.json".into(),
+        ])
+        .unwrap();
+        assert!(resumed.resume);
+        assert_eq!(resumed.cache_dir, Some(PathBuf::from("run.humanize-cache")));
+        assert!(HumanizeOptions::parse(vec![
+            "decompiler.txt".into(),
+            "--cache-dir".into(),
+            "cache".into(),
+        ])
+        .is_err());
 
         let local = HumanizeOptions::parse(vec![
             "decompiler.txt".into(),
@@ -3292,6 +3557,7 @@ mod tests {
             },
             "test",
             &units,
+            None,
         );
         assert_eq!(units.len(), 3);
         assert_eq!(run.failures, 0);
@@ -3356,6 +3622,7 @@ mod tests {
             },
             "test",
             &units,
+            None,
         );
         assert_eq!(run.failures, 0);
         let requests = requests.lock().unwrap();
@@ -3367,6 +3634,109 @@ mod tests {
             .any(|source| source == "accepted_humanization:unit_0002"));
         assert!(run.readable_fragments[0].contains("unit_0001"));
         assert!(run.readable_fragments[1].contains("unit_0002"));
+    }
+
+    #[test]
+    fn humanize_resume_revalidates_and_reuses_every_accepted_checkpoint() {
+        #[derive(Clone)]
+        struct CountingHumanizer {
+            calls: Arc<Mutex<usize>>,
+        }
+
+        impl ModelProvider for CountingHumanizer {
+            fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
+                *self.calls.lock().unwrap() += 1;
+                let function = request.evidence_pack.ir.functions[0].clone();
+                let operation_id = request.evidence_pack.ir.operations[0].id.clone();
+                Ok(ModelResponse {
+                    task: request.task,
+                    model: request.model,
+                    prompt_version: request.prompt_version,
+                    structured_output: serde_json::json!({
+                        "functions": [{
+                            "function_id": function.id,
+                            "pseudocode": format!("fn {}() {{}}", function.name),
+                            "evidence": [{
+                                "source": "ir",
+                                "location": format!("operation:{operation_id}"),
+                                "detail": "bounded function evidence"
+                            }]
+                        }]
+                    }),
+                    evidence: Vec::new(),
+                })
+            }
+        }
+
+        let source =
+            "undefined8 caller()\n{\n  return helper();\n}\nundefined8 helper()\n{\n  return 7;\n}";
+        let units = sos_ai::partition_pseudocode(source).unwrap();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "sos-humanize-resume-test-{}-{unique}",
+            std::process::id()
+        ));
+        let cache = HumanizationCache {
+            directory: directory.clone(),
+            source_sha256: sos_artifact::sha256_hex(source.as_bytes()),
+            provider: "test_provider".into(),
+            model: "test".into(),
+        };
+
+        let first_calls = Arc::new(Mutex::new(0));
+        let first = run_humanization_units(
+            CountingHumanizer {
+                calls: first_calls.clone(),
+            },
+            "test",
+            &units,
+            Some(&cache),
+        );
+        assert_eq!(first.failures, 0);
+        assert_eq!(first.reused_units, 0);
+        assert_eq!(*first_calls.lock().unwrap(), 2);
+        assert!(directory.join("unit_0001.json").is_file());
+        assert!(directory.join("unit_0002.json").is_file());
+
+        let resumed_calls = Arc::new(Mutex::new(0));
+        let resumed = run_humanization_units(
+            CountingHumanizer {
+                calls: resumed_calls.clone(),
+            },
+            "test",
+            &units,
+            Some(&cache),
+        );
+        assert_eq!(resumed.failures, 0);
+        assert_eq!(resumed.reused_units, 2);
+        assert_eq!(*resumed_calls.lock().unwrap(), 0);
+        assert!(resumed
+            .unit_audits
+            .iter()
+            .all(|audit| audit["checkpoint"] == "reused"));
+
+        let helper_path = directory.join("unit_0002.json");
+        let mut tampered: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&helper_path).unwrap()).unwrap();
+        tampered["model"] = serde_json::json!("tampered-model");
+        std::fs::write(&helper_path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+        let recovery_calls = Arc::new(Mutex::new(0));
+        let recovered = run_humanization_units(
+            CountingHumanizer {
+                calls: recovery_calls.clone(),
+            },
+            "test",
+            &units,
+            Some(&cache),
+        );
+        assert_eq!(recovered.failures, 0);
+        assert_eq!(recovered.reused_units, 1);
+        assert_eq!(*recovery_calls.lock().unwrap(), 1);
+
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

@@ -408,7 +408,11 @@ mod tests {
             .map(|line| format!("tmp_{line} = tmp_{} + 1;", line.saturating_sub(1)))
             .collect::<Vec<_>>()
             .join("\n");
-        let pack = crate::evidence_pack_from_pseudocode(&source).unwrap();
+        let mut pack = crate::evidence_pack_from_pseudocode(&source).unwrap();
+        pack.untrusted_evidence.push(crate::UntrustedEvidence {
+            source: "accepted_humanization:unit_0001".into(),
+            content: r#"{"functions":[]}"#.into(),
+        });
         let projection = hosted_model_evidence(&pack);
         assert_eq!(projection["pseudocode"]["operations_total"], 128);
         assert_eq!(projection["pseudocode"]["truncated"], false);
@@ -418,6 +422,10 @@ mod tests {
                 .unwrap()
                 .len(),
             128
+        );
+        assert_eq!(
+            projection["bounded_context_untrusted"][0]["source"],
+            "accepted_humanization:unit_0001"
         );
         assert!(serde_json::to_vec(&projection).unwrap().len() < 32 * 1024);
     }

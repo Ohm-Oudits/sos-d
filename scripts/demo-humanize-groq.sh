@@ -15,9 +15,12 @@ mkdir -p "$out_dir"
 
 cargo run -q -p sos-cli -- humanize "$input" \
   --provider groq \
+  --resume \
+  --cache-dir "$out_dir/checkpoints" \
   --out "$out_dir/readable.rs" \
   --audit-out "$out_dir/humanize.json"
 
 echo "Input pseudocode: $input"
 echo "Readable output:  $out_dir/readable.rs"
 echo "Evidence audit:   $out_dir/humanize.json"
+echo "Checkpoints:      $out_dir/checkpoints"

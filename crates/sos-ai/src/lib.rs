@@ -1817,6 +1817,12 @@ fn validate_response_for_request(
             response.prompt_version, request.prompt_version
         )));
     }
+    if response.model != request.model {
+        return Err(AiError::InvalidResponse(format!(
+            "model response identity {:?} does not match request {:?}",
+            response.model, request.model
+        )));
+    }
     validate_structured_output(request.task, &response.structured_output)?;
     validate_structured_consistency(request, &response.structured_output)?;
     validate_response(response)?;
@@ -1829,6 +1835,45 @@ fn validate_response_for_request(
         validate_evidence_ref(request, &evidence)?;
     }
     Ok(())
+}
+
+/// Revalidate a persisted provider response against a fresh immutable evidence
+/// pack before cache reuse. This applies the same task, model, prompt, schema,
+/// anti-cheese, and evidence-reference checks as a live gateway submission.
+pub fn validate_model_response_for_pack(
+    model: &str,
+    prompt_version: &str,
+    pack: EvidencePack,
+    response: &ModelResponse,
+) -> Result<(), AiError> {
+    const MAX_CACHED_INPUT_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_CACHED_OUTPUT_BYTES: usize = 1024 * 1024;
+    let input_bytes = serde_json::to_vec(&pack)
+        .map_err(|error| AiError::InvalidResponse(error.to_string()))?
+        .len();
+    if input_bytes > MAX_CACHED_INPUT_BYTES {
+        return Err(AiError::EvidencePackTooLarge {
+            bytes: input_bytes,
+            limit: MAX_CACHED_INPUT_BYTES,
+        });
+    }
+    let output_bytes = serde_json::to_vec(response)
+        .map_err(|error| AiError::InvalidResponse(error.to_string()))?
+        .len();
+    if output_bytes > MAX_CACHED_OUTPUT_BYTES {
+        return Err(AiError::OutputTooLarge {
+            bytes: output_bytes,
+            limit: MAX_CACHED_OUTPUT_BYTES,
+        });
+    }
+    let request = ModelRequest {
+        task: pack.task,
+        prompt_version: prompt_version.into(),
+        model: model.into(),
+        evidence_pack: pack,
+        max_output_bytes: MAX_CACHED_OUTPUT_BYTES,
+    };
+    validate_response_for_request(&request, response)
 }
 
 /// Enforce that model edits address only functions present in the bounded IR.
@@ -2362,6 +2407,23 @@ mod tests {
         }
     }
 
+    struct WrongModelProvider;
+
+    impl ModelProvider for WrongModelProvider {
+        fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
+            Ok(ModelResponse {
+                task: request.task,
+                model: "different-model".into(),
+                prompt_version: request.prompt_version,
+                structured_output: serde_json::json!({
+                    "summary": "bounded explanation",
+                    "observations": []
+                }),
+                evidence: vec![],
+            })
+        }
+    }
+
     struct LargeResponseProvider;
 
     impl ModelProvider for LargeResponseProvider {
@@ -2631,6 +2693,15 @@ mod tests {
         let gateway = ModelGateway::new(WrongTaskProvider, 10_000, 10_000);
         let result = gateway.submit(ModelTask::Explanation, "test", "v1", empty_pack());
         assert!(matches!(result, Err(AiError::InvalidResponse(error)) if error.contains("task")));
+    }
+
+    #[test]
+    fn gateway_rejects_response_for_wrong_model_identity() {
+        let gateway = ModelGateway::new(WrongModelProvider, 10_000, 10_000);
+        let result = gateway.submit(ModelTask::Explanation, "test", "v1", empty_pack());
+        assert!(
+            matches!(result, Err(AiError::InvalidResponse(error)) if error.contains("model response identity"))
+        );
     }
 
     #[test]
@@ -3103,6 +3174,42 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("read_value"));
+    }
+
+    #[test]
+    fn persisted_humanization_response_is_revalidated_against_fresh_evidence() {
+        let pack = evidence_pack_from_pseudocode("let value = 7\nreturn value").unwrap();
+        let response = ModelResponse {
+            task: ModelTask::PseudocodeHumanization,
+            model: "test".into(),
+            prompt_version: "sos-v1".into(),
+            structured_output: serde_json::json!({
+                "functions": [{
+                    "function_id": "fn_0",
+                    "pseudocode": "fn recovered() -> u64 { 7 }",
+                    "evidence": [{
+                        "source": "ir",
+                        "location": "operation:op_100",
+                        "detail": "return statement"
+                    }]
+                }]
+            }),
+            evidence: Vec::new(),
+        };
+        assert!(
+            validate_model_response_for_pack("test", "sos-v1", pack.clone(), &response).is_ok()
+        );
+
+        let mut wrong_model = response.clone();
+        wrong_model.model = "other".into();
+        assert!(
+            validate_model_response_for_pack("test", "sos-v1", pack.clone(), &wrong_model).is_err()
+        );
+
+        let different_pack = evidence_pack_from_pseudocode("return 8").unwrap();
+        assert!(
+            validate_model_response_for_pack("test", "sos-v1", different_pack, &response).is_err()
+        );
     }
 
     #[test]

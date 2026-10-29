@@ -112,6 +112,7 @@ from another decompiler:
 export GROQ_API_KEY='...'
 sos humanize ./decompiler-output.txt \
   --provider groq \
+  --resume \
   --out ./readable.rs \
   --audit-out ./humanize.json
 ```
@@ -140,6 +141,16 @@ untrusted context, following the iterative GoonFi/Patina pattern without allowin
 model output to replace line-level evidence. A deterministic dependency walk
 processes known callees before callers, handles cycles in stable source order,
 and merges final fragments back into their original line order.
+
+For interruption-safe hosted runs, `--resume` checkpoints a unit only after the
+gateway accepts its schema and evidence references. Before reuse, SOS rebuilds
+the current evidence pack and verifies the source, provider, model, prompt,
+unit hash, full staged request hash, anti-cheese constraints, and evidence
+references. Invalid or stale records are warned about and recomputed rather
+than trusted. The default directory is derived from `--audit-out`; specify
+`--cache-dir DIR` for a stable path. Checkpoints contain no API credentials.
+If every unit is cached, SOS can validate and reconstruct the output without a
+Groq key; missing units stay unresolved until hosted inference is available.
 
 Use `--plan` to write the source hash, detected line ranges, synthetic function
 IDs, operation counts, and per-unit hashes without requiring an API key or

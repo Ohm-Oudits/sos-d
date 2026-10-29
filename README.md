@@ -239,6 +239,7 @@ decompiler, use the one-stage humanizer instead of re-running binary analysis:
 export GROQ_API_KEY='...'
 sos humanize ./decompiler-output.txt \
   --provider groq \
+  --resume \
   --out ./readable.rs \
   --audit-out ./humanize.json
 ```
@@ -256,6 +257,15 @@ Up to two accepted earlier reconstructions are supplied to the next unit as
 explicitly untrusted context; deterministic line evidence remains authoritative.
 Dependency units are processed before callers even when file order is reversed,
 then merged back into original source order.
+
+`--resume` writes each accepted unit to a checkpoint directory (by default,
+next to the audit output). On restart, SOS verifies the source, provider, model,
+prompt, unit hash, complete staged evidence-pack hash, output schema,
+anti-cheese rules, and every evidence reference before reuse. Stale or edited
+checkpoints are ignored and recomputed. Use `--cache-dir DIR` with `--resume`
+to choose a stable location. A fully cached hosted run can be reconstructed
+without `GROQ_API_KEY`; any cache miss remains explicitly unresolved until the
+key is available. API keys are never written to checkpoints.
 
 Preview decomposition without loading or contacting any model:
 
