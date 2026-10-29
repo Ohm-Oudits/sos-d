@@ -6,10 +6,11 @@ use std::{
 };
 
 use sos_ai::{
-    compile_refinement_output, run_pipeline, run_refinement_loop, unavailable_pipeline_bundle,
-    AiPipelineBundle, AiPipelineConfig, CommandModelProvider, EvidencePack, EvidencePackLimits,
-    HttpModelProvider, ModelGateway, ModelProvider, ModelTask, RefinementFeedback,
-    RefinementLoopResult, RefinementOutput, RefinementValidation, VALIDATION_BUNDLE_SCHEMA_VERSION,
+    compile_refinement_output, run_pipeline, run_refinement_loop, scope_analysis_to_function,
+    trusted_open_model, unavailable_pipeline_bundle, AiPipelineBundle, AiPipelineConfig,
+    CommandModelProvider, EvidencePack, EvidencePackLimits, HttpModelProvider, ModelGateway,
+    ModelProvider, ModelTask, OllamaModelProvider, RefinementFeedback, RefinementLoopResult,
+    RefinementOutput, RefinementValidation, VALIDATION_BUNDLE_SCHEMA_VERSION,
 };
 use sos_analysis::{analyze_elf, build_canonical_ir};
 use sos_artifact::{
@@ -24,7 +25,7 @@ use sos_replay::UnavailableReplayEngine;
 use sos_replay::{compare_candidate_observations, compare_semantics, ExecutionTrace, ReplayEngine};
 use sos_report::{
     render_ai_markdown, render_c_pseudocode, render_cfg_dot, render_markdown, render_pseudocode,
-    render_sarif,
+    render_readable_rust, render_sarif,
 };
 use sos_rpc::{ChainProvider, JsonRpcProvider};
 use sos_solana::analyze as analyze_semantics;
@@ -65,6 +66,7 @@ fn main() -> ExitCode {
         "replay" => replay_command(args.collect()),
         "report" => report_command(args.collect()),
         "decompile" => decompile_command(args.collect()),
+        "lift" => lift_command(args.collect()),
         "benchmark" => benchmark_command(args.collect()),
         _ => usage(),
     }
@@ -1387,6 +1389,197 @@ fn decompile_command(args: Vec<String>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+#[derive(Debug)]
+struct LiftOptions {
+    directory: PathBuf,
+    output: PathBuf,
+    ollama_url: String,
+    model: String,
+    context_tokens: usize,
+    allow_unreviewed_model: bool,
+}
+
+impl LiftOptions {
+    fn parse(args: Vec<String>) -> Result<Self, String> {
+        let Some(directory) = args.first() else {
+            return Err(
+                "usage: sos lift <analysis-directory> [--model gpt-oss:20b] [--ollama-url URL] [--context-tokens N] [--out DIR]".into(),
+            );
+        };
+        let mut options = Self {
+            directory: PathBuf::from(directory),
+            output: PathBuf::from(directory).join("lifted"),
+            ollama_url: "http://127.0.0.1:11434".into(),
+            model: "gpt-oss:20b".into(),
+            context_tokens: 65_536,
+            allow_unreviewed_model: false,
+        };
+        let mut index = 1;
+        while index < args.len() {
+            if args[index] == "--allow-unreviewed-model" {
+                options.allow_unreviewed_model = true;
+                index += 1;
+                continue;
+            }
+            let flag = &args[index];
+            let Some(value) = args.get(index + 1) else {
+                return Err(format!("missing value for {flag}"));
+            };
+            match flag.as_str() {
+                "--out" => options.output = PathBuf::from(value),
+                "--ollama-url" => options.ollama_url = value.clone(),
+                "--model" => options.model = value.clone(),
+                "--context-tokens" => {
+                    options.context_tokens = value
+                        .parse::<usize>()
+                        .map_err(|error| format!("invalid context token count: {error}"))?;
+                    if !(4_096..=131_072).contains(&options.context_tokens) {
+                        return Err("--context-tokens must be between 4096 and 131072".into());
+                    }
+                }
+                _ => return Err(format!("unknown lift option: {flag}")),
+            }
+            index += 2;
+        }
+        if trusted_open_model(&options.model).is_none() && !options.allow_unreviewed_model {
+            return Err(format!(
+                "model {:?} is not in SOS's reviewed open-weight registry; use gpt-oss:20b or explicitly pass --allow-unreviewed-model",
+                options.model
+            ));
+        }
+        Ok(options)
+    }
+}
+
+fn lift_command(args: Vec<String>) -> ExitCode {
+    let options = match LiftOptions::parse(args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let analysis =
+        match read_json::<sos_analysis::StaticAnalysis>(&options.directory.join("analysis.json")) {
+            Ok(analysis) => analysis,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        };
+    let global_semantics =
+        read_json::<sos_solana::SemanticAnalysis>(&options.directory.join("semantics.json"))
+            .unwrap_or_else(|_| analyze_semantics(&analysis));
+    let artifact_sha256 = read_json::<ArtifactManifest>(&options.directory.join("manifest.json"))
+        .ok()
+        .map(|manifest| manifest.elf_sha256);
+    let provider =
+        OllamaModelProvider::new(&options.ollama_url).with_context_tokens(options.context_tokens);
+    let config = AiPipelineConfig {
+        provider_name: "ollama_local_open_weights".into(),
+        model: options.model.clone(),
+        prompt_version: "sos-semantic-lift-v2".into(),
+        artifact_sha256: artifact_sha256.clone(),
+        limits: EvidencePackLimits::default(),
+        max_attempts: 2,
+    };
+    let mut bundle = AiPipelineBundle {
+        schema_version: sos_ai::AI_BUNDLE_SCHEMA_VERSION,
+        artifact_sha256,
+        provider: config.provider_name.clone(),
+        model: config.model.clone(),
+        stages: Vec::new(),
+    };
+    let mut functions = analysis.functions.clone();
+    functions.sort_by_key(|function| function.pc);
+    if functions.is_empty() {
+        bundle = run_pipeline(provider, config, &analysis, &global_semantics);
+    } else {
+        for (index, function) in functions.iter().enumerate() {
+            eprintln!(
+                "lifting function {}/{}: fn_{:x}",
+                index + 1,
+                functions.len(),
+                function.pc
+            );
+            let Some(scoped_analysis) = scope_analysis_to_function(&analysis, function.pc) else {
+                continue;
+            };
+            let scoped_semantics = analyze_semantics(&scoped_analysis);
+            let partial = run_pipeline(
+                provider.clone(),
+                config.clone(),
+                &scoped_analysis,
+                &scoped_semantics,
+            );
+            bundle.stages.extend(partial.stages);
+        }
+    }
+    if let Err(error) = fs::create_dir_all(&options.output) {
+        eprintln!("error: {}: {error}", options.output.display());
+        return ExitCode::from(1);
+    }
+    let model_path = options.output.join("model.json");
+    let report_path = options.output.join("ai-report.md");
+    let source_path = options.output.join("readable.rs");
+    let writes = [
+        (
+            &model_path,
+            serde_json::to_vec_pretty(&bundle).map_err(|error| error.to_string()),
+        ),
+        (&report_path, Ok(render_ai_markdown(&bundle).into_bytes())),
+        (
+            &source_path,
+            Ok(render_readable_rust(&analysis, &bundle).into_bytes()),
+        ),
+    ];
+    for (path, bytes) in writes {
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        if let Err(error) = fs::write(path, bytes) {
+            eprintln!("error: {}: {error}", path.display());
+            return ExitCode::from(1);
+        }
+    }
+
+    println!("model={}", model_path.display());
+    println!("ai_report={}", report_path.display());
+    println!("readable_source={}", source_path.display());
+    if let Some(profile) = trusted_open_model(&options.model) {
+        println!(
+            "open_model={} publisher={} license={} weights={}",
+            profile.id, profile.publisher, profile.license, profile.weights_url
+        );
+    }
+
+    let has_candidate = bundle.stages.iter().any(|stage| {
+        stage.status == sos_ai::AiStageStatus::Accepted
+            && matches!(
+                stage.task,
+                ModelTask::StructureRecovery | ModelTask::Refinement
+            )
+            && stage.response.as_ref().is_some_and(|response| {
+                response
+                    .structured_output
+                    .get("functions")
+                    .or_else(|| response.structured_output.get("patches"))
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|items| !items.is_empty())
+            })
+    });
+    if has_candidate {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("error: no readable candidate was accepted; inspect model.json for stage errors");
+        ExitCode::from(1)
+    }
+}
+
 fn parse_decompile_options(args: &[String]) -> Result<(Option<PathBuf>, String), String> {
     let mut index = 1;
     let mut output = None;
@@ -2017,6 +2210,7 @@ fn usage() -> ExitCode {
     eprintln!(
         "       sos decompile <analysis-directory> [--format rust-like|c-like|json] [--out PATH]"
     );
+    eprintln!("       sos lift <analysis-directory> [--model gpt-oss:20b] [--ollama-url URL] [--context-tokens N] [--out DIR]");
     eprintln!("       sos benchmark <artifact> [--repeats N] [--out PATH]");
     ExitCode::from(2)
 }

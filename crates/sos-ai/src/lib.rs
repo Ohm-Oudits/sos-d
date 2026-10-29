@@ -20,6 +20,10 @@ use sos_analysis::{build_canonical_ir, CanonicalIr, StaticAnalysis};
 use sos_solana::SemanticAnalysis;
 use sos_types::{EvidenceItem, EvidenceStatus};
 
+mod ollama;
+
+pub use ollama::{trusted_open_model, OllamaModelProvider, OpenModelProfile, TRUSTED_OPEN_MODELS};
+
 pub const AI_SCHEMA_VERSION: u32 = 1;
 pub const AI_BUNDLE_SCHEMA_VERSION: u32 = 1;
 
@@ -505,6 +509,42 @@ impl EvidencePack {
     }
 }
 
+/// Produce a deterministic one-function analysis slice. Global read-only data
+/// remains available because strings and public keys are commonly referenced
+/// through relocations, while executable facts are restricted to the target's
+/// half-open PC range. This is the unit used by local semantic lifting.
+pub fn scope_analysis_to_function(
+    analysis: &StaticAnalysis,
+    function_pc: usize,
+) -> Option<StaticAnalysis> {
+    let mut ordered = analysis.functions.clone();
+    ordered.sort_by_key(|function| function.pc);
+    let index = ordered
+        .iter()
+        .position(|function| function.pc == function_pc)?;
+    let next_pc = ordered.get(index + 1).map(|function| function.pc);
+    let in_range = |pc: usize| pc >= function_pc && next_pc.is_none_or(|next| pc < next);
+
+    let mut scoped = analysis.clone();
+    scoped.entrypoint = function_pc;
+    scoped.functions = vec![ordered[index].clone()];
+    scoped.instructions.retain(|item| in_range(item.pc));
+    scoped.basic_blocks.retain(|item| in_range(item.start_pc));
+    scoped.memory_accesses.retain(|item| in_range(item.pc));
+    scoped.stack_accesses.retain(|item| in_range(item.pc));
+    scoped.immediate_constants.retain(|item| in_range(item.pc));
+    scoped.register_uses.retain(|item| in_range(item.pc));
+    scoped.calls.retain(|item| in_range(item.call_pc));
+    scoped
+        .dataflow_edges
+        .retain(|item| in_range(item.source_pc) && in_range(item.destination_pc));
+    scoped.sccs.retain_mut(|item| {
+        item.block_starts.retain(|pc| in_range(*pc));
+        !item.block_starts.is_empty()
+    });
+    Some(scoped)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelRequest {
     pub task: ModelTask,
@@ -845,15 +885,21 @@ pub fn run_pipeline<P: ModelProvider>(
     } = config;
     let gateway = ModelGateway::new(provider, 4 * 1024 * 1024, 1024 * 1024);
     let mut stages = Vec::with_capacity(ModelTask::ALL.len());
+    let mut accepted_prior_stages = Vec::<UntrustedEvidence>::new();
 
     for task in ModelTask::ALL {
-        let pack = EvidencePack::bounded_from_analysis(
+        let mut pack = EvidencePack::bounded_from_analysis(
             task,
             artifact_sha256.clone(),
             analysis,
             semantics,
             limits,
         );
+        // Patina/Goonfi-style staged lifting: later stages receive accepted
+        // earlier output as hypotheses while deterministic facts remain
+        // immutable. The gateway still validates all evidence references.
+        pack.untrusted_evidence
+            .extend(accepted_prior_stages.iter().cloned());
         let input_sha256 = sha256_json(&pack);
         match gateway.submit_with_retry(
             task,
@@ -862,16 +908,27 @@ pub fn run_pipeline<P: ModelProvider>(
             pack,
             max_attempts,
         ) {
-            Ok(response) => stages.push(AiStageResult {
-                task,
-                status: AiStageStatus::Accepted,
-                model: model.clone(),
-                prompt_version: prompt_version.clone(),
-                input_sha256,
-                output_sha256: Some(sha256_json(&response)),
-                response: Some(response),
-                error: None,
-            }),
+            Ok(response) => {
+                let prior = serde_json::to_string(&response.structured_output)
+                    .unwrap_or_else(|_| "{}".into())
+                    .chars()
+                    .take(128 * 1024)
+                    .collect::<String>();
+                accepted_prior_stages.push(UntrustedEvidence {
+                    source: format!("accepted_model_stage:{task:?}"),
+                    content: prior,
+                });
+                stages.push(AiStageResult {
+                    task,
+                    status: AiStageStatus::Accepted,
+                    model: model.clone(),
+                    prompt_version: prompt_version.clone(),
+                    input_sha256,
+                    output_sha256: Some(sha256_json(&response)),
+                    response: Some(response),
+                    error: None,
+                })
+            }
             Err(error) => {
                 let status = if matches!(&error, AiError::Provider(_)) {
                     AiStageStatus::NotAvailable
@@ -1576,6 +1633,7 @@ fn structured_evidence_refs(
                         function.function_id
                     )));
                 }
+                validate_readable_candidate(&function.pseudocode, &function.function_id)?;
                 references.extend(function.evidence);
             }
         }
@@ -1613,6 +1671,7 @@ fn structured_evidence_refs(
                         patch.function_id
                     )));
                 }
+                validate_readable_candidate(&patch.replacement, &patch.function_id)?;
                 references.extend(patch.evidence);
             }
             for observation in parsed.observations {
@@ -1628,6 +1687,36 @@ fn structured_evidence_refs(
         ModelTask::Explanation => {}
     }
     Ok(references)
+}
+
+fn validate_readable_candidate(source: &str, function_id: &str) -> Result<(), AiError> {
+    if source.len() > 256 * 1024 {
+        return Err(AiError::InvalidResponse(format!(
+            "candidate for {function_id} exceeds the 256 KiB source limit"
+        )));
+    }
+    for forbidden in [
+        "asm!(",
+        "asm! (",
+        "global_asm!(",
+        "include!(",
+        "include_str!(",
+        "include_bytes!(",
+        "sos_raw_op",
+        "core::arch::asm",
+        "std::arch::asm",
+        "transmute(",
+        "write_volatile(",
+        "black_box(",
+        "#[no_mangle]",
+    ] {
+        if source.contains(forbidden) {
+            return Err(AiError::InvalidResponse(format!(
+                "candidate for {function_id} contains forbidden reconstruction shortcut `{forbidden}`"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_evidence_ref(
@@ -1835,7 +1924,7 @@ pub fn validate_response(response: &ModelResponse) -> Result<(), AiError> {
 mod tests {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
     #[cfg(unix)]
     use std::time::Duration;
@@ -1869,6 +1958,20 @@ mod tests {
         }
     }
 
+    struct RecordingProvider {
+        prior_counts: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl ModelProvider for RecordingProvider {
+        fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
+            self.prior_counts
+                .lock()
+                .unwrap()
+                .push(request.evidence_pack.untrusted_evidence.len());
+            EchoProvider.generate_structured(request)
+        }
+    }
+
     struct FlakyProvider {
         attempts: Arc<AtomicUsize>,
     }
@@ -1892,7 +1995,7 @@ mod tests {
                 .iter()
                 .any(|item| item.source == "external_validation");
             let replacement = if repairing {
-                "fn fn_0() { sos_raw_op!(0, 1, 2, 3, 4); unknown_return(); }"
+                "fn fn_0() { let recovered_value = 1_u64; let _ = recovered_value; }"
             } else {
                 "fn broken( {"
             };
@@ -2167,6 +2270,28 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_passes_accepted_stage_output_forward_as_untrusted_context() {
+        let pack = empty_pack();
+        let prior_counts = Arc::new(Mutex::new(Vec::new()));
+        let _ = run_pipeline(
+            RecordingProvider {
+                prior_counts: prior_counts.clone(),
+            },
+            AiPipelineConfig {
+                provider_name: "test-provider".into(),
+                model: "test-model".into(),
+                prompt_version: "sos-v2".into(),
+                artifact_sha256: None,
+                limits: EvidencePackLimits::default(),
+                max_attempts: 1,
+            },
+            &pack.analysis,
+            &pack.semantics,
+        );
+        assert_eq!(*prior_counts.lock().unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
     fn gateway_rejects_oversized_evidence_pack() {
         let gateway = ModelGateway::new(EchoProvider, 1, 10_000);
         let result = gateway.submit(ModelTask::Explanation, "test", "v1", empty_pack());
@@ -2205,6 +2330,29 @@ mod tests {
             evidence: vec![],
         };
         assert!(validate_structured_output(response.task, &response.structured_output).is_err());
+    }
+
+    #[test]
+    fn readable_candidates_reject_inline_assembly_and_raw_op_passthroughs() {
+        for source in [
+            "fn fn_0() { core::arch::asm!(\"exit\"); }",
+            "fn fn_0() { sos_raw_op(0, 0, 0, 0, 0); }",
+        ] {
+            let response = ModelResponse {
+                task: ModelTask::StructureRecovery,
+                model: "test".into(),
+                prompt_version: "v1".into(),
+                structured_output: serde_json::json!({
+                    "functions": [{
+                        "function_id": "fn_0",
+                        "pseudocode": source,
+                        "evidence": [{"source": "ir", "location": "function:fn_0"}]
+                    }]
+                }),
+                evidence: vec![],
+            };
+            assert!(validate_response(&response).is_err());
+        }
     }
 
     #[test]
@@ -2416,6 +2564,45 @@ mod tests {
         );
         assert!(bounded.analysis.instructions.is_empty());
         assert!(bounded.analysis.register_uses.is_empty());
+    }
+
+    #[test]
+    fn function_scope_keeps_only_the_target_executable_facts() {
+        let mut analysis = empty_pack().analysis;
+        analysis.functions.push(FunctionFact {
+            pc: 8,
+            symbol_hash: 8,
+            name: "helper".into(),
+        });
+        analysis.instructions.push(InstructionFact {
+            pc: 8,
+            opcode: 0,
+            dst: 0,
+            src: 0,
+            offset: 0,
+            immediate: 0,
+            assembly: "exit".into(),
+        });
+        analysis.basic_blocks.push(BasicBlockFact {
+            start_pc: 8,
+            end_instruction_index: 2,
+            destinations: vec![],
+            label: "helper".into(),
+        });
+        analysis.strings.push(sos_analysis::StringFact {
+            offset: 4,
+            value: "shared rodata".into(),
+        });
+
+        let first = scope_analysis_to_function(&analysis, 0).unwrap();
+        assert_eq!(first.functions.len(), 1);
+        assert!(first.instructions.iter().all(|item| item.pc < 8));
+        assert_eq!(first.strings.len(), 1);
+
+        let second = scope_analysis_to_function(&analysis, 8).unwrap();
+        assert_eq!(second.functions[0].name, "helper");
+        assert_eq!(second.instructions.len(), 1);
+        assert_eq!(second.instructions[0].pc, 8);
     }
 
     #[test]

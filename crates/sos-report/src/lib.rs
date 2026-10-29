@@ -6,6 +6,7 @@ use sos_ai::{
 };
 use sos_analysis::{FunctionFact, StaticAnalysis};
 use sos_solana::{SecurityReport, SemanticAnalysis};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub fn render_sarif(report: &SecurityReport) -> String {
     let results = report
@@ -410,6 +411,127 @@ pub fn render_ai_markdown(bundle: &AiPipelineBundle) -> String {
     output
 }
 
+/// Render the best accepted semantic-lifting candidate for each deterministic
+/// IR function. Refinement output wins over structure recovery, but neither is
+/// promoted beyond a hypothesis. Missing functions remain explicit instead of
+/// being silently invented or omitted.
+pub fn render_readable_rust(analysis: &StaticAnalysis, bundle: &AiPipelineBundle) -> String {
+    #[derive(Clone)]
+    struct Candidate {
+        source: String,
+        stage: &'static str,
+        evidence: Vec<sos_types::EvidenceRef>,
+    }
+
+    let valid_ids = analysis
+        .functions
+        .iter()
+        .map(|function| format!("fn_{:x}", function.pc))
+        .collect::<BTreeSet<_>>();
+    let mut candidates = BTreeMap::<String, Candidate>::new();
+
+    for stage in &bundle.stages {
+        if stage.status != AiStageStatus::Accepted {
+            continue;
+        }
+        let Some(response) = stage.response.as_ref() else {
+            continue;
+        };
+        match stage.task {
+            sos_ai::ModelTask::StructureRecovery => {
+                if let Ok(recovered) = serde_json::from_value::<StructureRecoveryOutput>(
+                    response.structured_output.clone(),
+                ) {
+                    for function in recovered.functions {
+                        if valid_ids.contains(&function.function_id)
+                            && !function.pseudocode.trim().is_empty()
+                        {
+                            candidates.entry(function.function_id).or_insert(Candidate {
+                                source: strip_markdown_fence(&function.pseudocode),
+                                stage: "structure_recovery",
+                                evidence: function.evidence,
+                            });
+                        }
+                    }
+                }
+            }
+            sos_ai::ModelTask::Refinement => {
+                if let Ok(refinement) =
+                    serde_json::from_value::<RefinementOutput>(response.structured_output.clone())
+                {
+                    for patch in refinement.patches {
+                        if valid_ids.contains(&patch.function_id)
+                            && !patch.replacement.trim().is_empty()
+                        {
+                            candidates.insert(
+                                patch.function_id,
+                                Candidate {
+                                    source: strip_markdown_fence(&patch.replacement),
+                                    stage: "refinement",
+                                    evidence: patch.evidence,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut output = String::new();
+    output.push_str("// SOS AI-assisted readable Rust-like reconstruction.\n");
+    output
+        .push_str("// This is evidence-linked hypothesis output, not recovered original source.\n");
+    output.push_str(&format!(
+        "// Provider: {}; model: {}.\n\n",
+        bundle.provider, bundle.model
+    ));
+
+    let mut functions = analysis.functions.clone();
+    functions.sort_by_key(|function| function.pc);
+    for function in functions {
+        let function_id = format!("fn_{:x}", function.pc);
+        if let Some(candidate) = candidates.get(&function_id) {
+            output.push_str(&format!(
+                "// candidate: {function_id}; stage: {}; evidence: {}\n",
+                candidate.stage,
+                candidate
+                    .evidence
+                    .iter()
+                    .map(|evidence| format!("{}:{}", evidence.source, evidence.location))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            output.push_str(candidate.source.trim());
+            output.push_str("\n\n");
+        } else {
+            output.push_str(&format!(
+                "// unresolved: {function_id} at SBPF PC 0x{:x}; no accepted readable candidate.\n",
+                function.pc
+            ));
+            output.push_str(&format!(
+                "fn {function_id}() {{\n    unknown_semantics();\n}}\n\n"
+            ));
+        }
+    }
+    output
+}
+
+fn strip_markdown_fence(source: &str) -> String {
+    let trimmed = source.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed.to_owned();
+    }
+    let mut lines = trimmed.lines();
+    let _ = lines.next();
+    let mut body = lines.collect::<Vec<_>>();
+    if body.last().is_some_and(|line| line.trim() == "```") {
+        body.pop();
+    }
+    body.join("\n")
+}
+
 fn render_evidence_refs(evidence: &[sos_types::EvidenceRef]) -> String {
     if evidence.is_empty() {
         return "none".into();
@@ -687,5 +809,96 @@ mod tests {
         assert!(report.contains("Explanation (hypothesis)"));
         assert!(report.contains("observed"));
         assert!(report.contains(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn readable_rust_prefers_refinement_and_marks_missing_functions() {
+        let analysis = StaticAnalysis {
+            schema_version: 1,
+            sbpf_version: "V0".into(),
+            entrypoint: 0,
+            instructions: vec![],
+            functions: vec![
+                FunctionFact {
+                    pc: 0,
+                    symbol_hash: 0,
+                    name: "entrypoint".into(),
+                },
+                FunctionFact {
+                    pc: 8,
+                    symbol_hash: 0,
+                    name: "helper".into(),
+                },
+            ],
+            basic_blocks: vec![],
+            memory_accesses: vec![],
+            stack_accesses: vec![],
+            strings: vec![],
+            public_key_candidates: vec![],
+            immediate_constants: vec![],
+            register_uses: vec![],
+            calls: vec![],
+            relocations: vec![],
+            sccs: vec![],
+            dataflow_edges: vec![],
+            verifier_diagnostics: vec![],
+        };
+        let evidence = vec![EvidenceRef {
+            source: "ir".into(),
+            location: "function:fn_0".into(),
+            detail: None,
+        }];
+        let bundle = AiPipelineBundle {
+            schema_version: 1,
+            artifact_sha256: None,
+            provider: "ollama".into(),
+            model: "gpt-oss:20b".into(),
+            stages: vec![
+                AiStageResult {
+                    task: ModelTask::StructureRecovery,
+                    status: AiStageStatus::Accepted,
+                    model: "gpt-oss:20b".into(),
+                    prompt_version: "sos-v2".into(),
+                    input_sha256: "a".repeat(64),
+                    output_sha256: Some("b".repeat(64)),
+                    response: Some(ModelResponse {
+                        task: ModelTask::StructureRecovery,
+                        model: "gpt-oss:20b".into(),
+                        prompt_version: "sos-v2".into(),
+                        structured_output: serde_json::json!({"functions": [{
+                            "function_id": "fn_0", "pseudocode": "fn old_name() {}",
+                            "evidence": evidence
+                        }]}),
+                        evidence: vec![],
+                    }),
+                    error: None,
+                },
+                AiStageResult {
+                    task: ModelTask::Refinement,
+                    status: AiStageStatus::Accepted,
+                    model: "gpt-oss:20b".into(),
+                    prompt_version: "sos-v2".into(),
+                    input_sha256: "c".repeat(64),
+                    output_sha256: Some("d".repeat(64)),
+                    response: Some(ModelResponse {
+                        task: ModelTask::Refinement,
+                        model: "gpt-oss:20b".into(),
+                        prompt_version: "sos-v2".into(),
+                        structured_output: serde_json::json!({
+                            "schema_version": 1,
+                            "patches": [{"function_id": "fn_0", "replacement": "```rust\nfn process_instruction() {}\n```", "evidence": evidence}],
+                            "observations": [],
+                            "validation": {"status": "unverified", "notes": []}
+                        }),
+                        evidence: vec![],
+                    }),
+                    error: None,
+                },
+            ],
+        };
+        let source = render_readable_rust(&analysis, &bundle);
+        assert!(source.contains("fn process_instruction() {}"));
+        assert!(!source.contains("old_name"));
+        assert!(source.contains("unresolved: fn_8"));
     }
 }

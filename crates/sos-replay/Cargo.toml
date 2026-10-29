@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[[example]]
+name = "litesvm_fixture"
+required-features = ["litesvm"]
+
 [features]
 default = []
 litesvm = [

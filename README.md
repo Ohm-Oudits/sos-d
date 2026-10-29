@@ -168,6 +168,27 @@ sos report ./analysis --format graphviz --out ./analysis/cfg.dot
 sos explain ./analysis --model-command ./fixtures/echo-model.sh --out ./analysis/explanation.json
 ```
 
+### Local open-weight semantic lifting
+
+SOS can now pass deterministic IR through a four-stage local semantic-lifting
+pipeline and merge accepted structure/refinement candidates into readable
+Rust-like output. The reviewed default is OpenAI's Apache-2.0 `gpt-oss:20b`
+weights running locally through Ollama:
+
+```bash
+ollama pull gpt-oss:20b
+cargo run -p sos-cli -- lift ./analysis \
+  --model gpt-oss:20b \
+  --ollama-url http://127.0.0.1:11434 \
+  --out ./analysis/lifted
+```
+
+The command writes `readable.rs`, `model.json`, and `ai-report.md`. Generated
+source remains evidence-linked hypothesis material; functions without an accepted
+candidate are marked unresolved. The research basis, trust boundary, and staged
+GoonFi/Patina-derived design are documented in
+[docs/SEMANTIC_LIFTING.md](docs/SEMANTIC_LIFTING.md).
+
 Hosted providers can implement the same provider-neutral JSON protocol through an
 HTTP endpoint:
 
