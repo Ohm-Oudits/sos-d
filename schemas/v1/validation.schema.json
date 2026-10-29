@@ -53,7 +53,8 @@
                   "memory_writes",
                   "returns",
                   "has_loop",
-                  "effect_dependencies"
+                  "effect_dependencies",
+                  "memory_write_dependencies"
                 ],
                 "properties": {
                   "effect_dependencies": {
@@ -69,6 +70,19 @@
                       "properties": {
                         "kind": {"enum": ["memory_write", "branch", "loop", "call", "return"]},
                         "input_parameters": {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 5}},
+                        "target_input_parameters": {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 5}},
+                        "value_input_parameters": {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 5}}
+                      }
+                    }
+                  },
+                  "memory_write_dependencies": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["block", "statement_index", "target_input_parameters", "value_input_parameters"],
+                      "properties": {
+                        "block": {"type": "integer", "minimum": 0},
+                        "statement_index": {"type": "integer", "minimum": 0},
                         "target_input_parameters": {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 5}},
                         "value_input_parameters": {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 5}}
                       }

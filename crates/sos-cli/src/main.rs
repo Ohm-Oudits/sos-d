@@ -725,7 +725,18 @@ fn validate_command_inner(args: Vec<String>, announce_output: bool) -> ExitCode 
                                     mismatch.missing_value_input_dependencies
                                 )
                             });
-                        missing_effects.chain(missing_dependencies)
+                        let missing_write_roles =
+                            function.memory_write_mismatches.iter().map(|mismatch| {
+                                format!(
+                                    "candidate MIR has no memory write matching {} with target inputs {:?} and value inputs {:?}",
+                                    mismatch.required_location,
+                                    mismatch.required_target_input_registers,
+                                    mismatch.required_value_input_registers
+                                )
+                            });
+                        missing_effects
+                            .chain(missing_dependencies)
+                            .chain(missing_write_roles)
                     })
                     .collect::<Vec<_>>();
                 let (behavioral_status, mut mismatches, mut limitations) =

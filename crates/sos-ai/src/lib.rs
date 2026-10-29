@@ -510,6 +510,8 @@ pub struct MirFunctionSummary {
     pub returns: usize,
     pub has_loop: bool,
     pub effect_dependencies: Vec<MirEffectDependency>,
+    #[serde(default)]
+    pub memory_write_dependencies: Vec<MirMemoryWriteDependency>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -519,6 +521,14 @@ pub struct MirEffectDependency {
     #[serde(default)]
     pub target_input_parameters: Vec<u8>,
     #[serde(default)]
+    pub value_input_parameters: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MirMemoryWriteDependency {
+    pub block: usize,
+    pub statement_index: usize,
+    pub target_input_parameters: Vec<u8>,
     pub value_input_parameters: Vec<u8>,
 }
 
@@ -543,6 +553,15 @@ pub struct MirFunctionEffectComparison {
     pub observed: Vec<RecoveredEffectKind>,
     pub missing: Vec<RecoveredEffectKind>,
     pub dependency_mismatches: Vec<MirDependencyMismatch>,
+    pub memory_write_mismatches: Vec<MirMemoryWriteMismatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MirMemoryWriteMismatch {
+    pub required_location: String,
+    pub required_target_input_registers: Vec<u8>,
+    pub required_value_input_registers: Vec<u8>,
+    pub observed_role_signatures: Vec<MirMemoryWriteDependency>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2560,7 +2579,7 @@ pub fn summarize_rustc_mir(source: &str) -> MirProgramSummary {
             edge.source == edge.destination
                 || mir_path_exists(&edges, edge.destination, edge.source)
         });
-        let effect_dependencies = summarize_mir_effect_dependencies(
+        let (effect_dependencies, memory_write_dependencies) = summarize_mir_effect_dependencies(
             &builder.block_lines,
             &edges,
             builder.parameter_count,
@@ -2577,6 +2596,7 @@ pub fn summarize_rustc_mir(source: &str) -> MirProgramSummary {
             returns: builder.returns,
             has_loop,
             effect_dependencies,
+            memory_write_dependencies,
         }
     }
 
@@ -2714,7 +2734,7 @@ fn summarize_mir_effect_dependencies(
     edges: &[MirEdge],
     parameter_count: usize,
     has_loop: bool,
-) -> Vec<MirEffectDependency> {
+) -> (Vec<MirEffectDependency>, Vec<MirMemoryWriteDependency>) {
     #[derive(Clone, Copy, Default)]
     struct DependencyMasks {
         all: u8,
@@ -2723,7 +2743,7 @@ fn summarize_mir_effect_dependencies(
     }
 
     let Some(entry_block) = blocks.keys().next().copied() else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let mut entry = BTreeMap::<usize, u8>::new();
     for parameter in 1..=parameter_count.min(5) {
@@ -2733,9 +2753,10 @@ fn summarize_mir_effect_dependencies(
     incoming.insert(entry_block, entry);
     let mut queue = std::collections::VecDeque::from([entry_block]);
     let mut effects = BTreeMap::<RecoveredEffectKind, DependencyMasks>::new();
+    let mut memory_writes = BTreeMap::<(usize, usize), (u8, u8)>::new();
     while let Some(block) = queue.pop_front() {
         let mut origins = incoming.get(&block).cloned().unwrap_or_default();
-        for line in blocks.get(&block).into_iter().flatten() {
+        for (statement_index, line) in blocks.get(&block).into_iter().flatten().enumerate() {
             let is_call = line.contains(" -> [return: bb")
                 && line
                     .split_once(" = ")
@@ -2748,6 +2769,9 @@ fn summarize_mir_effect_dependencies(
                     effect.all |= right_dependencies | target_dependencies;
                     effect.target |= target_dependencies;
                     effect.value |= right_dependencies;
+                    let write = memory_writes.entry((block, statement_index)).or_default();
+                    write.0 |= target_dependencies;
+                    write.1 |= right_dependencies;
                 } else if let Some(local) = parse_plain_mir_local(left) {
                     origins.insert(local, right_dependencies);
                 }
@@ -2797,7 +2821,7 @@ fn summarize_mir_effect_dependencies(
             },
         );
     }
-    effects
+    let effect_dependencies = effects
         .into_iter()
         .map(|(kind, dependencies)| MirEffectDependency {
             kind,
@@ -2805,7 +2829,21 @@ fn summarize_mir_effect_dependencies(
             target_input_parameters: dependency_registers_from_mask(dependencies.target),
             value_input_parameters: dependency_registers_from_mask(dependencies.value),
         })
-        .collect()
+        .collect();
+    let memory_write_dependencies = memory_writes
+        .into_iter()
+        .map(
+            |((block, statement_index), (target_dependencies, value_dependencies))| {
+                MirMemoryWriteDependency {
+                    block,
+                    statement_index,
+                    target_input_parameters: dependency_registers_from_mask(target_dependencies),
+                    value_input_parameters: dependency_registers_from_mask(value_dependencies),
+                }
+            },
+        )
+        .collect();
+    (effect_dependencies, memory_write_dependencies)
 }
 
 fn mir_local_dependencies(line: &str, origins: &BTreeMap<usize, u8>) -> u8 {
@@ -2997,8 +3035,31 @@ pub fn compare_mir_effects(
                 })
             })
             .collect::<Vec<_>>();
+        let memory_write_mismatches = required_structure_effects(pack, &function.id)
+            .into_iter()
+            .filter(|effect| effect.kind == RecoveredEffectKind::MemoryWrite)
+            .filter(|effect| {
+                !candidate.is_some_and(|candidate| {
+                    candidate.memory_write_dependencies.iter().any(|observed| {
+                        (effect.target_input_registers.is_empty()
+                            || observed.target_input_parameters == effect.target_input_registers)
+                            && (effect.value_input_registers.is_empty()
+                                || observed.value_input_parameters == effect.value_input_registers)
+                    })
+                })
+            })
+            .map(|effect| MirMemoryWriteMismatch {
+                required_location: effect.location,
+                required_target_input_registers: effect.target_input_registers,
+                required_value_input_registers: effect.value_input_registers,
+                observed_role_signatures: candidate
+                    .map(|candidate| candidate.memory_write_dependencies.clone())
+                    .unwrap_or_default(),
+            })
+            .collect::<Vec<_>>();
         has_mismatch |= !missing.is_empty()
             || !dependency_mismatches.is_empty()
+            || !memory_write_mismatches.is_empty()
             || !summary
                 .functions
                 .iter()
@@ -3009,6 +3070,7 @@ pub fn compare_mir_effects(
             observed: observed.into_iter().collect(),
             missing,
             dependency_mismatches,
+            memory_write_mismatches,
         });
     }
     MirEffectComparison {
@@ -3021,7 +3083,7 @@ pub fn compare_mir_effects(
         functions,
         limitations: vec![
             "MIR effect coverage checks category presence, not semantic equivalence or one-to-one instruction lowering".into(),
-            "memory-write target and value dependencies are role-checked after aggregation by effect class; individual SBPF stores are not yet paired one-to-one with MIR assignments".into(),
+            "memory-write target/value role signatures are checked per required SBPF store, but identical signatures may reuse one MIR assignment because one source assignment can lower to multiple stores".into(),
             "rustc textual MIR is parsed into a versioned SOS summary because the upstream text format is not stable".into(),
         ],
     }
@@ -4801,6 +4863,15 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
                 && dependency.target_input_parameters == vec![1, 3]
                 && dependency.value_input_parameters == vec![2]
         }));
+        assert_eq!(function.memory_write_dependencies.len(), 1);
+        assert_eq!(
+            function.memory_write_dependencies[0].target_input_parameters,
+            vec![1, 3]
+        );
+        assert_eq!(
+            function.memory_write_dependencies[0].value_input_parameters,
+            vec![2]
+        );
 
         let mut pack = empty_pack();
         pack.task = ModelTask::Refinement;
@@ -4870,6 +4941,7 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
                     target_input_parameters: Vec::new(),
                     value_input_parameters: Vec::new(),
                 }],
+                memory_write_dependencies: Vec::new(),
             }],
         };
         let comparison = compare_mir_effects(&pack, Some(&summary));
@@ -4922,6 +4994,12 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
                     target_input_parameters: vec![2],
                     value_input_parameters: vec![1],
                 }],
+                memory_write_dependencies: vec![MirMemoryWriteDependency {
+                    block: 0,
+                    statement_index: 0,
+                    target_input_parameters: vec![2],
+                    value_input_parameters: vec![1],
+                }],
             }],
         };
 
@@ -4939,6 +5017,112 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
             comparison.functions[0].dependency_mismatches[0].missing_value_input_dependencies,
             vec![2]
         );
+    }
+
+    #[test]
+    fn mir_effect_comparison_requires_each_distinct_memory_role_signature() {
+        let mut analysis = empty_pack().analysis;
+        analysis.instructions = vec![
+            InstructionFact {
+                pc: 0,
+                opcode: 0x7b,
+                dst: 1,
+                src: 2,
+                offset: 0,
+                immediate: 0,
+                assembly: "stxdw [r1], r2".into(),
+            },
+            InstructionFact {
+                pc: 1,
+                opcode: 0x7b,
+                dst: 3,
+                src: 4,
+                offset: 8,
+                immediate: 0,
+                assembly: "stxdw [r3+0x8], r4".into(),
+            },
+            InstructionFact {
+                pc: 2,
+                opcode: 0x95,
+                dst: 0,
+                src: 0,
+                offset: 0,
+                immediate: 0,
+                assembly: "exit".into(),
+            },
+        ];
+        analysis.basic_blocks[0].end_instruction_index = 3;
+        analysis.memory_accesses = vec![
+            sos_analysis::MemoryAccessFact {
+                pc: 0,
+                kind: "store".into(),
+                width: 8,
+                base_register: 1,
+                value_register: Some(2),
+                offset: 0,
+                immediate: None,
+                assembly: "stxdw [r1], r2".into(),
+            },
+            sos_analysis::MemoryAccessFact {
+                pc: 1,
+                kind: "store".into(),
+                width: 8,
+                base_register: 3,
+                value_register: Some(4),
+                offset: 8,
+                immediate: None,
+                assembly: "stxdw [r3+0x8], r4".into(),
+            },
+        ];
+        let semantics = sos_solana::analyze(&analysis);
+        let pack = EvidencePack::from_analysis(ModelTask::Refinement, None, analysis, semantics);
+        let summary = MirProgramSummary {
+            schema_version: MIR_SUMMARY_SCHEMA_VERSION,
+            functions: vec![MirFunctionSummary {
+                name: "fn_0".into(),
+                parameter_count: 4,
+                basic_block_count: 1,
+                edges: Vec::new(),
+                branch_terminators: 0,
+                calls: 0,
+                memory_writes: 2,
+                returns: 1,
+                has_loop: false,
+                effect_dependencies: vec![
+                    MirEffectDependency {
+                        kind: RecoveredEffectKind::MemoryWrite,
+                        input_parameters: vec![1, 2, 3, 4],
+                        target_input_parameters: vec![1, 3],
+                        value_input_parameters: vec![2, 4],
+                    },
+                    MirEffectDependency {
+                        kind: RecoveredEffectKind::Return,
+                        input_parameters: Vec::new(),
+                        target_input_parameters: Vec::new(),
+                        value_input_parameters: Vec::new(),
+                    },
+                ],
+                memory_write_dependencies: vec![
+                    MirMemoryWriteDependency {
+                        block: 0,
+                        statement_index: 0,
+                        target_input_parameters: vec![1],
+                        value_input_parameters: vec![4],
+                    },
+                    MirMemoryWriteDependency {
+                        block: 0,
+                        statement_index: 1,
+                        target_input_parameters: vec![3],
+                        value_input_parameters: vec![2],
+                    },
+                ],
+            }],
+        };
+
+        let comparison = compare_mir_effects(&pack, Some(&summary));
+        assert_eq!(comparison.status, MirEffectComparisonStatus::Mismatch);
+        assert!(comparison.functions[0].dependency_mismatches.is_empty());
+        assert_eq!(comparison.functions[0].memory_write_mismatches.len(), 2);
     }
 
     #[test]

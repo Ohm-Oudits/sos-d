@@ -425,8 +425,10 @@ The deterministic SBPF dependency pass distinguishes the inputs that influence a
 store destination from those that influence its value. Structure-stage ledgers
 must cite both roles, and the MIR adapter computes the same split from projected
 places and right-hand-side expressions. This rejects pointer/value swaps that a
-coarser union-of-inputs check would accept; the current comparison remains
-aggregated by effect kind rather than pairing every individual store.
+coarser union-of-inputs check would accept. The MIR summary also retains each
+write's role signature, and validation requires every distinct SBPF store
+signature to appear in a MIR assignment. Identical signatures may reuse one MIR
+assignment because one source assignment can lower to several machine stores.
 
 After a whole candidate is rebuilt with the pinned Solana/SBPF toolchain,
 `sos judge` provides a separate deterministic binary regression gate. It pairs

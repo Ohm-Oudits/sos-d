@@ -406,7 +406,8 @@ only for the selected paths. Deterministic function-level recompilation scoring
 and automatic pinned candidate rebuilding are implemented. The rebuild gate
 rejects toolchain drift, requires a lockfile, captures bounded build provenance,
 and prevents stale candidate reuse. Memory-write dependencies now distinguish
-destination-address inputs from stored-value inputs across SBPF and MIR. The
-remaining judge work is type-layout verification, per-store alias/offset pairing,
+destination-address inputs from stored-value inputs across SBPF and MIR, and
+distinct per-write role signatures are checked independently. The remaining
+judge work is type-layout verification, byte-offset/field correspondence,
 stronger call-graph non-regression constraints, and multi-transaction path
 coverage.

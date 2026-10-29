@@ -29,7 +29,8 @@ candidate observations.
 The validation contract keeps compiler status and behavioral status distinct;
 successful compilation alone is never represented as behavioral agreement.
 Its MIR summary also keeps memory-write destination dependencies separate from
-stored-value dependencies so pointer/value role swaps remain explicit mismatches.
+stored-value dependencies, both in aggregate and per write, so pointer/value
+role swaps and crossed write pairs remain explicit mismatches.
 The binary-judge contract records content hashes, per-function structural scores,
 the configured acceptance threshold, exact-match status, and explicit limitations;
 it is a deterministic regression signal rather than equivalence proof.

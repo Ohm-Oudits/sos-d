@@ -207,7 +207,9 @@ register operations and CFG joins, then requires candidate MIR effects to retain
 those positional input dependencies. Memory writes separately preserve which
 inputs influence the destination address and which influence the stored value,
 so swapping an account pointer with its data is rejected even when the same
-inputs remain present overall. MIR coverage is still a structural
+inputs remain present overall. Distinct store role signatures are checked
+separately, preventing two crossed writes from passing merely because their
+aggregate target and value sets look correct. MIR coverage is still a structural
 non-regression check, not a claim of semantic equivalence.
 
 ### Local open-weight semantic lifting

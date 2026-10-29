@@ -218,7 +218,9 @@ For every SBPF memory write, the deterministic dependency contract must keep
 destination-address inputs separate from stored-value inputs. The structure
 ledger and compiler-produced MIR summary must preserve both roles in addition
 to their union. A candidate that uses the correct parameters but swaps pointer
-and value roles is a mismatch and must be returned to bounded repair.
+and value roles is a mismatch and must be returned to bounded repair. MIR
+validation must retain individual write role signatures and cover every distinct
+required SBPF signature; aggregate dependency sets alone are insufficient.
 
 `sos judge <original.so> <candidate.so>` is the deterministic recompilation
 gate. Both inputs must pass the normal ELF/SBPF analyzer. The judge must pair
