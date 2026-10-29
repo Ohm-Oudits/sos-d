@@ -183,6 +183,21 @@ cargo run -p sos-cli -- lift ./analysis \
   --out ./analysis/lifted
 ```
 
+The same reviewed local pipeline is available directly from a deployed address;
+no separate model-adapter command is required. Scope the first run to an entrypoint
+or handler so large programs can be lifted and reviewed incrementally:
+
+```bash
+sos inspect <PROGRAM_ADDRESS> \
+  --rpc-url https://api.mainnet.solana.com \
+  --model gpt-oss:20b \
+  --function fn_0 \
+  --out ./reports/<PROGRAM_ADDRESS>
+```
+
+This address-first form writes `readable.rs` and `repair.json` in addition to the
+deterministic evidence bundle and audited model outputs.
+
 The command writes `readable.rs`, `model.json`, and `ai-report.md`. Generated
 source remains evidence-linked hypothesis material; functions without an accepted
 candidate are marked unresolved. The research basis, trust boundary, and staged

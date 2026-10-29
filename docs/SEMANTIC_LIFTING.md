@@ -78,6 +78,16 @@ cargo run -p sos-cli -- lift ./analysis \
   --out ./analysis/lifted
 ```
 
+Or fetch and lift directly from a deployed program address:
+
+```bash
+sos inspect <PROGRAM_ADDRESS> \
+  --rpc-url https://api.mainnet.solana.com \
+  --model gpt-oss:20b \
+  --function fn_0 \
+  --out ./reports/<PROGRAM_ADDRESS>
+```
+
 For iterative work on a large binary, scope a run to one canonical IR function
 (`fn_` followed by its hexadecimal entry PC):
 

@@ -1103,40 +1103,71 @@ fn inspect_command(args: Vec<String>) -> ExitCode {
     } else {
         None
     };
-    let (model_path, ai_report_path) = if let Some(model) = &options.model {
+    let (model_path, ai_report_path, readable_path, lift_repair_path) = if let Some(model) =
+        &options.model
+    {
         let path = PathBuf::from(&options.output).join("model.json");
-        let bundle = match (
+        let (bundle, lift_repair_records) = match (
             options.model_command.as_deref(),
             options.model_endpoint.as_deref(),
         ) {
-            (Some(command), _) => run_model_pipeline(
-                &analysis,
-                &semantics,
-                Some(&manifest.elf_sha256),
-                Some(Path::new(command)),
+            (Some(command), _) => (
+                run_model_pipeline(
+                    &analysis,
+                    &semantics,
+                    Some(&manifest.elf_sha256),
+                    Some(Path::new(command)),
+                    None,
+                    model,
+                ),
                 None,
-                model,
             ),
-            (None, Some(endpoint)) => run_model_pipeline(
-                &analysis,
-                &semantics,
-                Some(&manifest.elf_sha256),
+            (None, Some(endpoint)) => (
+                run_model_pipeline(
+                    &analysis,
+                    &semantics,
+                    Some(&manifest.elf_sha256),
+                    None,
+                    Some(endpoint),
+                    model,
+                ),
                 None,
-                Some(endpoint),
-                model,
             ),
-            (None, None) => unavailable_pipeline_bundle(
-                AiPipelineConfig {
-                    provider_name: "none".into(),
-                    model: model.clone(),
-                    prompt_version: "sos-v1".into(),
-                    artifact_sha256: Some(manifest.elf_sha256.clone()),
-                    limits: EvidencePackLimits::default(),
-                    max_attempts: 2,
-                },
-                &analysis,
-                &semantics,
-                "provide --model-command PATH or --model-endpoint URL",
+            (None, None) if trusted_open_model(model).is_some() => {
+                match run_ollama_lift_bundle(
+                    &analysis,
+                    &semantics,
+                    OllamaLiftConfig {
+                        artifact_sha256: Some(manifest.elf_sha256.clone()),
+                        model,
+                        ollama_url: &options.ollama_url,
+                        context_tokens: options.context_tokens,
+                        function_id: options.function_id.as_deref(),
+                        repair_rounds: options.repair_rounds.min(4),
+                    },
+                ) {
+                    Ok((bundle, records)) => (bundle, Some(records)),
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            (None, None) => (
+                unavailable_pipeline_bundle(
+                    AiPipelineConfig {
+                        provider_name: "none".into(),
+                        model: model.clone(),
+                        prompt_version: "sos-v1".into(),
+                        artifact_sha256: Some(manifest.elf_sha256.clone()),
+                        limits: EvidencePackLimits::default(),
+                        max_attempts: 2,
+                    },
+                    &analysis,
+                    &semantics,
+                    "provide --model-command PATH, --model-endpoint URL, or a reviewed local open-weight model",
+                ),
+                None,
             ),
         };
         let value = match serde_json::to_value(&bundle) {
@@ -1158,9 +1189,33 @@ fn inspect_command(args: Vec<String>) -> ExitCode {
             eprintln!("error: {error}");
             return ExitCode::from(1);
         }
-        (Some(path), Some(ai_report_path))
+        let (readable_path, lift_repair_path) = if let Some(records) = lift_repair_records {
+            let readable_path = PathBuf::from(&options.output).join("readable.rs");
+            if let Err(error) = fs::write(&readable_path, render_readable_rust(&analysis, &bundle))
+            {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+            let repair_path = PathBuf::from(&options.output).join("repair.json");
+            if let Err(error) = fs::write(
+                &repair_path,
+                serde_json::to_vec_pretty(&records).expect("repair records are serializable"),
+            ) {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+            (Some(readable_path), Some(repair_path))
+        } else {
+            (None, None)
+        };
+        (
+            Some(path),
+            Some(ai_report_path),
+            readable_path,
+            lift_repair_path,
+        )
     } else {
-        (None, None)
+        (None, None, None, None)
     };
     let validation_path = if options.validate_requested || options.repair_requested {
         let path = PathBuf::from(&options.output).join("validation.json");
@@ -1211,6 +1266,8 @@ fn inspect_command(args: Vec<String>) -> ExitCode {
             "replay": replay_path,
             "model": model_path,
             "ai_report": ai_report_path,
+            "readable_source": readable_path,
+            "lift_repair": lift_repair_path,
             "validation": validation_path,
             "elf_sha256": manifest.elf_sha256,
             "sbpf_version": analysis.sbpf_version,
@@ -1245,6 +1302,12 @@ fn inspect_command(args: Vec<String>) -> ExitCode {
         }
         if let Some(path) = ai_report_path {
             println!("ai_report={}", path.display());
+        }
+        if let Some(path) = readable_path {
+            println!("readable_source={}", path.display());
+        }
+        if let Some(path) = lift_repair_path {
+            println!("lift_repair={}", path.display());
         }
         if let Some(path) = validation_path {
             println!("validation={}", path.display());
@@ -1465,41 +1528,33 @@ impl LiftOptions {
     }
 }
 
-fn lift_command(args: Vec<String>) -> ExitCode {
-    let options = match LiftOptions::parse(args) {
-        Ok(options) => options,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return ExitCode::from(2);
-        }
-    };
-    let analysis =
-        match read_json::<sos_analysis::StaticAnalysis>(&options.directory.join("analysis.json")) {
-            Ok(analysis) => analysis,
-            Err(error) => {
-                eprintln!("error: {error}");
-                return ExitCode::from(1);
-            }
-        };
-    let global_semantics =
-        read_json::<sos_solana::SemanticAnalysis>(&options.directory.join("semantics.json"))
-            .unwrap_or_else(|_| analyze_semantics(&analysis));
-    let artifact_sha256 = read_json::<ArtifactManifest>(&options.directory.join("manifest.json"))
-        .ok()
-        .map(|manifest| manifest.elf_sha256);
+struct OllamaLiftConfig<'a> {
+    artifact_sha256: Option<String>,
+    model: &'a str,
+    ollama_url: &'a str,
+    context_tokens: usize,
+    function_id: Option<&'a str>,
+    repair_rounds: usize,
+}
+
+fn run_ollama_lift_bundle(
+    analysis: &sos_analysis::StaticAnalysis,
+    global_semantics: &sos_solana::SemanticAnalysis,
+    options: OllamaLiftConfig<'_>,
+) -> Result<(AiPipelineBundle, Vec<serde_json::Value>), String> {
     let provider =
-        OllamaModelProvider::new(&options.ollama_url).with_context_tokens(options.context_tokens);
+        OllamaModelProvider::new(options.ollama_url).with_context_tokens(options.context_tokens);
     let config = AiPipelineConfig {
         provider_name: "ollama_local_open_weights".into(),
-        model: options.model.clone(),
+        model: options.model.into(),
         prompt_version: "sos-semantic-lift-v2".into(),
-        artifact_sha256: artifact_sha256.clone(),
+        artifact_sha256: options.artifact_sha256.clone(),
         limits: EvidencePackLimits::default(),
         max_attempts: 2,
     };
     let mut bundle = AiPipelineBundle {
         schema_version: sos_ai::AI_BUNDLE_SCHEMA_VERSION,
-        artifact_sha256,
+        artifact_sha256: options.artifact_sha256,
         provider: config.provider_name.clone(),
         model: config.model.clone(),
         stages: Vec::new(),
@@ -1507,15 +1562,16 @@ fn lift_command(args: Vec<String>) -> ExitCode {
     let mut repair_records = Vec::<serde_json::Value>::new();
     let mut functions = analysis.functions.clone();
     functions.sort_by_key(|function| function.pc);
-    if let Some(function_id) = options.function_id.as_deref() {
+    if let Some(function_id) = options.function_id {
         functions.retain(|function| format!("fn_{:x}", function.pc) == function_id);
         if functions.is_empty() {
-            eprintln!("error: function {function_id:?} does not exist in the analysis IR");
-            return ExitCode::from(2);
+            return Err(format!(
+                "function {function_id:?} does not exist in the analysis IR"
+            ));
         }
     }
     if functions.is_empty() {
-        bundle = run_pipeline(provider, config, &analysis, &global_semantics);
+        bundle = run_pipeline(provider, config, analysis, global_semantics);
     } else {
         for (index, function) in functions.iter().enumerate() {
             eprintln!(
@@ -1524,7 +1580,7 @@ fn lift_command(args: Vec<String>) -> ExitCode {
                 functions.len(),
                 function.pc
             );
-            let Some(scoped_analysis) = scope_analysis_to_function(&analysis, function.pc) else {
+            let Some(scoped_analysis) = scope_analysis_to_function(analysis, function.pc) else {
                 continue;
             };
             let scoped_semantics = analyze_semantics(&scoped_analysis);
@@ -1548,6 +1604,49 @@ fn lift_command(args: Vec<String>) -> ExitCode {
             bundle.stages.extend(partial.stages);
         }
     }
+    Ok((bundle, repair_records))
+}
+
+fn lift_command(args: Vec<String>) -> ExitCode {
+    let options = match LiftOptions::parse(args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let analysis =
+        match read_json::<sos_analysis::StaticAnalysis>(&options.directory.join("analysis.json")) {
+            Ok(analysis) => analysis,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        };
+    let global_semantics =
+        read_json::<sos_solana::SemanticAnalysis>(&options.directory.join("semantics.json"))
+            .unwrap_or_else(|_| analyze_semantics(&analysis));
+    let artifact_sha256 = read_json::<ArtifactManifest>(&options.directory.join("manifest.json"))
+        .ok()
+        .map(|manifest| manifest.elf_sha256);
+    let (bundle, repair_records) = match run_ollama_lift_bundle(
+        &analysis,
+        &global_semantics,
+        OllamaLiftConfig {
+            artifact_sha256,
+            model: &options.model,
+            ollama_url: &options.ollama_url,
+            context_tokens: options.context_tokens,
+            function_id: options.function_id.as_deref(),
+            repair_rounds: options.repair_rounds,
+        },
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
     if let Err(error) = fs::create_dir_all(&options.output) {
         eprintln!("error: {}: {error}", options.output.display());
         return ExitCode::from(1);
@@ -1918,6 +2017,9 @@ struct RemoteOptions {
     model: Option<String>,
     model_command: Option<String>,
     model_endpoint: Option<String>,
+    ollama_url: String,
+    context_tokens: usize,
+    function_id: Option<String>,
     signature: Option<String>,
     validate_requested: bool,
     repair_requested: bool,
@@ -2089,6 +2191,9 @@ impl RemoteOptions {
             model: None,
             model_command: None,
             model_endpoint: None,
+            ollama_url: "http://127.0.0.1:11434".into(),
+            context_tokens: 32_768,
+            function_id: None,
             signature: None,
             validate_requested: false,
             repair_requested: false,
@@ -2151,6 +2256,16 @@ impl RemoteOptions {
                 "--model" => options.model = Some(value.clone()),
                 "--model-command" => options.model_command = Some(value.clone()),
                 "--model-endpoint" => options.model_endpoint = Some(value.clone()),
+                "--ollama-url" if command == "inspect" => options.ollama_url = value.clone(),
+                "--function" if command == "inspect" => options.function_id = Some(value.clone()),
+                "--context-tokens" if command == "inspect" => {
+                    options.context_tokens = value
+                        .parse::<usize>()
+                        .map_err(|error| format!("invalid context token count: {error}"))?;
+                    if !(4_096..=131_072).contains(&options.context_tokens) {
+                        return Err("--context-tokens must be between 4096 and 131072".into());
+                    }
+                }
                 "--signature" => options.signature = Some(value.clone()),
                 "--repair-rounds" if command == "inspect" => {
                     options.repair_rounds = value
@@ -2374,7 +2489,7 @@ fn usage() -> ExitCode {
     eprintln!("usage: sos artifact-info <path-to-sbf-elf> [--json]");
     eprintln!("       sos manifest <path-to-sbf-elf>");
     eprintln!("       sos fetch <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--commitment LEVEL] [--json]");
-    eprintln!("       sos inspect <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--history N] [--replay] [--signature SIGNATURE] [--model NAME] [--model-command PATH|--model-endpoint URL] [--validate] [--repair --repair-rounds N] [--validation-trace PATH] [--commitment LEVEL] [--json]");
+    eprintln!("       sos inspect <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--history N] [--replay] [--signature SIGNATURE] [--model gpt-oss:20b] [--function fn_ID] [--ollama-url URL] [--context-tokens N] [--model-command PATH|--model-endpoint URL] [--validate] [--repair --repair-rounds N] [--validation-trace PATH] [--commitment LEVEL] [--json]");
     eprintln!("       sos analyze <path-to-sbf-elf> [--out DIR]");
     eprintln!("       sos detect <analysis-directory> [--format json|sarif] [--out PATH]");
     eprintln!("       sos validate <analysis-directory> [--compiler PATH|--no-compile] [--trace PATH] [--repair --model-command PATH --repair-rounds N] [--out PATH]");
@@ -2395,7 +2510,9 @@ fn usage() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{transaction_account_addresses, BenchmarkOptions, ExplainOptions, LiftOptions};
+    use super::{
+        transaction_account_addresses, BenchmarkOptions, ExplainOptions, LiftOptions, RemoteOptions,
+    };
 
     #[test]
     fn transaction_accounts_include_static_and_loaded_keys_without_duplicates() {
@@ -2470,6 +2587,30 @@ mod tests {
             "unknown:latest".into(),
         ])
         .is_err());
+    }
+
+    #[test]
+    fn inspect_accepts_reviewed_ollama_lift_options() {
+        let options = RemoteOptions::parse(
+            vec![
+                "11111111111111111111111111111111".into(),
+                "--model".into(),
+                "gpt-oss:20b".into(),
+                "--function".into(),
+                "fn_0".into(),
+                "--context-tokens".into(),
+                "16384".into(),
+                "--ollama-url".into(),
+                "http://127.0.0.1:11434".into(),
+            ],
+            "inspect",
+        )
+        .unwrap();
+        assert_eq!(options.model.as_deref(), Some("gpt-oss:20b"));
+        assert_eq!(options.function_id.as_deref(), Some("fn_0"));
+        assert_eq!(options.context_tokens, 16_384);
+        assert!(options.model_command.is_none());
+        assert!(options.model_endpoint.is_none());
     }
 
     #[test]
