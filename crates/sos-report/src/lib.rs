@@ -312,12 +312,14 @@ pub fn render_markdown(analysis: &StaticAnalysis, semantics: &SemanticAnalysis) 
     }
     output.push_str("## Semantic graph candidates\n\n");
     output.push_str(&format!(
-        "Instruction candidates: `{}`; argument candidates: `{}`; account bases: `{}`; account fields: `{}`; validation checks: `{}`; log candidates: `{}`; error candidates: `{}`.\n\n",
+        "Instruction candidates: `{}`; argument candidates: `{}`; account bases: `{}`; account fields: `{}`; validation checks: `{}`; C SDK deserializers: `{}`; instruction-data guards: `{}`; log candidates: `{}`; error candidates: `{}`.\n\n",
         semantics.instruction_candidates.len(),
         semantics.argument_candidates.len(),
         semantics.account_candidates.len(),
         semantics.account_field_candidates.len(),
         semantics.validation_checks.len(),
+        semantics.deserialization_candidates.len(),
+        semantics.instruction_data_guard_candidates.len(),
         semantics.log_candidates.len(),
         semantics.error_candidates.len()
     ));
@@ -636,6 +638,35 @@ fn render_source_like(
         } else {
             output.push_str(&format!("fn fn_{:04x}() {{\n", function.pc));
         }
+        if let Some(candidate) = semantics
+            .deserialization_candidates
+            .iter()
+            .find(|candidate| candidate.function_pc == function.pc)
+        {
+            if c_like {
+                output.push_str(&format!(
+                    "    /* recovered inlined Solana C SDK deserializer: {} materialized account record(s), {}-byte records; evidence remains in semantics.json */\n",
+                    candidate.account_count, candidate.account_record_size
+                ));
+                output.push_str(&format!(
+                    "    SolParameters params = sol_deserialize(input, {});\n",
+                    candidate.account_count
+                ));
+                output.push_str("    SolAccountInfo *accounts = params.ka;\n");
+                output.push_str("    uint8_t *instruction_data = params.data;\n");
+                output.push_str("    uint64_t instruction_data_len = params.data_len;\n");
+            } else {
+                output.push_str(&format!(
+                    "    // Recovered inlined Solana C SDK deserializer: {} materialized account record(s), {}-byte records; evidence remains in semantics.json.\n",
+                    candidate.account_count, candidate.account_record_size
+                ));
+                output.push_str(&format!(
+                    "    let (accounts, instruction_data, program_id) = sol_deserialize(input, {});\n",
+                    candidate.account_count
+                ));
+                output.push_str("    let instruction_data_len = instruction_data.len();\n");
+            }
+        }
 
         let blocks = analysis
             .basic_blocks
@@ -703,6 +734,65 @@ fn render_instruction(
     indent: usize,
 ) {
     let padding = "    ".repeat(indent);
+    if let Some(guard) = semantics
+        .instruction_data_guard_candidates
+        .iter()
+        .find(|guard| guard.length_load_pc == instruction.pc)
+    {
+        let comment_prefix = if c_like { "/*" } else { "//" };
+        let comment_suffix = if c_like { " */" } else { "" };
+        output.push_str(&format!(
+            "{padding}{comment_prefix} 0x{:x}: recovered instruction-data length load from r{}+{}; evidence: analysis/instruction:0x{:x}{comment_suffix}\n",
+            instruction.pc, guard.base_register, guard.length_offset, instruction.pc
+        ));
+        output.push_str(&format!(
+            "{padding}instruction_data_len = instruction_data.len();\n"
+        ));
+        return;
+    }
+    if let Some(guard) = semantics
+        .instruction_data_guard_candidates
+        .iter()
+        .find(|guard| guard.length_branch_pc == instruction.pc)
+    {
+        let condition = if instruction.assembly.starts_with("jeq") {
+            "=="
+        } else {
+            "!="
+        };
+        output.push_str(&format!(
+            "{padding}if instruction_data_len {condition} 0 {{ goto block_{:x}; }}\n",
+            guard.empty_target_pc
+        ));
+        return;
+    }
+    if let Some(guard) = semantics
+        .instruction_data_guard_candidates
+        .iter()
+        .find(|guard| guard.byte_load_pc == instruction.pc)
+    {
+        output.push_str(&format!(
+            "{padding}let instruction_tag = instruction_data[0]; // recovered from r{}+{} at 0x{:x}\n",
+            guard.base_register, guard.byte_offset, instruction.pc
+        ));
+        return;
+    }
+    if let Some(guard) = semantics
+        .instruction_data_guard_candidates
+        .iter()
+        .find(|guard| guard.tag_compare_pc == instruction.pc)
+    {
+        let condition = if instruction.assembly.starts_with("jeq") {
+            "=="
+        } else {
+            "!="
+        };
+        output.push_str(&format!(
+            "{padding}if instruction_tag {condition} 0x{:02x} {{ goto block_{:x}; }}\n",
+            guard.tag_value, guard.mismatch_target_pc
+        ));
+        return;
+    }
     let resolved_log = semantics
         .resolved_log_calls
         .iter()

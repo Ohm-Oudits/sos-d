@@ -488,6 +488,18 @@ impl EvidencePack {
             .take(limits.max_semantic_items)
             .cloned()
             .collect();
+        bounded_semantics.deserialization_candidates = semantics
+            .deserialization_candidates
+            .iter()
+            .take(limits.max_semantic_items)
+            .cloned()
+            .collect();
+        bounded_semantics.instruction_data_guard_candidates = semantics
+            .instruction_data_guard_candidates
+            .iter()
+            .take(limits.max_semantic_items)
+            .cloned()
+            .collect();
         bounded_semantics.error_candidates = semantics
             .error_candidates
             .iter()

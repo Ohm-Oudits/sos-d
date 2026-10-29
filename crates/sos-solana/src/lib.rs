@@ -1,6 +1,6 @@
 //! Conservative Solana-specific semantic recovery over deterministic SBPF facts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -293,6 +293,37 @@ pub struct ValidationCheckCandidate {
     pub evidence: Vec<EvidenceRef>,
 }
 
+/// Evidence that the entrypoint contains the Solana C SDK's inlined
+/// `sol_deserialize` routine. The C SDK exposes this as an inline function, so
+/// optimized programs do not retain a call symbol for it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeserializationCandidate {
+    pub function_pc: usize,
+    pub account_count: usize,
+    pub account_record_size: u64,
+    pub permitted_data_increase_stride: u64,
+    pub confidence: f32,
+    pub status: EvidenceStatus,
+    pub evidence: Vec<EvidenceRef>,
+}
+
+/// A length check followed by a first-byte instruction discriminator check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstructionDataGuardCandidate {
+    pub length_load_pc: usize,
+    pub length_branch_pc: usize,
+    pub byte_load_pc: usize,
+    pub tag_compare_pc: usize,
+    pub base_register: u8,
+    pub length_offset: i16,
+    pub byte_offset: i16,
+    pub tag_value: i64,
+    pub empty_target_pc: usize,
+    pub mismatch_target_pc: usize,
+    pub status: EvidenceStatus,
+    pub evidence: Vec<EvidenceRef>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticAnalysis {
     pub schema_version: u32,
@@ -321,6 +352,10 @@ pub struct SemanticAnalysis {
     pub protocol_fingerprints: Vec<ProtocolFingerprint>,
     #[serde(default)]
     pub validation_checks: Vec<ValidationCheckCandidate>,
+    #[serde(default)]
+    pub deserialization_candidates: Vec<DeserializationCandidate>,
+    #[serde(default)]
+    pub instruction_data_guard_candidates: Vec<InstructionDataGuardCandidate>,
     #[serde(default)]
     pub error_candidates: Vec<ErrorCandidate>,
     #[serde(default)]
@@ -846,6 +881,10 @@ pub fn analyze_with_registry(
     let stack_account_field_candidates = stack_account_fields(analysis, &mut evidence);
     let validation_checks =
         validation_checks(analysis, &stack_account_field_candidates, &mut evidence);
+    let deserialization_candidates =
+        deserialization_candidates(analysis, &stack_account_field_candidates, &mut evidence);
+    let instruction_data_guard_candidates =
+        instruction_data_guards(analysis, &deserialization_candidates, &mut evidence);
 
     for (instruction_index, instruction) in analysis.instructions.iter().enumerate() {
         if is_syscall(instruction) {
@@ -978,6 +1017,8 @@ pub fn analyze_with_registry(
         runtime_error_candidates,
         protocol_fingerprints,
         validation_checks,
+        deserialization_candidates,
+        instruction_data_guard_candidates,
         error_candidates,
         log_candidates,
         resolved_log_calls,
@@ -1460,6 +1501,191 @@ fn stack_account_fields(
         }
     }
     candidates
+}
+
+fn deserialization_candidates(
+    analysis: &StaticAnalysis,
+    stack_fields: &[StackAccountFieldCandidate],
+    evidence: &mut Vec<EvidenceItem>,
+) -> Vec<DeserializationCandidate> {
+    const ACCOUNT_RECORD_SIZE: i64 = 56;
+    const SDK_STRIDES: [i64; 2] = [10_247, 10_343];
+
+    let complete_accounts = stack_fields
+        .iter()
+        .map(|field| field.account_index)
+        .collect::<BTreeSet<_>>();
+    if complete_accounts.is_empty() {
+        return Vec::new();
+    }
+
+    let record_size = analysis.instructions.iter().find(|instruction| {
+        instruction.opcode == ebpf::MUL64_IMM && instruction.immediate == ACCOUNT_RECORD_SIZE
+    });
+    let stride = analysis.instructions.iter().find(|instruction| {
+        instruction.opcode == ebpf::ADD64_IMM && SDK_STRIDES.contains(&instruction.immediate)
+    });
+    let (Some(record_size), Some(stride)) = (record_size, stride) else {
+        return Vec::new();
+    };
+
+    let function_pc = analysis
+        .functions
+        .iter()
+        .filter(|function| function.pc <= record_size.pc)
+        .max_by_key(|function| function.pc)
+        .map_or(0, |function| function.pc);
+    let mut evidence_refs = vec![instruction_ref(record_size), instruction_ref(stride)];
+    evidence_refs.extend(
+        stack_fields
+            .iter()
+            .flat_map(|field| field.evidence.iter().cloned())
+            .take(24),
+    );
+    let candidate = DeserializationCandidate {
+        function_pc,
+        account_count: complete_accounts.len(),
+        account_record_size: ACCOUNT_RECORD_SIZE as u64,
+        permitted_data_increase_stride: stride.immediate as u64,
+        confidence: 0.95,
+        status: EvidenceStatus::Recovered,
+        evidence: evidence_refs.clone(),
+    };
+    evidence.push(EvidenceItem {
+        kind: "solana_c_sdk_deserializer".into(),
+        value: serde_json::json!({
+            "function_pc": candidate.function_pc,
+            "account_count": candidate.account_count,
+            "account_record_size": candidate.account_record_size,
+            "permitted_data_increase_stride": candidate.permitted_data_increase_stride,
+            "basis": "complete 56-byte SolAccountInfo materialization plus the C SDK permitted-data-increase stride",
+        }),
+        confidence: Some(candidate.confidence),
+        status: candidate.status.clone(),
+        evidence: evidence_refs,
+    });
+    vec![candidate]
+}
+
+fn instruction_data_guards(
+    analysis: &StaticAnalysis,
+    deserializers: &[DeserializationCandidate],
+    evidence: &mut Vec<EvidenceItem>,
+) -> Vec<InstructionDataGuardCandidate> {
+    if deserializers.is_empty() {
+        return Vec::new();
+    }
+
+    let indices = analysis
+        .instructions
+        .iter()
+        .enumerate()
+        .map(|(index, instruction)| (instruction.pc, index))
+        .collect::<BTreeMap<_, _>>();
+    let mut guards = Vec::new();
+    for length_load in analysis
+        .memory_accesses
+        .iter()
+        .filter(|access| access.kind == "load" && access.width == 8)
+    {
+        let Some(length_register) = length_load.value_register else {
+            continue;
+        };
+        let Some(&length_index) = indices.get(&length_load.pc) else {
+            continue;
+        };
+        let Some(length_branch) = analysis
+            .instructions
+            .iter()
+            .skip(length_index + 1)
+            .take(8)
+            .find(|instruction| {
+                is_dispatch_immediate_compare(instruction)
+                    && instruction.dst == length_register
+                    && instruction.immediate == 0
+            })
+        else {
+            continue;
+        };
+        let Some(&branch_index) = indices.get(&length_branch.pc) else {
+            continue;
+        };
+        let Some(byte_offset) = length_load.offset.checked_add(8) else {
+            continue;
+        };
+        let Some(byte_load) = analysis.memory_accesses.iter().find(|access| {
+            access.kind == "load"
+                && access.width == 1
+                && access.base_register == length_load.base_register
+                && access.offset == byte_offset
+                && access.pc > length_branch.pc
+                && indices
+                    .get(&access.pc)
+                    .is_some_and(|index| *index <= branch_index + 8)
+        }) else {
+            continue;
+        };
+        let Some(byte_register) = byte_load.value_register else {
+            continue;
+        };
+        let Some(&byte_index) = indices.get(&byte_load.pc) else {
+            continue;
+        };
+        let Some(tag_compare) = analysis
+            .instructions
+            .iter()
+            .skip(byte_index + 1)
+            .take(8)
+            .find(|instruction| {
+                is_dispatch_immediate_compare(instruction)
+                    && instruction.dst == byte_register
+                    && (0..=u8::MAX as i64).contains(&instruction.immediate)
+            })
+        else {
+            continue;
+        };
+
+        let evidence_refs = vec![
+            memory_ref(length_load),
+            instruction_ref(length_branch),
+            memory_ref(byte_load),
+            instruction_ref(tag_compare),
+        ];
+        let candidate = InstructionDataGuardCandidate {
+            length_load_pc: length_load.pc,
+            length_branch_pc: length_branch.pc,
+            byte_load_pc: byte_load.pc,
+            tag_compare_pc: tag_compare.pc,
+            base_register: length_load.base_register,
+            length_offset: length_load.offset,
+            byte_offset: byte_load.offset,
+            tag_value: tag_compare.immediate,
+            empty_target_pc: branch_target(length_branch),
+            mismatch_target_pc: branch_target(tag_compare),
+            status: EvidenceStatus::Recovered,
+            evidence: evidence_refs.clone(),
+        };
+        evidence.push(EvidenceItem {
+            kind: "instruction_data_guard".into(),
+            value: serde_json::json!({
+                "length_load_pc": candidate.length_load_pc,
+                "length_branch_pc": candidate.length_branch_pc,
+                "byte_load_pc": candidate.byte_load_pc,
+                "tag_compare_pc": candidate.tag_compare_pc,
+                "base_register": candidate.base_register,
+                "length_offset": candidate.length_offset,
+                "byte_offset": candidate.byte_offset,
+                "tag_value": candidate.tag_value,
+                "empty_target_pc": candidate.empty_target_pc,
+                "mismatch_target_pc": candidate.mismatch_target_pc,
+            }),
+            confidence: Some(0.9),
+            status: candidate.status.clone(),
+            evidence: evidence_refs,
+        });
+        guards.push(candidate);
+    }
+    guards
 }
 
 fn block_for_instruction(
@@ -2787,5 +3013,143 @@ mod tests {
             Some("ERROR_MISSING_REQUIRED_SIGNATURES")
         );
         assert_eq!(solana_builtin_error_name(42), None);
+    }
+
+    #[test]
+    fn recovers_c_sdk_deserializer_and_instruction_data_guard_patterns() {
+        let instructions = vec![
+            InstructionFact {
+                pc: 4,
+                opcode: ebpf::MUL64_IMM,
+                dst: 0,
+                src: 0,
+                offset: 0,
+                immediate: 56,
+                assembly: "mul64 r0, 56".into(),
+            },
+            InstructionFact {
+                pc: 5,
+                opcode: ebpf::ADD64_IMM,
+                dst: 4,
+                src: 0,
+                offset: 0,
+                immediate: 10_247,
+                assembly: "add64 r4, 10247".into(),
+            },
+            InstructionFact {
+                pc: 10,
+                opcode: ebpf::LD_DW_REG,
+                dst: 8,
+                src: 6,
+                offset: 8,
+                immediate: 0,
+                assembly: "ldxdw r8, [r6+8]".into(),
+            },
+            InstructionFact {
+                pc: 11,
+                opcode: ebpf::JEQ64_IMM,
+                dst: 8,
+                src: 0,
+                offset: 4,
+                immediate: 0,
+                assembly: "jeq r8, 0, +4".into(),
+            },
+            InstructionFact {
+                pc: 12,
+                opcode: ebpf::LD_B_REG,
+                dst: 1,
+                src: 6,
+                offset: 16,
+                immediate: 0,
+                assembly: "ldxb r1, [r6+16]".into(),
+            },
+            InstructionFact {
+                pc: 13,
+                opcode: ebpf::JNE64_IMM,
+                dst: 1,
+                src: 0,
+                offset: 2,
+                immediate: 0x43,
+                assembly: "jne r1, 67, +2".into(),
+            },
+        ];
+        let analysis = StaticAnalysis {
+            schema_version: sos_types::ANALYSIS_SCHEMA_VERSION,
+            sbpf_version: "V0".into(),
+            entrypoint: 0,
+            instructions,
+            functions: vec![sos_analysis::FunctionFact {
+                pc: 0,
+                symbol_hash: 0,
+                name: "entrypoint".into(),
+            }],
+            basic_blocks: Vec::new(),
+            memory_accesses: vec![
+                MemoryAccessFact {
+                    pc: 10,
+                    kind: "load".into(),
+                    width: 8,
+                    base_register: 6,
+                    value_register: Some(8),
+                    offset: 8,
+                    immediate: None,
+                    assembly: "ldxdw r8, [r6+8]".into(),
+                },
+                MemoryAccessFact {
+                    pc: 12,
+                    kind: "load".into(),
+                    width: 1,
+                    base_register: 6,
+                    value_register: Some(1),
+                    offset: 16,
+                    immediate: None,
+                    assembly: "ldxb r1, [r6+16]".into(),
+                },
+            ],
+            stack_accesses: Vec::new(),
+            strings: Vec::new(),
+            public_key_candidates: Vec::new(),
+            immediate_constants: Vec::new(),
+            register_uses: Vec::new(),
+            calls: Vec::new(),
+            relocations: Vec::new(),
+            sccs: Vec::new(),
+            dataflow_edges: Vec::new(),
+            verifier_diagnostics: Vec::new(),
+        };
+        let fields = [
+            ("key", 0, 8),
+            ("lamports", 8, 8),
+            ("data_len", 16, 8),
+            ("data", 24, 8),
+            ("owner", 32, 8),
+            ("rent_epoch", 40, 8),
+            ("is_signer", 48, 1),
+            ("is_writable", 49, 1),
+            ("executable", 50, 1),
+        ]
+        .into_iter()
+        .map(|(field, frame_offset, width)| StackAccountFieldCandidate {
+            account_index: 0,
+            field: field.into(),
+            frame_offset,
+            width,
+            access_pcs: Vec::new(),
+            status: EvidenceStatus::Recovered,
+            evidence: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+        let mut evidence = Vec::new();
+
+        let deserializers = deserialization_candidates(&analysis, &fields, &mut evidence);
+        let guards = instruction_data_guards(&analysis, &deserializers, &mut evidence);
+
+        assert_eq!(deserializers.len(), 1);
+        assert_eq!(deserializers[0].account_record_size, 56);
+        assert_eq!(deserializers[0].permitted_data_increase_stride, 10_247);
+        assert_eq!(guards.len(), 1);
+        assert_eq!(guards[0].tag_value, 0x43);
+        assert_eq!(guards[0].empty_target_pc, 16);
+        assert_eq!(guards[0].mismatch_target_pc, 16);
     }
 }
