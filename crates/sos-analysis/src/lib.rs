@@ -313,10 +313,20 @@ pub fn build_canonical_ir(analysis: &StaticAnalysis) -> CanonicalIr {
     functions.sort_by_key(|function| function.pc);
     let ir_functions = functions
         .iter()
-        .map(|function| IrFunction {
+        .enumerate()
+        .map(|(index, function)| IrFunction {
             id: format!("fn_{:x}", function.pc),
             entry_pc: function.pc,
-            name: function.name.clone(),
+            name: if function.name.is_empty() {
+                infer_library_helper_name(
+                    analysis,
+                    function.pc,
+                    functions.get(index + 1).map(|next| next.pc),
+                )
+                .unwrap_or_default()
+            } else {
+                function.name.clone()
+            },
         })
         .collect::<Vec<_>>();
 
@@ -410,6 +420,45 @@ pub fn build_canonical_ir(analysis: &StaticAnalysis) -> CanonicalIr {
         operations,
         sccs: analysis.sccs.clone(),
     }
+}
+
+/// Recognize only high-signal compiler helper shapes. These labels are hints in
+/// canonical IR, not claims about original symbol names. A byte-fill helper has
+/// byte and word stores, masks the fill value to one byte, expands that byte to
+/// a repeated 64-bit word, and contains a backward copy/fill loop.
+fn infer_library_helper_name(
+    analysis: &StaticAnalysis,
+    function_pc: usize,
+    next_function_pc: Option<usize>,
+) -> Option<String> {
+    let in_function =
+        |pc: usize| pc >= function_pc && next_function_pc.is_none_or(|next_pc| pc < next_pc);
+    let instructions = analysis
+        .instructions
+        .iter()
+        .filter(|instruction| in_function(instruction.pc))
+        .collect::<Vec<_>>();
+    let byte_stores = instructions
+        .iter()
+        .filter(|instruction| instruction.assembly.starts_with("stxb "))
+        .count();
+    let word_stores = instructions
+        .iter()
+        .filter(|instruction| instruction.assembly.starts_with("stxdw "))
+        .count();
+    let masks_byte = instructions.iter().any(|instruction| {
+        instruction.assembly.starts_with("and64 ") && instruction.immediate == 255
+    });
+    let expands_byte = instructions.iter().any(|instruction| {
+        instruction.assembly.starts_with("lddw ") && instruction.immediate == 0x0101_0101_0101_0101
+    }) && instructions
+        .iter()
+        .any(|instruction| instruction.assembly.starts_with("mul64 "));
+    let has_backward_loop = instructions
+        .iter()
+        .any(|instruction| instruction.offset < 0 && instruction.assembly.starts_with('j'));
+    (byte_stores >= 2 && word_stores >= 2 && masks_byte && expands_byte && has_backward_loop)
+        .then(|| "inferred_memset_like".into())
 }
 
 pub const BINARY_COMPARISON_SCHEMA_VERSION: u32 = 1;
@@ -1673,6 +1722,61 @@ mod static_tests {
         assert_eq!(ir.blocks[0].id, "bb_0");
         assert_eq!(ir.blocks[0].successors, vec!["bb_0"]);
         assert_eq!(ir.operations[0].id, "op_0");
+    }
+
+    #[test]
+    fn canonical_ir_labels_high_signal_byte_fill_helpers() {
+        let instruction = |pc, offset, immediate, assembly: &str| InstructionFact {
+            pc,
+            opcode: 0,
+            dst: 0,
+            src: 0,
+            offset,
+            immediate,
+            assembly: assembly.into(),
+        };
+        let analysis = StaticAnalysis {
+            schema_version: sos_types::ANALYSIS_SCHEMA_VERSION,
+            sbpf_version: "V0".into(),
+            entrypoint: 0x80,
+            instructions: vec![
+                instruction(0x80, 0, 255, "and64 r2, 255"),
+                instruction(0x81, 0, 0x0101_0101_0101_0101, "lddw r5, 0x101010101010101"),
+                instruction(0x83, 0, 0, "mul64 r2, r5"),
+                instruction(0x84, 0, 0, "stxb [r4+0x0], r1"),
+                instruction(0x85, 0, 0, "stxb [r4+0x1], r1"),
+                instruction(0x86, 0, 0, "stxdw [r4+0x0], r2"),
+                instruction(0x87, 0, 0, "stxdw [r4+0x8], r2"),
+                instruction(0x88, -2, 0, "jne r3, 0, lbb_134"),
+            ],
+            functions: vec![FunctionFact {
+                pc: 0x80,
+                symbol_hash: 0,
+                name: String::new(),
+            }],
+            basic_blocks: Vec::new(),
+            memory_accesses: Vec::new(),
+            stack_accesses: Vec::new(),
+            strings: Vec::new(),
+            public_key_candidates: Vec::new(),
+            immediate_constants: Vec::new(),
+            register_uses: Vec::new(),
+            calls: Vec::new(),
+            relocations: Vec::new(),
+            sccs: Vec::new(),
+            dataflow_edges: Vec::new(),
+            verifier_diagnostics: Vec::new(),
+        };
+
+        assert_eq!(
+            build_canonical_ir(&analysis).functions[0].name,
+            "inferred_memset_like"
+        );
+        let mut incomplete = analysis;
+        incomplete
+            .instructions
+            .retain(|item| !item.assembly.starts_with("stxdw "));
+        assert!(build_canonical_ir(&incomplete).functions[0].name.is_empty());
     }
 
     #[test]

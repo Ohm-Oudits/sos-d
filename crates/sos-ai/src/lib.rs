@@ -1583,6 +1583,24 @@ pub fn scope_analysis_to_function(
     scoped.immediate_constants.retain(|item| in_range(item.pc));
     scoped.register_uses.retain(|item| in_range(item.pc));
     scoped.calls.retain(|item| in_range(item.call_pc));
+    // Read-only data is global in the ELF, but exposing every string and public
+    // key to a one-function lift gives a model unrelated semantic bait. Keep
+    // only values whose section offsets are materialized by this function.
+    // Solana's loader maps read-only data at a fixed high base, so the low
+    // 32 bits of a pointer immediate are the section offset used by our facts.
+    let referenced_ro_offsets = scoped
+        .immediate_constants
+        .iter()
+        .filter_map(|item| (item.value >= 0).then_some(item.value as usize & 0xffff_ffff))
+        .collect::<BTreeSet<_>>();
+    scoped.strings.retain(|item| {
+        referenced_ro_offsets
+            .iter()
+            .any(|offset| *offset >= item.offset && *offset < item.offset + item.value.len())
+    });
+    scoped
+        .public_key_candidates
+        .retain(|item| referenced_ro_offsets.contains(&item.offset));
     scoped
         .dataflow_edges
         .retain(|item| in_range(item.source_pc) && in_range(item.destination_pc));
@@ -2850,6 +2868,9 @@ fn validate_structured_consistency(
                         function.function_id
                     )));
                 }
+                if request.task == ModelTask::StructureRecovery {
+                    validate_structure_candidate(request, &function)?;
+                }
             }
         }
         ModelTask::SignatureRecovery => {
@@ -2956,6 +2977,79 @@ fn validate_structured_consistency(
             }
         }
         ModelTask::SemanticLabeling | ModelTask::Explanation => {}
+    }
+    Ok(())
+}
+
+fn validate_structure_candidate(
+    request: &ModelRequest,
+    function: &RecoveredFunction,
+) -> Result<(), AiError> {
+    let declaration = format!("fn {}(", function.function_id);
+    if !function.pseudocode.contains(&declaration) {
+        return Err(AiError::InvalidResponse(format!(
+            "structure candidate for {} must preserve the IR identity with `{declaration}`",
+            function.function_id
+        )));
+    }
+    let function_blocks = request
+        .evidence_pack
+        .ir
+        .blocks
+        .iter()
+        .filter(|block| block.function_id == function.function_id)
+        .map(|block| block.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let operations = request
+        .evidence_pack
+        .ir
+        .operations
+        .iter()
+        .filter(|operation| function_blocks.contains(operation.block_id.as_str()))
+        .collect::<Vec<_>>();
+    let has_loop = request.evidence_pack.ir.sccs.iter().any(|scc| {
+        scc.recursive
+            && scc
+                .block_starts
+                .iter()
+                .any(|pc| function_blocks.contains(format!("bb_{pc:x}").as_str()))
+    });
+    let lower = function.pseudocode.to_ascii_lowercase();
+    if has_loop
+        && !["loop", "while", "for ", "unknown_loop"]
+            .iter()
+            .any(|token| lower.contains(token))
+    {
+        return Err(AiError::InvalidResponse(format!(
+            "structure candidate for {} omits a deterministic CFG loop",
+            function.function_id
+        )));
+    }
+    let has_write = operations.iter().any(|operation| {
+        operation.kind == "store"
+            || operation
+                .memory_effect
+                .as_deref()
+                .is_some_and(|effect| effect.starts_with("store:"))
+    });
+    if has_write
+        && ![
+            "] =",
+            ".fill(",
+            ".copy",
+            "copy_",
+            "memset",
+            "write_",
+            "store_",
+            "unknown_memory_write",
+        ]
+        .iter()
+        .any(|token| lower.contains(token))
+    {
+        return Err(AiError::InvalidResponse(format!(
+            "structure candidate for {} omits deterministic memory writes",
+            function.function_id
+        )));
     }
     Ok(())
 }
@@ -3163,6 +3257,12 @@ fn validate_evidence_ref(
     if evidence.source.trim().is_empty() || evidence.location.trim().is_empty() {
         return Err(AiError::InvalidResponse(
             "evidence references must include a source and location".into(),
+        ));
+    }
+    if evidence.detail.is_some() {
+        return Err(AiError::InvalidResponse(
+            "model evidence detail must be null; SOS resolves immutable evidence text by location"
+                .into(),
         ));
     }
     let supported_source = matches!(evidence.source.as_str(), "analysis" | "ir" | "ro_section");
@@ -3380,10 +3480,17 @@ mod tests {
                 .first()
                 .map(|function| function.id.clone())
                 .unwrap_or_else(|| "fn_0".into());
+            let evidence_location = request
+                .evidence_pack
+                .ir
+                .operations
+                .first()
+                .map(|operation| format!("operation:{}", operation.id))
+                .unwrap_or_else(|| format!("function:{function_id}"));
             let function_evidence = serde_json::json!({
                 "source": "ir",
-                "location": format!("function:{function_id}"),
-                "detail": "bounded IR function"
+                "location": evidence_location,
+                "detail": null
             });
             let structured_output = match request.task {
                 ModelTask::StructureRecovery | ModelTask::PseudocodeHumanization => {
@@ -4413,7 +4520,18 @@ mod tests {
         let first = scope_analysis_to_function(&analysis, 0).unwrap();
         assert_eq!(first.functions.len(), 1);
         assert!(first.instructions.iter().all(|item| item.pc < 8));
-        assert_eq!(first.strings.len(), 1);
+        assert!(first.strings.is_empty());
+
+        analysis
+            .immediate_constants
+            .push(sos_analysis::ImmediateConstantFact {
+                pc: 0,
+                value: 0x1_0000_0004,
+                kind: "lddw".into(),
+                assembly: "lddw r1, 0x100000004".into(),
+            });
+        let referenced = scope_analysis_to_function(&analysis, 0).unwrap();
+        assert_eq!(referenced.strings.len(), 1);
 
         let second = scope_analysis_to_function(&analysis, 8).unwrap();
         assert_eq!(second.functions[0].name, "helper");
@@ -4574,7 +4692,7 @@ mod tests {
                             "evidence": [{
                                 "source": "ir",
                                 "location": "operation:op_100",
-                                "detail": "null guard on line 2"
+                                "detail": null
                             }]
                         }]
                     }),
@@ -4611,7 +4729,7 @@ mod tests {
                     "evidence": [{
                         "source": "ir",
                         "location": "operation:op_100",
-                        "detail": "return statement"
+                        "detail": null
                     }]
                 }]
             }),

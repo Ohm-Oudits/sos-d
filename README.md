@@ -168,6 +168,9 @@ sos decompile ./analysis --format c-like --out ./analysis/pseudocode.c
 sos report ./analysis --format json --out ./analysis/report.json
 sos report ./analysis --format graphviz --out ./analysis/cfg.dot
 sos explain ./analysis --model-command ./fixtures/echo-model.sh --out ./analysis/explanation.json
+sos explain ./analysis --provider ollama --task structure --function fn_0 \
+  --context-tokens 32768 --max-output-tokens 2400 \
+  --out ./analysis/structure-fn-0.json
 sos judge ./program.so ./recompiled-candidate.so \
   --minimum-score 0.90 --out ./binary-judge.json
 ```
@@ -439,6 +442,14 @@ HTTP endpoint:
 ```bash
 sos explain ./analysis --model hosted --model-endpoint http://127.0.0.1:8080/generate
 ```
+
+`sos explain` is also the cost-bounded one-agent path for inspecting one stage
+and one recovered function before committing to a complete five-stage lift. It
+supports the same reviewed Ollama, Groq, Hugging Face, Cloudflare, OpenAI, and
+Anthropic providers as `sos lift`; generated output still passes the same local
+schema, evidence-reference, and anti-cheese checks. It makes one provider
+attempt so a rejected diagnostic cannot silently double local runtime or hosted
+token spend.
 
 For repeatable evaluation, benchmark an artifact directly. The command records
 artifact and analysis hashes, structural/semantic/security counts, and whether

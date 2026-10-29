@@ -8,7 +8,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sos_ai::{
-    compile_refinement_output, deterministic_humanize_pseudocode_unit,
+    compile_refinement_output, default_stage_output_tokens, deterministic_humanize_pseudocode_unit,
     evidence_pack_from_pseudocode_unit, partition_pseudocode, run_pipeline,
     run_pipeline_with_context, run_refinement_loop, run_refinement_loop_with_limits,
     scope_analysis_to_function, trusted_open_model, unavailable_pipeline_bundle,
@@ -928,13 +928,7 @@ fn explain_command(args: Vec<String>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let response = match run_model(
-        &options.directory,
-        options.model_command.as_deref(),
-        options.model_endpoint.as_deref(),
-        &options.model,
-        options.task,
-    ) {
+    let response = match run_model(&options) {
         Ok(response) => response,
         Err(error) => {
             eprintln!("error: {error}");
@@ -3805,38 +3799,125 @@ fn run_model_pipeline(
     }
 }
 
-fn run_model(
-    directory: &Path,
-    command: Option<&Path>,
-    endpoint: Option<&str>,
-    model: &str,
-    task: ModelTask,
-) -> Result<sos_ai::ModelResponse, String> {
-    let analysis = read_json::<sos_analysis::StaticAnalysis>(&directory.join("analysis.json"))?;
-    let semantics = read_json::<sos_solana::SemanticAnalysis>(&directory.join("semantics.json"))
-        .unwrap_or_else(|_| analyze_semantics(&analysis));
+fn run_model(options: &ExplainOptions) -> Result<sos_ai::ModelResponse, String> {
+    let mut analysis =
+        read_json::<sos_analysis::StaticAnalysis>(&options.directory.join("analysis.json"))?;
+    let mut semantics =
+        read_json::<sos_solana::SemanticAnalysis>(&options.directory.join("semantics.json"))
+            .unwrap_or_else(|_| analyze_semantics(&analysis));
+    if let Some(function_id) = options.function_id.as_deref() {
+        let function = analysis
+            .functions
+            .iter()
+            .find(|function| format!("fn_{:x}", function.pc) == function_id)
+            .ok_or_else(|| format!("unknown function scope {function_id}"))?;
+        analysis = scope_analysis_to_function(&analysis, function.pc)
+            .ok_or_else(|| format!("unable to scope analysis to {function_id}"))?;
+        semantics = analyze_semantics(&analysis);
+    }
     let artifact_sha256 =
-        read_json::<sos_types::ArtifactManifest>(&directory.join("manifest.json"))
+        read_json::<sos_types::ArtifactManifest>(&options.directory.join("manifest.json"))
             .ok()
             .map(|manifest| manifest.elf_sha256);
     let pack = EvidencePack::bounded_from_analysis(
-        task,
+        options.task,
         artifact_sha256,
         &analysis,
         &semantics,
         EvidencePackLimits::default(),
     );
-    if let Some(command) = command {
-        return submit_model(CommandModelProvider::new(command), task, model, pack);
+    if let Some(command) = options.model_command.as_deref() {
+        return submit_model_with_budget(
+            CommandModelProvider::new(command),
+            options.task,
+            &options.model,
+            pack,
+            options.max_output_tokens,
+        );
     }
-    if let Some(endpoint) = endpoint {
+    if let Some(endpoint) = options.model_endpoint.as_deref() {
         let mut provider = HttpModelProvider::new(endpoint);
         if let Ok(token) = env::var("SOS_MODEL_TOKEN") {
             provider = provider.with_bearer_token(token);
         }
-        return submit_model(provider, task, model, pack);
+        return submit_model_with_budget(
+            provider,
+            options.task,
+            &options.model,
+            pack,
+            options.max_output_tokens,
+        );
     }
-    Err("no model provider configured".into())
+    let provider = options
+        .provider
+        .ok_or_else(|| "no model provider configured".to_owned())?;
+    match provider {
+        LiftProvider::Ollama => submit_model_with_budget(
+            OllamaModelProvider::new(&options.ollama_url)
+                .with_context_tokens(options.context_tokens),
+            options.task,
+            &options.model,
+            pack,
+            options.max_output_tokens,
+        ),
+        LiftProvider::Groq => submit_model_with_budget(
+            GroqModelProvider::new(
+                env::var("GROQ_API_KEY")
+                    .map_err(|_| "GROQ_API_KEY is required for --provider groq".to_owned())?,
+            )
+            .map_err(|error| error.to_string())?,
+            options.task,
+            &options.model,
+            pack,
+            options.max_output_tokens,
+        ),
+        LiftProvider::HuggingFace => submit_model_with_budget(
+            HuggingFaceModelProvider::new(
+                env::var("HF_TOKEN")
+                    .map_err(|_| "HF_TOKEN is required for --provider huggingface".to_owned())?,
+            )
+            .map_err(|error| error.to_string())?,
+            options.task,
+            &options.model,
+            pack,
+            options.max_output_tokens,
+        ),
+        LiftProvider::Cloudflare => submit_model_with_budget(
+            CloudflareModelProvider::new(
+                env::var("CLOUDFLARE_ACCOUNT_ID").map_err(|_| {
+                    "CLOUDFLARE_ACCOUNT_ID is required for --provider cloudflare".to_owned()
+                })?,
+                env::var("CLOUDFLARE_API_TOKEN").map_err(|_| {
+                    "CLOUDFLARE_API_TOKEN is required for --provider cloudflare".to_owned()
+                })?,
+            )
+            .map_err(|error| error.to_string())?,
+            options.task,
+            &options.model,
+            pack,
+            options.max_output_tokens,
+        ),
+        LiftProvider::OpenAi => submit_model_with_budget(
+            OpenAiModelProvider::new(
+                env::var("OPENAI_API_KEY")
+                    .map_err(|_| "OPENAI_API_KEY is required for --provider openai".to_owned())?,
+            )
+            .map_err(|error| error.to_string())?,
+            options.task,
+            &options.model,
+            pack,
+            options.max_output_tokens,
+        ),
+        LiftProvider::Anthropic => submit_model_with_budget(
+            anthropic_provider(env::var("ANTHROPIC_API_KEY").map_err(|_| {
+                "ANTHROPIC_API_KEY is required for --provider anthropic".to_owned()
+            })?)?,
+            options.task,
+            &options.model,
+            pack,
+            options.max_output_tokens,
+        ),
+    }
 }
 
 fn submit_model<P: ModelProvider>(
@@ -3848,6 +3929,29 @@ fn submit_model<P: ModelProvider>(
     let gateway = ModelGateway::new(provider, 4 * 1024 * 1024, 1024 * 1024);
     gateway
         .submit_with_retry(task, model.to_owned(), HUMANIZATION_PROMPT_VERSION, pack, 2)
+        .map_err(|error| error.to_string())
+}
+
+fn submit_model_with_budget<P: ModelProvider>(
+    provider: P,
+    task: ModelTask,
+    model: &str,
+    pack: EvidencePack,
+    max_output_tokens: usize,
+) -> Result<sos_ai::ModelResponse, String> {
+    let gateway = ModelGateway::new(provider, 4 * 1024 * 1024, 1024 * 1024);
+    gateway
+        .submit_with_retry_and_token_budget(
+            task,
+            model.to_owned(),
+            HUMANIZATION_PROMPT_VERSION,
+            pack,
+            // `sos explain` is the cost-bounded single-stage diagnostic path.
+            // Fail closed after one answer instead of silently doubling local
+            // inference time or hosted token spend on the same immutable input.
+            1,
+            max_output_tokens,
+        )
         .map_err(|error| error.to_string())
 }
 
@@ -3953,34 +4057,66 @@ struct ExplainOptions {
     directory: PathBuf,
     model_command: Option<PathBuf>,
     model_endpoint: Option<String>,
+    provider: Option<LiftProvider>,
+    ollama_url: String,
+    context_tokens: usize,
     model: String,
     task: ModelTask,
+    function_id: Option<String>,
+    max_output_tokens: usize,
+    allow_unreviewed_model: bool,
     output: Option<PathBuf>,
 }
 
 impl ExplainOptions {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let Some(directory) = args.first() else {
-            return Err("usage: sos explain <analysis-directory> --model-command PATH or --model-endpoint URL [options]".into());
+            return Err("usage: sos explain <analysis-directory> --provider ollama|groq|cloudflare|huggingface|openai|anthropic or --model-command PATH or --model-endpoint URL [options]".into());
         };
         let mut options = Self {
             directory: PathBuf::from(directory),
             model_command: None,
             model_endpoint: None,
+            provider: None,
+            ollama_url: "http://127.0.0.1:11434".into(),
+            context_tokens: 32_768,
             model: "local".into(),
             task: ModelTask::Explanation,
+            function_id: None,
+            max_output_tokens: default_stage_output_tokens(ModelTask::Explanation),
+            allow_unreviewed_model: false,
             output: None,
         };
+        let mut model_explicit = false;
+        let mut output_tokens_explicit = false;
         let mut index = 1;
         while index < args.len() {
             let flag = &args[index];
+            if flag == "--allow-unreviewed-model" {
+                options.allow_unreviewed_model = true;
+                index += 1;
+                continue;
+            }
             let Some(value) = args.get(index + 1) else {
                 return Err(format!("missing value for {flag}"));
             };
             match flag.as_str() {
                 "--model-command" => options.model_command = Some(PathBuf::from(value)),
                 "--model-endpoint" => options.model_endpoint = Some(value.clone()),
-                "--model" => options.model = value.clone(),
+                "--provider" => options.provider = Some(LiftProvider::parse(value)?),
+                "--ollama-url" => options.ollama_url = value.clone(),
+                "--context-tokens" => {
+                    options.context_tokens = value
+                        .parse::<usize>()
+                        .map_err(|error| format!("invalid context token count: {error}"))?;
+                    if !(4_096..=131_072).contains(&options.context_tokens) {
+                        return Err("--context-tokens must be between 4096 and 131072".into());
+                    }
+                }
+                "--model" => {
+                    options.model = value.clone();
+                    model_explicit = true;
+                }
                 "--task" => {
                     options.task = match value.as_str() {
                         "structure" => ModelTask::StructureRecovery,
@@ -3989,15 +4125,44 @@ impl ExplainOptions {
                         "explanation" => ModelTask::Explanation,
                         "refinement" => ModelTask::Refinement,
                         _ => return Err(format!("unsupported model task: {value}")),
+                    };
+                    if !output_tokens_explicit {
+                        options.max_output_tokens = default_stage_output_tokens(options.task);
                     }
+                }
+                "--function" => options.function_id = Some(value.clone()),
+                "--max-output-tokens" => {
+                    options.max_output_tokens = parse_stage_token_budget(flag, value)?;
+                    output_tokens_explicit = true;
                 }
                 "--out" => options.output = Some(PathBuf::from(value)),
                 _ => return Err(format!("unknown explain option: {flag}")),
             }
             index += 2;
         }
-        if options.model_command.is_none() && options.model_endpoint.is_none() {
-            return Err("provide --model-command PATH or --model-endpoint URL".into());
+        let provider_count = usize::from(options.provider.is_some())
+            + usize::from(options.model_command.is_some())
+            + usize::from(options.model_endpoint.is_some());
+        if provider_count != 1 {
+            return Err(
+                "provide exactly one of --provider, --model-command, or --model-endpoint".into(),
+            );
+        }
+        if let Some(provider) = options.provider {
+            if !model_explicit {
+                options.model = provider.configured_model().ok_or_else(|| {
+                    format!(
+                        "--provider {} requires --model MODEL or {}",
+                        provider.audit_name(),
+                        provider.model_env_name().unwrap_or("an explicit model ID")
+                    )
+                })?;
+            }
+            provider.validate_agent_models(
+                &options.model,
+                &AiStageModels::default(),
+                options.allow_unreviewed_model,
+            )?;
         }
         Ok(options)
     }
@@ -4471,7 +4636,7 @@ fn usage() -> ExitCode {
     eprintln!("       sos analyze <path-to-sbf-elf> [--out DIR]");
     eprintln!("       sos detect <analysis-directory> [--format json|sarif] [--out PATH]");
     eprintln!("       sos validate <analysis-directory> [--compiler PATH|--no-compile] [--trace PATH] [--repair --model-command PATH --repair-rounds N] [--out PATH]");
-    eprintln!("       sos explain <analysis-directory> --model-command PATH|--model-endpoint URL [--model NAME] [--task structure|signature|semantic|explanation|refinement] [--out PATH]");
+    eprintln!("       sos explain <analysis-directory> (--provider ollama|groq|cloudflare|huggingface|openai|anthropic | --model-command PATH | --model-endpoint URL) [--model NAME] [--task structure|signature|semantic|explanation|refinement] [--function fn_ID] [--context-tokens N] [--max-output-tokens N] [--out PATH]");
     eprintln!(
         "       sos replay <program-address> --signature SIGNATURE [--rpc-url URL] [--out PATH]"
     );
@@ -4502,6 +4667,7 @@ mod tests {
     };
     use sos_ai::{
         AiError, AiStageModels, AiStageTokenBudgets, ModelProvider, ModelRequest, ModelResponse,
+        ModelTask,
     };
 
     #[test]
@@ -4545,10 +4711,35 @@ mod tests {
         ])
         .unwrap();
         assert!(options.model_command.is_none());
+        assert!(options.provider.is_none());
         assert_eq!(
             options.model_endpoint.as_deref(),
             Some("http://127.0.0.1:8080/generate")
         );
+    }
+
+    #[test]
+    fn explain_supports_one_reviewed_agent_stage_with_function_scope() {
+        let options = ExplainOptions::parse(vec![
+            "./analysis".into(),
+            "--provider".into(),
+            "ollama".into(),
+            "--task".into(),
+            "structure".into(),
+            "--function".into(),
+            "fn_80".into(),
+            "--context-tokens".into(),
+            "32768".into(),
+            "--max-output-tokens".into(),
+            "2400".into(),
+        ])
+        .unwrap();
+        assert_eq!(options.provider, Some(LiftProvider::Ollama));
+        assert_eq!(options.model, "gpt-oss:20b");
+        assert_eq!(options.task, ModelTask::StructureRecovery);
+        assert_eq!(options.function_id.as_deref(), Some("fn_80"));
+        assert_eq!(options.context_tokens, 32_768);
+        assert_eq!(options.max_output_tokens, 2_400);
     }
 
     #[test]
@@ -4990,7 +5181,7 @@ mod tests {
                             "evidence": [{
                                 "source": "ir",
                                 "location": format!("operation:{operation_id}"),
-                                "detail": "first operation in bounded unit"
+                                "detail": null
                             }]
                         }]
                     }),
@@ -5084,7 +5275,7 @@ mod tests {
                             "evidence": [{
                                 "source": "ir",
                                 "location": format!("operation:{operation_id}"),
-                                "detail": "bounded function evidence"
+                                "detail": null
                             }]
                         }]
                     }),
@@ -5149,7 +5340,7 @@ mod tests {
                             "evidence": [{
                                 "source": "ir",
                                 "location": format!("operation:{operation_id}"),
-                                "detail": "bounded function operation"
+                                "detail": null
                             }]
                         }]
                     }),
@@ -5163,7 +5354,7 @@ mod tests {
                             "evidence": [{
                                 "source": "ir",
                                 "location": format!("operation:{operation_id}"),
-                                "detail": "bounded function operation"
+                                "detail": null
                             }]
                         }]
                     }),
@@ -5182,7 +5373,7 @@ mod tests {
                             "evidence": [{
                                 "source": "ir",
                                 "location": format!("operation:{operation_id}"),
-                                "detail": "bounded function operation"
+                                "detail": null
                             }]
                         }],
                         "observations": [],
@@ -5396,7 +5587,7 @@ mod tests {
                             "evidence": [{
                                 "source": "ir",
                                 "location": format!("operation:{operation_id}"),
-                                "detail": "bounded function evidence"
+                                "detail": null
                             }]
                         }]
                     }),

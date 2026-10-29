@@ -285,6 +285,25 @@ cargo run -p sos-cli -- lift ./analysis \
   --out ./analysis/lifted
 ```
 
+To evaluate one agent against one recovered function first, use the same
+reviewed provider through the bounded one-stage command:
+
+```bash
+cargo run -p sos-cli -- explain ./analysis \
+  --provider ollama \
+  --task structure \
+  --function fn_0 \
+  --context-tokens 32768 \
+  --max-output-tokens 2400 \
+  --out ./analysis/structure-fn-0.json
+```
+
+This is an auditable diagnostic path, not a replacement for the full agent
+chain. The response is validated against the same immutable scoped evidence
+pack and remains an unverified hypothesis. The command makes one provider
+attempt and fails closed when the candidate drops a deterministic loop or
+memory write, invents a function identity, or cites nonexistent evidence.
+
 Or fetch and lift directly from a deployed program address:
 
 ```bash

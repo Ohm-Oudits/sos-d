@@ -270,8 +270,12 @@ pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::V
             "task": pack.task,
             "source_sha256": pack.artifact_sha256,
             "evidence_addressing": {
-                "ir": "cite function:<fn_id>, block:<bb_id>, or operation:<op_id>",
-                "detail": "always include a short string or null"
+                "valid_ir_examples": [
+                    pack.ir.functions.first().map(|item| format!("function:{}", item.id)),
+                    pack.ir.blocks.first().map(|item| format!("block:{}", item.id)),
+                    pack.ir.operations.first().map(|item| format!("operation:{}", item.id))
+                ],
+                "detail": null
             },
             "pseudocode": {
                 "functions": pack.ir.functions.iter().take(1).collect::<Vec<_>>(),
@@ -307,10 +311,14 @@ pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::V
         "task": pack.task,
         "artifact_sha256": pack.artifact_sha256,
         "evidence_addressing": {
-            "ir": "cite function:<fn_id>, block:<bb_id>, or operation:<op_id>",
-            "analysis": "cite instruction:0x<hex_pc>",
-            "ro_section": "cite offset:0x<hex_offset>",
-            "detail": "always include a short string or null"
+            "valid_ir_examples": [
+                pack.ir.functions.first().map(|item| format!("function:{}", item.id)),
+                pack.ir.blocks.first().map(|item| format!("block:{}", item.id)),
+                pack.ir.operations.first().map(|item| format!("operation:{}", item.id))
+            ],
+            "valid_analysis_example": pack.ir.operations.first().map(|item| format!("instruction:0x{:x}", item.pc)),
+            "valid_ro_section_example": pack.analysis.strings.first().map(|item| format!("offset:0x{:x}", item.offset)),
+            "detail": null
         },
         "program": {
             "sbpf": pack.analysis.sbpf_version,
