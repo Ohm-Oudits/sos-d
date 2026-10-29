@@ -189,8 +189,10 @@ refinement. SOS reduces that compiler output to a bounded function/CFG summary
 and verifies that each SBPF-required effect category is present in the actual
 candidate MIR. A model cannot satisfy this gate merely by returning an effect
 ledger while omitting the corresponding write, branch, loop, call, or return
-from its code. MIR coverage is still a structural non-regression check, not a
-claim of semantic equivalence.
+from its code. SOS also propagates incoming SBPF `r1`-`r5` identities through
+register operations and CFG joins, then requires candidate MIR effects to retain
+those positional input dependencies. MIR coverage is still a structural
+non-regression check, not a claim of semantic equivalence.
 
 ### Local open-weight semantic lifting
 

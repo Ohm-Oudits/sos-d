@@ -121,7 +121,7 @@ The default `--model` can be overridden independently with
 validation rejects any bundle created with a different stage assignment.
 The parallel `--structure-tokens`, `--signature-tokens`, `--semantic-tokens`,
 `--explanation-tokens`, and `--refinement-tokens` flags bound generated output;
-the selected budget is sent to the provider, recorded in AI bundle schema v4,
+the selected budget is sent to the provider, recorded in AI bundle schema v5,
 and included in checkpoint validation.
 The local GPT-OSS adapter selects Ollama's `low` reasoning mode so reasoning
 tokens leave room for final schema-constrained JSON. Structure and signature
@@ -354,6 +354,15 @@ by canonical SBPF IR. Missing categories are fed into bounded repair as external
 validation mismatches. Raw MIR is not persisted because rustc explicitly treats
 its textual representation as unstable.
 
+The same comparison carries positional data dependencies. SOS taints incoming
+SBPF registers `r1` through `r5`, propagates those identities through register
+moves, arithmetic, loads, CFG joins, and recursive blocks, and records the input
+set influencing each observable effect. The MIR summarizer performs the
+corresponding propagation from `_1` through `_5`. If a candidate write, branch,
+loop, or return drops an input required by the binary, validation reports the
+exact missing dependency to the repair agent. Unknown memory contents and
+unknown callee arity are not guessed.
+
 For source-backed corpus fixtures, run the lightweight text-contract smoke test
 after lifting. It fails when required observable semantics are absent from the
 readable candidate:
@@ -395,5 +404,6 @@ syntax and type consistency; MIR comparison additionally proves bounded
 structural effect coverage, not semantic equivalence. Replay proves behavior
 only for the selected paths. Deterministic function-level recompilation scoring
 is implemented. The remaining judge work is automatic pinned candidate builds,
-type-layout verification, variable-dependency correspondence, stronger
-call-graph non-regression constraints, and multi-transaction path coverage.
+type-layout verification, deeper memory/alias dependency correspondence,
+stronger call-graph non-regression constraints, and multi-transaction path
+coverage.

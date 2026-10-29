@@ -173,6 +173,10 @@ each canonical IR function against the deterministic required-effect classes.
 Missing writes, branches, loops, calls, or returns are validation mismatches and
 must be supplied to a bounded repair round when repair is enabled. This gate does
 not replace pinned SBPF recompilation or replay-based behavioral validation.
+Incoming SBPF argument identities must be conservatively propagated through
+register operations, loads, loops, and CFG joins. For each effect class, every
+deterministically required input dependency must appear in the corresponding
+candidate MIR effect; dropped dependencies are repairable mismatches.
 
 Each stage returns strict JSON. Inputs are tagged as untrusted data, and model output
 cannot alter facts, evidence references, or confidence values directly.

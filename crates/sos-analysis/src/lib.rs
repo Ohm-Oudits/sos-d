@@ -207,6 +207,16 @@ pub struct AbiParameterFact {
     pub first_use_pc: usize,
 }
 
+/// Incoming SBPF argument registers that deterministically influence an
+/// observable operation. `kind` is intentionally a small stable vocabulary:
+/// memory_write, branch, call, or return.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbiEffectDependencyFact {
+    pub pc: usize,
+    pub kind: String,
+    pub input_registers: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallFact {
     pub call_pc: usize,
@@ -1289,6 +1299,208 @@ pub fn observed_abi_parameters(
         .collect()
 }
 
+/// Propagate incoming r1-r5 identities through one function and record which
+/// inputs influence observable writes, branches, calls, and returns. The pass
+/// is deliberately register-and-address based: memory contents and unknown
+/// callees are not guessed into dependencies.
+pub fn abi_effect_dependencies(
+    analysis: &StaticAnalysis,
+    function_pc: usize,
+) -> Vec<AbiEffectDependencyFact> {
+    let mut functions = analysis
+        .functions
+        .iter()
+        .map(|item| item.pc)
+        .collect::<Vec<_>>();
+    functions.sort_unstable();
+    let Some(function_index) = functions.iter().position(|pc| *pc == function_pc) else {
+        return Vec::new();
+    };
+    let next_function_pc = functions.get(function_index + 1).copied();
+    let in_function =
+        |pc: usize| pc >= function_pc && next_function_pc.is_none_or(|next_pc| pc < next_pc);
+    let mut block_starts = analysis
+        .basic_blocks
+        .iter()
+        .filter(|block| in_function(block.start_pc))
+        .map(|block| block.start_pc)
+        .collect::<Vec<_>>();
+    block_starts.sort_unstable();
+    block_starts.dedup();
+    if !block_starts.contains(&function_pc) {
+        return Vec::new();
+    }
+    let blocks = analysis
+        .basic_blocks
+        .iter()
+        .filter(|block| in_function(block.start_pc))
+        .map(|block| (block.start_pc, block))
+        .collect::<BTreeMap<_, _>>();
+    let mut entry = [0_u8; 11];
+    for (register, origin) in entry.iter_mut().enumerate().take(6).skip(1) {
+        *origin = 1 << register;
+    }
+    let mut incoming = BTreeMap::<usize, [u8; 11]>::new();
+    incoming.insert(function_pc, entry);
+    let mut queue = VecDeque::from([function_pc]);
+    let mut effects = BTreeMap::<(usize, String), u8>::new();
+
+    while let Some(block_pc) = queue.pop_front() {
+        let Some(block) = blocks.get(&block_pc) else {
+            continue;
+        };
+        let mut origins = incoming.get(&block_pc).copied().unwrap_or_default();
+        let next_block_pc = block_starts
+            .iter()
+            .copied()
+            .find(|candidate| *candidate > block_pc);
+        for instruction in analysis.instructions.iter().filter(|instruction| {
+            instruction.pc >= block_pc
+                && next_block_pc.is_none_or(|next_pc| instruction.pc < next_pc)
+                && in_function(instruction.pc)
+        }) {
+            if let Some((kind, dependencies)) =
+                instruction_effect_dependencies(instruction, &origins)
+            {
+                *effects.entry((instruction.pc, kind)).or_default() |= dependencies;
+            }
+            transfer_dependency_origins(instruction, &mut origins);
+        }
+        for successor in block
+            .destinations
+            .iter()
+            .copied()
+            .filter(|pc| blocks.contains_key(pc))
+        {
+            let state = incoming.entry(successor).or_default();
+            let mut changed = false;
+            for (existing, propagated) in state.iter_mut().zip(origins) {
+                let merged = *existing | propagated;
+                changed |= merged != *existing;
+                *existing = merged;
+            }
+            if changed {
+                queue.push_back(successor);
+            }
+        }
+    }
+
+    effects
+        .into_iter()
+        .map(|((pc, kind), dependencies)| AbiEffectDependencyFact {
+            pc,
+            kind,
+            input_registers: dependency_registers(dependencies),
+        })
+        .collect()
+}
+
+fn instruction_effect_dependencies(
+    instruction: &InstructionFact,
+    origins: &[u8; 11],
+) -> Option<(String, u8)> {
+    use solana_sbpf::ebpf;
+
+    if let Some(access) = memory_access(instruction) {
+        if access.kind == "store" {
+            let mut dependencies = origins[access.base_register as usize];
+            if let Some(register) = access.value_register {
+                dependencies |= origins[register as usize];
+            }
+            return Some(("memory_write".into(), dependencies));
+        }
+        return None;
+    }
+    let class = instruction.opcode & ebpf::BPF_CLS_MASK;
+    let operation = instruction.opcode & ebpf::BPF_ALU_OP_MASK;
+    if class == ebpf::BPF_JMP64
+        || (class == ebpf::BPF_JMP32 && instruction.assembly.starts_with('j'))
+    {
+        return match operation {
+            ebpf::BPF_CALL => Some(("call".into(), 0)),
+            ebpf::BPF_EXIT if instruction.assembly.starts_with("syscall ") => {
+                Some(("call".into(), 0))
+            }
+            ebpf::BPF_EXIT => Some(("return".into(), origins[0])),
+            ebpf::BPF_JA => Some(("branch".into(), 0)),
+            _ => {
+                let mut dependencies = origins[instruction.dst as usize];
+                if instruction.opcode & ebpf::BPF_X != 0 {
+                    dependencies |= origins[instruction.src as usize];
+                }
+                Some(("branch".into(), dependencies))
+            }
+        };
+    }
+    None
+}
+
+fn transfer_dependency_origins(instruction: &InstructionFact, origins: &mut [u8; 11]) {
+    use solana_sbpf::ebpf;
+
+    if let Some(access) = memory_access(instruction) {
+        if access.kind == "load" {
+            origins[instruction.dst as usize] = origins[access.base_register as usize];
+        }
+        return;
+    }
+    if instruction.opcode == ebpf::LD_DW_IMM {
+        origins[instruction.dst as usize] = 0;
+        return;
+    }
+    let class = instruction.opcode & ebpf::BPF_CLS_MASK;
+    let operation = instruction.opcode & ebpf::BPF_ALU_OP_MASK;
+    let register_source = instruction.opcode & ebpf::BPF_X != 0;
+    match class {
+        ebpf::BPF_LDX => {
+            origins[instruction.dst as usize] = origins[instruction.src as usize];
+        }
+        ebpf::BPF_ALU32_LOAD | ebpf::BPF_ALU64_STORE => {
+            let value = if operation == ebpf::BPF_MOV {
+                if register_source {
+                    origins[instruction.src as usize]
+                } else {
+                    0
+                }
+            } else {
+                origins[instruction.dst as usize]
+                    | if register_source {
+                        origins[instruction.src as usize]
+                    } else {
+                        0
+                    }
+            };
+            origins[instruction.dst as usize] = value;
+        }
+        ebpf::BPF_JMP32 if !instruction.assembly.starts_with('j') => {
+            origins[instruction.dst as usize] |= if register_source {
+                origins[instruction.src as usize]
+            } else {
+                0
+            };
+        }
+        ebpf::BPF_JMP64 | ebpf::BPF_JMP32 if operation == ebpf::BPF_CALL => {
+            for origin in origins.iter_mut().take(6) {
+                *origin = 0;
+            }
+        }
+        ebpf::BPF_JMP64 | ebpf::BPF_JMP32
+            if operation == ebpf::BPF_EXIT && instruction.assembly.starts_with("syscall ") =>
+        {
+            for origin in origins.iter_mut().take(6) {
+                *origin = 0;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn dependency_registers(mask: u8) -> Vec<u8> {
+    (1..=5)
+        .filter(|register| mask & (1 << register) != 0)
+        .collect()
+}
+
 fn instruction_register_effects(instruction: &InstructionFact) -> (Vec<u8>, Vec<u8>, bool) {
     use solana_sbpf::ebpf;
 
@@ -1989,6 +2201,77 @@ mod static_tests {
                 AbiParameterFact {
                     register: 3,
                     first_use_pc: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn propagates_abi_inputs_into_effect_dependencies() {
+        use solana_sbpf::ebpf;
+
+        let instruction = |pc, opcode, dst, src, assembly: &str| InstructionFact {
+            pc,
+            opcode,
+            dst,
+            src,
+            offset: 0,
+            immediate: 0,
+            assembly: assembly.into(),
+        };
+        let instructions = vec![
+            instruction(0, ebpf::MOV64_REG, 0, 1, "mov64 r0, r1"),
+            instruction(1, ebpf::MOV64_REG, 1, 2, "mov64 r1, r2"),
+            instruction(2, ebpf::JEQ64_IMM, 3, 0, "jeq r3, 0, lbb_4"),
+            instruction(3, ebpf::ST_B_REG, 0, 1, "stxb [r0], r1"),
+            instruction(4, ebpf::EXIT, 0, 0, "exit"),
+        ];
+        let analysis = StaticAnalysis {
+            schema_version: sos_types::ANALYSIS_SCHEMA_VERSION,
+            sbpf_version: "V0".into(),
+            entrypoint: 0,
+            instructions,
+            functions: vec![FunctionFact {
+                pc: 0,
+                symbol_hash: 0,
+                name: "fill".into(),
+            }],
+            basic_blocks: vec![BasicBlockFact {
+                start_pc: 0,
+                end_instruction_index: 5,
+                destinations: vec![],
+                label: "entry".into(),
+            }],
+            memory_accesses: vec![],
+            stack_accesses: vec![],
+            strings: vec![],
+            public_key_candidates: vec![],
+            immediate_constants: vec![],
+            register_uses: vec![],
+            calls: vec![],
+            relocations: vec![],
+            sccs: vec![],
+            dataflow_edges: vec![],
+            verifier_diagnostics: vec![],
+        };
+
+        assert_eq!(
+            abi_effect_dependencies(&analysis, 0),
+            vec![
+                AbiEffectDependencyFact {
+                    pc: 2,
+                    kind: "branch".into(),
+                    input_registers: vec![3],
+                },
+                AbiEffectDependencyFact {
+                    pc: 3,
+                    kind: "memory_write".into(),
+                    input_registers: vec![1, 2],
+                },
+                AbiEffectDependencyFact {
+                    pc: 4,
+                    kind: "return".into(),
+                    input_registers: vec![1],
                 },
             ]
         );

@@ -5,7 +5,7 @@
 //! gateway remains responsible for schema, evidence, and resource validation.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -37,7 +37,7 @@ pub use ollama::{trusted_open_model, OllamaModelProvider, OpenModelProfile, TRUS
 pub use openai::OpenAiModelProvider;
 
 pub const AI_SCHEMA_VERSION: u32 = 1;
-pub const AI_BUNDLE_SCHEMA_VERSION: u32 = 4;
+pub const AI_BUNDLE_SCHEMA_VERSION: u32 = 5;
 pub const MIN_STAGE_OUTPUT_TOKENS: usize = 128;
 pub const MAX_STAGE_OUTPUT_TOKENS: usize = 32_768;
 
@@ -230,6 +230,8 @@ pub struct RecoveredFunction {
 pub struct RecoveredEffect {
     pub kind: RecoveredEffectKind,
     #[serde(default)]
+    pub input_registers: Vec<u8>,
+    #[serde(default)]
     pub evidence: Vec<sos_types::EvidenceRef>,
 }
 
@@ -247,9 +249,26 @@ pub enum RecoveredEffectKind {
 pub struct RequiredEffect {
     pub kind: RecoveredEffectKind,
     pub location: String,
+    pub input_registers: Vec<u8>,
 }
 
 pub fn required_structure_effects(pack: &EvidencePack, function_id: &str) -> Vec<RequiredEffect> {
+    let function_entry_pc = pack
+        .ir
+        .functions
+        .iter()
+        .find(|function| function.id == function_id)
+        .map(|function| function.entry_pc);
+    let dependency_facts = function_entry_pc
+        .map(|pc| sos_analysis::abi_effect_dependencies(&pack.analysis, pc))
+        .unwrap_or_default();
+    let dependency_map = dependency_facts
+        .iter()
+        .filter_map(|fact| {
+            recovered_effect_kind(&fact.kind)
+                .map(|kind| ((fact.pc, kind), fact.input_registers.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
     let function_blocks = pack
         .ir
         .blocks
@@ -288,21 +307,54 @@ pub fn required_structure_effects(pack: &EvidencePack, function_id: &str) -> Vec
             required.insert(RequiredEffect {
                 kind,
                 location: format!("operation:{}", operation.id),
+                input_registers: dependency_map
+                    .get(&(operation.pc, kind))
+                    .cloned()
+                    .unwrap_or_default(),
             });
         }
     }
     for scc in pack.ir.sccs.iter().filter(|scc| scc.recursive) {
+        let scc_blocks = scc
+            .block_starts
+            .iter()
+            .map(|pc| format!("bb_{pc:x}"))
+            .collect::<BTreeSet<_>>();
+        let loop_inputs = pack
+            .ir
+            .operations
+            .iter()
+            .filter(|operation| scc_blocks.contains(&operation.block_id))
+            .filter_map(|operation| {
+                dependency_map.get(&(operation.pc, RecoveredEffectKind::Branch))
+            })
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         for pc in &scc.block_starts {
             let location = format!("block:bb_{pc:x}");
             if function_blocks.contains(location.trim_start_matches("block:")) {
                 required.insert(RequiredEffect {
                     kind: RecoveredEffectKind::Loop,
                     location,
+                    input_registers: loop_inputs.clone(),
                 });
             }
         }
     }
     required.into_iter().collect()
+}
+
+fn recovered_effect_kind(kind: &str) -> Option<RecoveredEffectKind> {
+    match kind {
+        "memory_write" => Some(RecoveredEffectKind::MemoryWrite),
+        "branch" => Some(RecoveredEffectKind::Branch),
+        "call" => Some(RecoveredEffectKind::Call),
+        "return" => Some(RecoveredEffectKind::Return),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -431,6 +483,13 @@ pub struct MirFunctionSummary {
     pub memory_writes: usize,
     pub returns: usize,
     pub has_loop: bool,
+    pub effect_dependencies: Vec<MirEffectDependency>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MirEffectDependency {
+    pub kind: RecoveredEffectKind,
+    pub input_parameters: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -453,6 +512,15 @@ pub struct MirFunctionEffectComparison {
     pub required: Vec<RecoveredEffectKind>,
     pub observed: Vec<RecoveredEffectKind>,
     pub missing: Vec<RecoveredEffectKind>,
+    pub dependency_mismatches: Vec<MirDependencyMismatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MirDependencyMismatch {
+    pub kind: RecoveredEffectKind,
+    pub required_input_registers: Vec<u8>,
+    pub observed_input_parameters: Vec<u8>,
+    pub missing_input_dependencies: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2447,6 +2515,7 @@ pub fn summarize_rustc_mir(source: &str) -> MirProgramSummary {
         memory_writes: usize,
         returns: usize,
         current_block: Option<usize>,
+        block_lines: BTreeMap<usize, Vec<String>>,
     }
 
     fn finish(builder: Builder) -> MirFunctionSummary {
@@ -2455,6 +2524,12 @@ pub fn summarize_rustc_mir(source: &str) -> MirProgramSummary {
             edge.source == edge.destination
                 || mir_path_exists(&edges, edge.destination, edge.source)
         });
+        let effect_dependencies = summarize_mir_effect_dependencies(
+            &builder.block_lines,
+            &edges,
+            builder.parameter_count,
+            has_loop,
+        );
         MirFunctionSummary {
             name: builder.name,
             parameter_count: builder.parameter_count,
@@ -2465,6 +2540,7 @@ pub fn summarize_rustc_mir(source: &str) -> MirProgramSummary {
             memory_writes: builder.memory_writes,
             returns: builder.returns,
             has_loop,
+            effect_dependencies,
         }
     }
 
@@ -2506,6 +2582,11 @@ pub fn summarize_rustc_mir(source: &str) -> MirProgramSummary {
         let Some(source_block) = builder.current_block else {
             continue;
         };
+        builder
+            .block_lines
+            .entry(source_block)
+            .or_default()
+            .push(trimmed.to_owned());
         let targets = mir_block_targets(trimmed);
         for destination in &targets {
             builder.edges.insert(MirEdge {
@@ -2592,6 +2673,136 @@ fn count_mir_parameters(parameters: &str) -> usize {
     count
 }
 
+fn summarize_mir_effect_dependencies(
+    blocks: &BTreeMap<usize, Vec<String>>,
+    edges: &[MirEdge],
+    parameter_count: usize,
+    has_loop: bool,
+) -> Vec<MirEffectDependency> {
+    let Some(entry_block) = blocks.keys().next().copied() else {
+        return Vec::new();
+    };
+    let mut entry = BTreeMap::<usize, u8>::new();
+    for parameter in 1..=parameter_count.min(5) {
+        entry.insert(parameter, 1 << parameter);
+    }
+    let mut incoming = BTreeMap::<usize, BTreeMap<usize, u8>>::new();
+    incoming.insert(entry_block, entry);
+    let mut queue = std::collections::VecDeque::from([entry_block]);
+    let mut effects = BTreeMap::<RecoveredEffectKind, u8>::new();
+    while let Some(block) = queue.pop_front() {
+        let mut origins = incoming.get(&block).cloned().unwrap_or_default();
+        for line in blocks.get(&block).into_iter().flatten() {
+            let is_call = line.contains(" -> [return: bb")
+                && line
+                    .split_once(" = ")
+                    .is_some_and(|(_, right)| right.contains('('));
+            if let Some((left, right)) = line.split_once(" = ") {
+                let right_dependencies = mir_local_dependencies(right, &origins);
+                if mir_is_projected_place(left) {
+                    *effects.entry(RecoveredEffectKind::MemoryWrite).or_default() |=
+                        right_dependencies | mir_local_dependencies(left, &origins);
+                } else if let Some(local) = parse_plain_mir_local(left) {
+                    origins.insert(local, right_dependencies);
+                }
+            }
+            if is_call {
+                *effects.entry(RecoveredEffectKind::Call).or_default() |=
+                    mir_local_dependencies(line, &origins);
+            } else if line.starts_with("switchInt(") || line.starts_with("assert(") {
+                *effects.entry(RecoveredEffectKind::Branch).or_default() |=
+                    mir_local_dependencies(line, &origins);
+            } else if line.starts_with("goto ->") {
+                effects.entry(RecoveredEffectKind::Branch).or_default();
+            }
+            if line == "return;" {
+                *effects.entry(RecoveredEffectKind::Return).or_default() |=
+                    origins.get(&0).copied().unwrap_or_default();
+            }
+        }
+        for successor in edges
+            .iter()
+            .filter(|edge| edge.source == block)
+            .map(|edge| edge.destination)
+        {
+            let state = incoming.entry(successor).or_default();
+            let mut changed = false;
+            for (local, propagated) in &origins {
+                let slot = state.entry(*local).or_default();
+                let merged = *slot | *propagated;
+                changed |= merged != *slot;
+                *slot = merged;
+            }
+            if changed {
+                queue.push_back(successor);
+            }
+        }
+    }
+    if has_loop {
+        let branch_dependencies = effects
+            .get(&RecoveredEffectKind::Branch)
+            .copied()
+            .unwrap_or_default();
+        effects.insert(RecoveredEffectKind::Loop, branch_dependencies);
+    }
+    effects
+        .into_iter()
+        .map(|(kind, dependencies)| MirEffectDependency {
+            kind,
+            input_parameters: dependency_registers_from_mask(dependencies),
+        })
+        .collect()
+}
+
+fn mir_local_dependencies(line: &str, origins: &BTreeMap<usize, u8>) -> u8 {
+    mir_locals(line).into_iter().fold(0, |dependencies, local| {
+        dependencies | origins.get(&local).copied().unwrap_or_default()
+    })
+}
+
+fn mir_locals(line: &str) -> Vec<usize> {
+    let bytes = line.as_bytes();
+    let mut locals = BTreeSet::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'_' {
+            let begin = index + 1;
+            let mut end = begin;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > begin {
+                if let Ok(local) = line[begin..end].parse::<usize>() {
+                    locals.insert(local);
+                }
+                index = end;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    locals.into_iter().collect()
+}
+
+fn parse_plain_mir_local(place: &str) -> Option<usize> {
+    let place = place.trim();
+    let digits = place.strip_prefix('_')?;
+    (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+fn mir_is_projected_place(place: &str) -> bool {
+    let place = place.trim();
+    place.contains("(*") || place.contains('[')
+}
+
+fn dependency_registers_from_mask(mask: u8) -> Vec<u8> {
+    (1..=5)
+        .filter(|parameter| mask & (1 << parameter) != 0)
+        .collect()
+}
+
 fn mir_path_exists(edges: &[MirEdge], start: usize, goal: usize) -> bool {
     let mut pending = vec![start];
     let mut visited = BTreeSet::new();
@@ -2642,7 +2853,53 @@ pub fn compare_mir_effects(
             .map(mir_observed_effects)
             .unwrap_or_default();
         let missing = required.difference(&observed).copied().collect::<Vec<_>>();
+        let candidate = summary
+            .functions
+            .iter()
+            .find(|candidate| candidate.name == function.id);
+        let dependency_mismatches = required_structure_effects(pack, &function.id)
+            .into_iter()
+            .fold(
+                BTreeMap::<RecoveredEffectKind, BTreeSet<u8>>::new(),
+                |mut dependencies, effect| {
+                    dependencies
+                        .entry(effect.kind)
+                        .or_default()
+                        .extend(effect.input_registers);
+                    dependencies
+                },
+            )
+            .into_iter()
+            .filter_map(|(kind, required_inputs)| {
+                let observed_inputs = candidate
+                    .and_then(|candidate| {
+                        candidate
+                            .effect_dependencies
+                            .iter()
+                            .find(|dependency| dependency.kind == kind)
+                    })
+                    .map(|dependency| {
+                        dependency
+                            .input_parameters
+                            .iter()
+                            .copied()
+                            .collect::<BTreeSet<_>>()
+                    })
+                    .unwrap_or_default();
+                let missing_inputs = required_inputs
+                    .difference(&observed_inputs)
+                    .copied()
+                    .collect::<Vec<_>>();
+                (!missing_inputs.is_empty()).then(|| MirDependencyMismatch {
+                    kind,
+                    required_input_registers: required_inputs.into_iter().collect(),
+                    observed_input_parameters: observed_inputs.into_iter().collect(),
+                    missing_input_dependencies: missing_inputs,
+                })
+            })
+            .collect::<Vec<_>>();
         has_mismatch |= !missing.is_empty()
+            || !dependency_mismatches.is_empty()
             || !summary
                 .functions
                 .iter()
@@ -2652,6 +2909,7 @@ pub fn compare_mir_effects(
             required: required.into_iter().collect(),
             observed: observed.into_iter().collect(),
             missing,
+            dependency_mismatches,
         });
     }
     MirEffectComparison {
@@ -3504,16 +3762,44 @@ fn validate_structure_candidate(
                 function.function_id
             )));
         }
+        let mut normalized_inputs = effect.input_registers.clone();
+        normalized_inputs.sort_unstable();
+        normalized_inputs.dedup();
+        if normalized_inputs != effect.input_registers
+            || normalized_inputs
+                .iter()
+                .any(|register| !(1..=5).contains(register))
+        {
+            return Err(AiError::InvalidResponse(format!(
+                "structure candidate for {} has invalid or non-canonical effect input registers",
+                function.function_id
+            )));
+        }
         for evidence in &effect.evidence {
             if evidence.source == "ir" {
-                covered_effects.insert((effect.kind, evidence.location.clone()));
+                covered_effects.insert((
+                    effect.kind,
+                    evidence.location.clone(),
+                    normalized_inputs.clone(),
+                ));
             }
         }
     }
     let missing_effects = required_effects
         .iter()
-        .filter(|required| !covered_effects.contains(&(required.kind, required.location.clone())))
-        .map(|required| format!("{:?}:{}", required.kind, required.location))
+        .filter(|required| {
+            !covered_effects.contains(&(
+                required.kind,
+                required.location.clone(),
+                required.input_registers.clone(),
+            ))
+        })
+        .map(|required| {
+            format!(
+                "{:?}:{}<-{:?}",
+                required.kind, required.location, required.input_registers
+            )
+        })
         .collect::<Vec<_>>();
     if !missing_effects.is_empty() {
         return Err(AiError::InvalidResponse(format!(
@@ -4378,6 +4664,10 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
         assert_eq!(function.returns, 1);
         assert!(function.branch_terminators >= 2);
         assert!(function.has_loop);
+        assert!(function.effect_dependencies.iter().any(|dependency| {
+            dependency.kind == RecoveredEffectKind::MemoryWrite
+                && dependency.input_parameters == vec![1, 2, 3]
+        }));
 
         let mut pack = empty_pack();
         pack.task = ModelTask::Refinement;
@@ -4441,6 +4731,10 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
                 memory_writes: 0,
                 returns: 1,
                 has_loop: false,
+                effect_dependencies: vec![MirEffectDependency {
+                    kind: RecoveredEffectKind::Return,
+                    input_parameters: Vec::new(),
+                }],
             }],
         };
         let comparison = compare_mir_effects(&pack, Some(&summary));
@@ -4448,6 +4742,58 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
         assert_eq!(
             comparison.functions[0].missing,
             vec![RecoveredEffectKind::MemoryWrite]
+        );
+    }
+
+    #[test]
+    fn mir_effect_comparison_rejects_dropped_input_dependencies() {
+        let mut analysis = empty_pack().analysis;
+        analysis.instructions[0] = InstructionFact {
+            pc: 0,
+            opcode: 0x7b,
+            dst: 1,
+            src: 2,
+            offset: 0,
+            immediate: 0,
+            assembly: "stxdw [r1], r2".into(),
+        };
+        analysis.memory_accesses = vec![sos_analysis::MemoryAccessFact {
+            pc: 0,
+            kind: "store".into(),
+            width: 8,
+            base_register: 1,
+            value_register: Some(2),
+            offset: 0,
+            immediate: None,
+            assembly: "stxdw [r1], r2".into(),
+        }];
+        let semantics = sos_solana::analyze(&analysis);
+        let pack = EvidencePack::from_analysis(ModelTask::Refinement, None, analysis, semantics);
+        let summary = MirProgramSummary {
+            schema_version: MIR_SUMMARY_SCHEMA_VERSION,
+            functions: vec![MirFunctionSummary {
+                name: "fn_0".into(),
+                parameter_count: 2,
+                basic_block_count: 1,
+                edges: Vec::new(),
+                branch_terminators: 0,
+                calls: 0,
+                memory_writes: 1,
+                returns: 0,
+                has_loop: false,
+                effect_dependencies: vec![MirEffectDependency {
+                    kind: RecoveredEffectKind::MemoryWrite,
+                    input_parameters: vec![1],
+                }],
+            }],
+        };
+
+        let comparison = compare_mir_effects(&pack, Some(&summary));
+        assert_eq!(comparison.status, MirEffectComparisonStatus::Mismatch);
+        assert!(comparison.functions[0].missing.is_empty());
+        assert_eq!(
+            comparison.functions[0].dependency_mismatches[0].missing_input_dependencies,
+            vec![2]
         );
     }
 
@@ -4975,6 +5321,7 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
         let effect = |kind: &str, location: &str| {
             serde_json::json!({
                 "kind": kind,
+                "input_registers": [],
                 "evidence": [{"source": "ir", "location": location, "detail": null}]
             })
         };
@@ -4990,6 +5337,11 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
             "evidence": [{"source": "ir", "location": "function:fn_0", "detail": null}]
         }]});
         assert!(validate_structured_consistency(&request, &valid).is_ok());
+
+        let mut wrong_dependencies = valid.clone();
+        wrong_dependencies["functions"][0]["effects"][0]["input_registers"] =
+            serde_json::json!([1]);
+        assert!(validate_structured_consistency(&request, &wrong_dependencies).is_err());
 
         let mut missing_write = valid;
         missing_write["functions"][0]["effects"]

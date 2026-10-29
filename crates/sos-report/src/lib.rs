@@ -399,8 +399,9 @@ pub fn render_ai_markdown(bundle: &AiPipelineBundle) -> String {
                             .iter()
                             .map(|effect| {
                                 format!(
-                                    "`{:?}` → {}",
+                                    "`{:?}` from ABI {:?} → {}",
                                     effect.kind,
+                                    effect.input_registers,
                                     render_evidence_refs(&effect.evidence)
                                 )
                             })
