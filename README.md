@@ -189,6 +189,19 @@ candidate are marked unresolved. The research basis, trust boundary, and staged
 GoonFi/Patina-derived design are documented in
 [docs/SEMANTIC_LIFTING.md](docs/SEMANTIC_LIFTING.md).
 
+Run the complete checked fixture demonstration—C/SBF `.so` analysis, scoped
+open-weight lifting, bounded compiler repair, and the deterministic behavior
+coverage gate—with:
+
+```bash
+ollama serve
+./scripts/demo-open-model.sh
+```
+
+The script uses only the reviewed `gpt-oss:20b` profile unless `SOS_MODEL` is
+explicitly changed, and prints the paths to the readable source, audited model
+bundle, and quality result.
+
 Hosted providers can implement the same provider-neutral JSON protocol through an
 HTTP endpoint:
 
