@@ -95,6 +95,20 @@ pub struct LogCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedLogCall {
+    pub instruction_pc: usize,
+    pub syscall: String,
+    pub pointer: u64,
+    pub length: usize,
+    pub string_offset: usize,
+    pub value: String,
+    pub pointer_source_pc: usize,
+    pub length_source_pc: usize,
+    pub status: EvidenceStatus,
+    pub evidence: Vec<EvidenceRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CpiCandidate {
     pub instruction_pc: usize,
     pub syscall: String,
@@ -279,6 +293,8 @@ pub struct SemanticAnalysis {
     pub error_candidates: Vec<ErrorCandidate>,
     #[serde(default)]
     pub log_candidates: Vec<LogCandidate>,
+    #[serde(default)]
+    pub resolved_log_calls: Vec<ResolvedLogCall>,
     pub evidence: Vec<EvidenceItem>,
 }
 
@@ -906,6 +922,8 @@ pub fn analyze_with_registry(
     let account_candidates = account_candidates(&input_field_candidates);
     let account_field_candidates = account_field_candidates(&input_field_candidates);
     let (error_candidates, log_candidates) = string_role_candidates(analysis);
+    let resolved_log_calls =
+        resolved_log_calls(analysis, &syscalls, &argument_candidates, &mut evidence);
     SemanticAnalysis {
         schema_version: SEMANTIC_SCHEMA_VERSION,
         syscalls,
@@ -925,8 +943,100 @@ pub fn analyze_with_registry(
         validation_checks,
         error_candidates,
         log_candidates,
+        resolved_log_calls,
         evidence,
     }
+}
+
+fn resolved_log_calls(
+    analysis: &StaticAnalysis,
+    syscalls: &[SyscallFact],
+    arguments: &[ArgumentCandidate],
+    evidence: &mut Vec<EvidenceItem>,
+) -> Vec<ResolvedLogCall> {
+    let mut calls = Vec::new();
+    for syscall in syscalls
+        .iter()
+        .filter(|syscall| syscall.name.as_deref() == Some("sol_log_"))
+    {
+        let pointer = arguments.iter().find(|argument| {
+            argument.instruction_pc == syscall.instruction_pc && argument.register == 1
+        });
+        let length = arguments.iter().find(|argument| {
+            argument.instruction_pc == syscall.instruction_pc && argument.register == 2
+        });
+        let (Some(pointer), Some(length)) = (pointer, length) else {
+            continue;
+        };
+        let (Some(pointer_value), Some(length_value)) = (pointer.value, length.value) else {
+            continue;
+        };
+        let (Ok(pointer_value), Ok(length_value)) =
+            (u64::try_from(pointer_value), usize::try_from(length_value))
+        else {
+            continue;
+        };
+        // Modern SBPF maps the loaded ELF image (text plus read-only data) at
+        // MM_BYTECODE_START. StringFact offsets are relative to that image.
+        let Some(string_offset) = pointer_value.checked_sub(ebpf::MM_BYTECODE_START) else {
+            continue;
+        };
+        let Ok(string_offset) = usize::try_from(string_offset) else {
+            continue;
+        };
+        let Some(string) = analysis
+            .strings
+            .iter()
+            .find(|string| string.offset == string_offset && string.value.len() == length_value)
+        else {
+            continue;
+        };
+        let (Some(pointer_source_pc), Some(length_source_pc)) =
+            (pointer.source_pc, length.source_pc)
+        else {
+            continue;
+        };
+        let mut evidence_refs = vec![string_ref(string)];
+        for pc in [pointer_source_pc, length_source_pc, syscall.instruction_pc] {
+            if let Some(instruction) = analysis
+                .instructions
+                .iter()
+                .find(|instruction| instruction.pc == pc)
+            {
+                evidence_refs.push(instruction_ref(instruction));
+            }
+        }
+        let call = ResolvedLogCall {
+            instruction_pc: syscall.instruction_pc,
+            syscall: "sol_log_".into(),
+            pointer: pointer_value,
+            length: length_value,
+            string_offset,
+            value: string.value.clone(),
+            pointer_source_pc,
+            length_source_pc,
+            status: EvidenceStatus::Recovered,
+            evidence: evidence_refs.clone(),
+        };
+        evidence.push(EvidenceItem {
+            kind: "resolved_log_call".into(),
+            value: serde_json::json!({
+                "instruction_pc": call.instruction_pc,
+                "syscall": call.syscall,
+                "pointer": call.pointer,
+                "length": call.length,
+                "string_offset": call.string_offset,
+                "value": call.value,
+                "pointer_source_pc": call.pointer_source_pc,
+                "length_source_pc": call.length_source_pc,
+            }),
+            confidence: Some(1.0),
+            status: EvidenceStatus::Recovered,
+            evidence: evidence_refs,
+        });
+        calls.push(call);
+    }
+    calls
 }
 
 fn protocol_fingerprints(
@@ -2184,5 +2294,103 @@ mod tests {
         assert!(result.validation_checks[0]
             .interpretations
             .contains(&"signer_flag_candidate".into()));
+    }
+
+    #[test]
+    fn resolves_log_syscall_pointer_and_length_to_exact_rodata_string() {
+        let pointer_pc = 9;
+        let length_pc = 11;
+        let call_pc = 12;
+        let string_offset = 0x6b0;
+        let value = "SOS C fixture";
+        let analysis = StaticAnalysis {
+            schema_version: sos_types::ANALYSIS_SCHEMA_VERSION,
+            sbpf_version: "V0".into(),
+            entrypoint: 0,
+            instructions: vec![
+                InstructionFact {
+                    pc: pointer_pc,
+                    opcode: ebpf::LD_DW_IMM,
+                    dst: 1,
+                    src: 0,
+                    offset: 0,
+                    immediate: (ebpf::MM_BYTECODE_START + string_offset) as i64,
+                    assembly: "lddw r1, rodata".into(),
+                },
+                InstructionFact {
+                    pc: length_pc,
+                    opcode: ebpf::MOV64_IMM,
+                    dst: 2,
+                    src: 0,
+                    offset: 0,
+                    immediate: value.len() as i64,
+                    assembly: "mov64 r2, 13".into(),
+                },
+                InstructionFact {
+                    pc: call_pc,
+                    opcode: ebpf::CALL_IMM,
+                    dst: 0,
+                    src: 1,
+                    offset: 0,
+                    immediate: ebpf::hash_symbol_name(b"sol_log_") as i64,
+                    assembly: "syscall sol_log_".into(),
+                },
+            ],
+            functions: Vec::new(),
+            basic_blocks: Vec::new(),
+            memory_accesses: Vec::new(),
+            stack_accesses: Vec::new(),
+            strings: vec![StringFact {
+                offset: string_offset as usize,
+                value: value.into(),
+            }],
+            public_key_candidates: Vec::new(),
+            immediate_constants: Vec::new(),
+            register_uses: Vec::new(),
+            calls: Vec::new(),
+            relocations: Vec::new(),
+            sccs: Vec::new(),
+            dataflow_edges: Vec::new(),
+            verifier_diagnostics: Vec::new(),
+        };
+        let syscalls = [SyscallFact {
+            instruction_pc: call_pc,
+            hash: ebpf::hash_symbol_name(b"sol_log_"),
+            name: Some("sol_log_".into()),
+            category: Some("logging".into()),
+            argument_count: Some(2),
+            memory_effect: Some("reads_buffer".into()),
+            status: EvidenceStatus::Fact,
+        }];
+        let arguments = [
+            ArgumentCandidate {
+                instruction_pc: call_pc,
+                register: 1,
+                value: Some((ebpf::MM_BYTECODE_START + string_offset) as i64),
+                source_pc: Some(pointer_pc),
+                interpretations: Vec::new(),
+                status: EvidenceStatus::Recovered,
+                evidence: Vec::new(),
+            },
+            ArgumentCandidate {
+                instruction_pc: call_pc,
+                register: 2,
+                value: Some(value.len() as i64),
+                source_pc: Some(length_pc),
+                interpretations: Vec::new(),
+                status: EvidenceStatus::Recovered,
+                evidence: Vec::new(),
+            },
+        ];
+        let mut evidence = Vec::new();
+
+        let calls = resolved_log_calls(&analysis, &syscalls, &arguments, &mut evidence);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].instruction_pc, call_pc);
+        assert_eq!(calls[0].string_offset, string_offset as usize);
+        assert_eq!(calls[0].value, value);
+        assert_eq!(calls[0].status, EvidenceStatus::Recovered);
+        assert!(evidence.iter().any(|item| item.kind == "resolved_log_call"));
     }
 }

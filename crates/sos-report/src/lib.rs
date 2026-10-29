@@ -98,6 +98,23 @@ pub fn render_markdown(analysis: &StaticAnalysis, semantics: &SemanticAnalysis) 
         output.push_str("No printable read-only strings were identified.\n");
     }
     output.push('\n');
+    output.push_str("## Resolved log calls\n\n");
+    if semantics.resolved_log_calls.is_empty() {
+        output.push_str("No logging syscall arguments resolved to exact read-only strings.\n");
+    } else {
+        for call in semantics.resolved_log_calls.iter().take(64) {
+            output.push_str(&format!(
+                "- `0x{:x}`: `{}`(`ro+0x{:x}`, `{}` bytes) -> `{}` (`{:?}`).\n",
+                call.instruction_pc,
+                call.syscall,
+                call.string_offset,
+                call.length,
+                call.value,
+                call.status
+            ));
+        }
+    }
+    output.push('\n');
     output.push_str("## Immediate constants\n\n");
     for constant in semantics.constant_candidates.iter().take(64) {
         output.push_str(&format!(
@@ -652,6 +669,35 @@ fn render_instruction(
     indent: usize,
 ) {
     let padding = "    ".repeat(indent);
+    let resolved_log = semantics
+        .resolved_log_calls
+        .iter()
+        .find(|call| call.instruction_pc == instruction.pc);
+    if let Some(call) = resolved_log {
+        let rendered_value =
+            serde_json::to_string(&call.value).unwrap_or_else(|_| "\"<invalid string>\"".into());
+        if c_like {
+            output.push_str(&format!(
+                "{padding}/* 0x{:x}: {} — recovered {} pointer/length; evidence: ro_section/offset:0x{:x}, analysis/instruction:0x{:x} */\n",
+                instruction.pc,
+                instruction.assembly,
+                call.syscall,
+                call.string_offset,
+                instruction.pc
+            ));
+        } else {
+            output.push_str(&format!(
+                "{padding}// 0x{:x}: {} — recovered {} pointer/length; evidence: ro_section/offset:0x{:x}, analysis/instruction:0x{:x}\n",
+                instruction.pc,
+                instruction.assembly,
+                call.syscall,
+                call.string_offset,
+                instruction.pc
+            ));
+        }
+        output.push_str(&format!("{padding}sol_log({rendered_value});\n"));
+        return;
+    }
     let syscall = semantics
         .syscalls
         .iter()

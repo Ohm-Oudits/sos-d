@@ -488,6 +488,12 @@ impl EvidencePack {
             .take(limits.max_strings)
             .cloned()
             .collect();
+        bounded_semantics.resolved_log_calls = semantics
+            .resolved_log_calls
+            .iter()
+            .take(limits.max_semantic_items)
+            .cloned()
+            .collect();
         bounded_semantics.evidence = semantics
             .evidence
             .iter()
