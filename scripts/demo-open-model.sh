@@ -31,7 +31,15 @@ ollama list | awk 'NR > 1 {print $1}' | grep -Fx "$model" >/dev/null || {
 test -s "$artifact" || ./scripts/build-c-fixture.sh
 
 mkdir -p "$analysis_dir" "$lift_dir"
-model_digest="$(ollama list | awk -v selected="$model" '$1 == selected {print $2}')"
+model_digest="$(
+  curl --fail --silent --show-error http://127.0.0.1:11434/api/tags |
+    jq -r --arg selected "$model" '.models[] | select(.name == $selected or .model == $selected) | .digest' |
+    head -n 1
+)"
+test -n "$model_digest" || {
+  echo "unable to resolve the full local Ollama manifest digest for $model" >&2
+  exit 1
+}
 jq -n \
   --arg model "$model" \
   --arg digest "$model_digest" \
