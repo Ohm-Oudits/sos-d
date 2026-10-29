@@ -99,12 +99,12 @@ placeholders, request boundaries, and Patina-inspired stage isolation are
 documented in [AGENT_PROVIDERS.md](AGENT_PROVIDERS.md).
 
 The default `--model` can be overridden independently with
-`--structure-model`, `--semantic-model`, `--explanation-model`, and
+`--structure-model`, `--signature-model`, `--semantic-model`, `--explanation-model`, and
 `--refinement-model`. Each stage records the selected model, and checkpoint
 validation rejects any bundle created with a different stage assignment.
-The parallel `--structure-tokens`, `--semantic-tokens`,
+The parallel `--structure-tokens`, `--signature-tokens`, `--semantic-tokens`,
 `--explanation-tokens`, and `--refinement-tokens` flags bound generated output;
-the selected budget is sent to the provider, recorded in AI bundle schema v2,
+the selected budget is sent to the provider, recorded in AI bundle schema v3,
 and included in checkpoint validation.
 
 ## Running a lift
@@ -166,7 +166,7 @@ reconstructions as bounded untrusted context to the caller's structure stage.
 Recursive cycles retain stable address order. Rendering remains in address
 order, independent of processing order.
 
-`--resume` persists a fully accepted four-stage base bundle per function. On
+`--resume` persists a fully accepted five-stage base bundle per function. On
 reuse, SOS rebuilds the function-scoped analysis, semantic facts, and callee
 context, then verifies request identity, all stage input/output hashes, strict
 schemas, anti-cheese constraints, and evidence references. A stale, edited, or
@@ -270,7 +270,7 @@ ollama pull gpt-oss:20b
 ollama serve
 ```
 
-Analyze a program and run all four lifting stages:
+Analyze a program and run all five lifting stages:
 
 ```bash
 cargo run -p sos-cli -- analyze ./program.so --out ./analysis

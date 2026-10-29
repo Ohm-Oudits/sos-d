@@ -2,7 +2,7 @@
 
 use sos_ai::{
     AiPipelineBundle, AiStageStatus, ExplanationOutput, RefinementOutput, SemanticLabelingOutput,
-    StructureRecoveryOutput,
+    SignatureRecoveryOutput, StructureRecoveryOutput,
 };
 use sos_analysis::{FunctionFact, StaticAnalysis};
 use sos_solana::{SecurityReport, SemanticAnalysis};
@@ -418,6 +418,42 @@ pub fn render_ai_markdown(bundle: &AiPipelineBundle) -> String {
                             label.status,
                             label.confidence,
                             render_evidence_refs(&label.evidence)
+                        ));
+                    }
+                }
+                output.push('\n');
+            }
+            sos_ai::ModelTask::SignatureRecovery => {
+                output.push_str("## Signature recovery (hypotheses)\n\n");
+                if let Ok(parsed) = serde_json::from_value::<SignatureRecoveryOutput>(
+                    response.structured_output.clone(),
+                ) {
+                    for signature in parsed.signatures {
+                        let parameters = signature
+                            .parameters
+                            .iter()
+                            .map(|parameter| {
+                                format!(
+                                    "{}: {}{}",
+                                    escape_inline(&parameter.name),
+                                    escape_inline(&parameter.type_name),
+                                    parameter
+                                        .role
+                                        .as_ref()
+                                        .map(|role| format!(" ({})", escape_inline(role)))
+                                        .unwrap_or_default()
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        output.push_str(&format!(
+                            "- `{}`: `fn {}({}) -> {}`; confidence `{:?}`; evidence: {}\n",
+                            escape_inline(&signature.function_id),
+                            escape_inline(&signature.function_name),
+                            parameters,
+                            escape_inline(&signature.return_type),
+                            signature.confidence,
+                            render_evidence_refs(&signature.evidence)
                         ));
                     }
                 }

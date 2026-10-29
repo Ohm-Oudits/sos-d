@@ -1,11 +1,13 @@
 # SOS JSON contracts
 
-The files in `schemas/v1/` and `schemas/v2/` are the public, forward-compatible
+The files in `schemas/v1/`, `schemas/v2/`, and `schemas/v3/` are the public, forward-compatible
 JSON contracts for SOS bundles. The Rust structs remain the source of serialization
 behavior; these schemas document the wire format for external consumers and CI
 tooling. The replay trace is v2 because account-state provenance was added after
-the original trace contract. The AI pipeline bundle is v2 because every stage
-now carries its enforced output-token budget in addition to model identity.
+the original trace contract. The AI pipeline bundle is v3 because an
+evidence-constrained signature-recovery stage now sits between structure
+recovery and semantic labeling. Version 2 added each stage's enforced
+output-token budget in addition to model identity.
 
 Compatibility rules:
 

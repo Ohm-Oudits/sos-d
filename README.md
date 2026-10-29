@@ -66,7 +66,7 @@ solana config set --url http://127.0.0.1:8899
 solana program deploy target/deploy/sos_hello_world.so
 ```
 
-Run the address-first acquisition, deterministic analysis, and four-stage local
+Run the address-first acquisition, deterministic analysis, and five-stage local
 model pipeline against a fresh validator with:
 
 ```bash
@@ -183,7 +183,7 @@ pinned for meaningful comparisons.
 
 ### Local open-weight semantic lifting
 
-SOS can now pass deterministic IR through a four-stage local semantic-lifting
+SOS can now pass deterministic IR through a five-stage local semantic-lifting
 pipeline and merge accepted structure/refinement candidates into readable
 Rust-like output. The reviewed default is OpenAI's Apache-2.0 `gpt-oss:20b`
 weights running locally through Ollama:
@@ -311,10 +311,10 @@ sos inspect <PROGRAM_ADDRESS> \
 
 These transports are not silently classified as reviewed open weights. Their
 outputs pass the same local schemas, evidence-reference checks, anti-cheese
-rules, and checkpoint validation. `--structure-model`, `--semantic-model`,
+rules, and checkpoint validation. `--structure-model`, `--signature-model`, `--semantic-model`,
 `--explanation-model`, and `--refinement-model` optionally assign distinct
 models to the Patina-style agent stages; each identity is audited and included
-in checkpoint validation. Matching `--structure-tokens`, `--semantic-tokens`,
+in checkpoint validation. Matching `--structure-tokens`, `--signature-tokens`, `--semantic-tokens`,
 `--explanation-tokens`, and `--refinement-tokens` flags enforce and audit bounded
 per-stage output budgets. See
 [docs/AGENT_PROVIDERS.md](docs/AGENT_PROVIDERS.md) and the empty
@@ -326,7 +326,7 @@ reconstructions are supplied to the caller as bounded, explicitly untrusted
 context. Final source is still rendered in deterministic function-address
 order. Use `--function fn_ID` for a smaller first run.
 
-`--resume` writes a completed four-stage checkpoint per function. SOS rebuilds
+`--resume` writes a completed five-stage checkpoint per function. SOS rebuilds
 the scoped IR, Solana semantics, and callee context and then revalidates every
 stage's provider/model/prompt identity, input and output hashes, strict schema,
 anti-cheese rules, and evidence references before reuse. Invalid checkpoints

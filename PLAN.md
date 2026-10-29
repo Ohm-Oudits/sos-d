@@ -92,18 +92,18 @@ Already implemented in this workspace:
 - AI gateway responses now use task-specific typed schemas for structure recovery,
   semantic labeling, explanations, and refinement; arbitrary structured output is
   rejected before it reaches reports.
-- Address-first `inspect --model` now orchestrates all four AI stages and writes a
+- Address-first `inspect --model` now orchestrates all five AI stages and writes a
   versioned audit bundle with per-stage acceptance, rejection/unavailability,
   prompt/model identity, input hashes, and output hashes.
 - Function-level lifting now follows resolved call dependencies, processes callees
   before callers, and passes bounded accepted-callee output as untrusted context.
   `lift` and address-first `inspect` support validated `--resume` checkpoints;
-  every cached four-stage bundle is rebuilt and revalidated against current scoped
+  every cached five-stage bundle is rebuilt and revalidated against current scoped
   evidence and dependency context before reuse.
 - Accepted AI output is also rendered to a separate `ai-report.md` projection;
   deterministic reports and pseudocode remain unchanged.
 - A fresh-validator address-first E2E script deploys the hello fixture and verifies
-  manifest, deterministic analysis, reports, and four accepted local-model stages.
+  manifest, deterministic analysis, reports, and five accepted local-model stages.
 - Nested semantic/function/refinement claims are also required to carry evidence
   and are checked against bounded instruction/IR locations.
 - Evidence validation now covers instruction PCs, IR IDs, read-only offsets, and

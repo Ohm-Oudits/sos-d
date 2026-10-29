@@ -37,7 +37,7 @@ pub use ollama::{trusted_open_model, OllamaModelProvider, OpenModelProfile, TRUS
 pub use openai::OpenAiModelProvider;
 
 pub const AI_SCHEMA_VERSION: u32 = 1;
-pub const AI_BUNDLE_SCHEMA_VERSION: u32 = 2;
+pub const AI_BUNDLE_SCHEMA_VERSION: u32 = 3;
 pub const MIN_STAGE_OUTPUT_TOKENS: usize = 128;
 pub const MAX_STAGE_OUTPUT_TOKENS: usize = 32_768;
 
@@ -45,6 +45,7 @@ pub const MAX_STAGE_OUTPUT_TOKENS: usize = 32_768;
 #[serde(rename_all = "snake_case")]
 pub enum ModelTask {
     StructureRecovery,
+    SignatureRecovery,
     SemanticLabeling,
     Explanation,
     Refinement,
@@ -52,8 +53,9 @@ pub enum ModelTask {
 }
 
 impl ModelTask {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::StructureRecovery,
+        Self::SignatureRecovery,
         Self::SemanticLabeling,
         Self::Explanation,
         Self::Refinement,
@@ -64,6 +66,7 @@ pub fn default_stage_output_tokens(task: ModelTask) -> usize {
     match task {
         ModelTask::Explanation => 640,
         ModelTask::StructureRecovery
+        | ModelTask::SignatureRecovery
         | ModelTask::SemanticLabeling
         | ModelTask::Refinement
         | ModelTask::PseudocodeHumanization => 1_200,
@@ -120,6 +123,8 @@ pub struct AiStageTokenBudgets {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structure_recovery: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_recovery: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_labeling: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explanation: Option<usize>,
@@ -131,6 +136,7 @@ impl AiStageTokenBudgets {
     pub fn tokens_for(&self, task: ModelTask) -> usize {
         match task {
             ModelTask::StructureRecovery => self.structure_recovery,
+            ModelTask::SignatureRecovery => self.signature_recovery,
             ModelTask::SemanticLabeling => self.semantic_labeling,
             ModelTask::Explanation => self.explanation,
             ModelTask::Refinement => self.refinement,
@@ -142,6 +148,7 @@ impl AiStageTokenBudgets {
     pub fn configured(&self) -> impl Iterator<Item = (ModelTask, usize)> {
         [
             (ModelTask::StructureRecovery, self.structure_recovery),
+            (ModelTask::SignatureRecovery, self.signature_recovery),
             (ModelTask::SemanticLabeling, self.semantic_labeling),
             (ModelTask::Explanation, self.explanation),
             (ModelTask::Refinement, self.refinement),
@@ -156,6 +163,8 @@ pub struct AiStageModels {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structure_recovery: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_recovery: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_labeling: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explanation: Option<String>,
@@ -167,6 +176,7 @@ impl AiStageModels {
     pub fn model_for<'a>(&'a self, task: ModelTask, fallback: &'a str) -> &'a str {
         match task {
             ModelTask::StructureRecovery => self.structure_recovery.as_deref(),
+            ModelTask::SignatureRecovery => self.signature_recovery.as_deref(),
             ModelTask::SemanticLabeling => self.semantic_labeling.as_deref(),
             ModelTask::Explanation => self.explanation.as_deref(),
             ModelTask::Refinement => self.refinement.as_deref(),
@@ -180,6 +190,10 @@ impl AiStageModels {
             (
                 ModelTask::StructureRecovery,
                 self.structure_recovery.as_deref(),
+            ),
+            (
+                ModelTask::SignatureRecovery,
+                self.signature_recovery.as_deref(),
             ),
             (
                 ModelTask::SemanticLabeling,
@@ -204,6 +218,29 @@ pub struct RecoveredFunction {
     pub pseudocode: String,
     #[serde(default)]
     pub evidence: Vec<sos_types::EvidenceRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignatureRecoveryOutput {
+    pub signatures: Vec<RecoveredSignature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecoveredSignature {
+    pub function_id: String,
+    pub function_name: String,
+    pub return_type: String,
+    pub parameters: Vec<RecoveredParameter>,
+    pub confidence: Option<f32>,
+    #[serde(default)]
+    pub evidence: Vec<sos_types::EvidenceRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveredParameter {
+    pub name: String,
+    pub type_name: String,
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1939,7 +1976,7 @@ where
     }
 }
 
-/// Run the four bounded AI stages against one immutable deterministic evidence
+/// Run the five bounded AI stages against one immutable deterministic evidence
 /// snapshot. A provider or validation failure is recorded for that stage and
 /// does not discard accepted results from earlier stages or break the
 /// deterministic analysis bundle.
@@ -1952,7 +1989,7 @@ pub fn run_pipeline<P: ModelProvider>(
     run_pipeline_with_context(provider, config, analysis, semantics, &[])
 }
 
-/// Run the four bounded stages with caller-supplied, explicitly untrusted
+/// Run the five bounded stages with caller-supplied, explicitly untrusted
 /// context from already accepted dependency functions. Deterministic facts in
 /// `analysis` and `semantics` remain authoritative and every response must cite
 /// evidence from the current function's bounded pack.
@@ -2067,7 +2104,7 @@ fn bounded_initial_context(initial_context: &[UntrustedEvidence]) -> Vec<Untrust
     bounded
 }
 
-/// Rebuild and verify a persisted four-stage function bundle before reuse.
+/// Rebuild and verify a persisted five-stage function bundle before reuse.
 /// Only fully accepted base pipelines are checkpointable; transient failures
 /// and later compiler-repair rounds must be rerun instead of becoming trusted
 /// cache state.
@@ -2810,6 +2847,50 @@ fn validate_structured_consistency(
                 }
             }
         }
+        ModelTask::SignatureRecovery => {
+            let parsed: SignatureRecoveryOutput = serde_json::from_value(output.clone())
+                .map_err(|error| AiError::InvalidResponse(error.to_string()))?;
+            if parsed.signatures.len() > 128 {
+                return Err(AiError::InvalidResponse(
+                    "signature recovery contains more than 128 signatures".into(),
+                ));
+            }
+            let mut recovered_functions = BTreeSet::new();
+            for signature in parsed.signatures {
+                if !known_functions.contains(signature.function_id.as_str()) {
+                    return Err(AiError::InvalidResponse(format!(
+                        "signature recovery references unknown function {}",
+                        signature.function_id
+                    )));
+                }
+                if !recovered_functions.insert(signature.function_id.clone()) {
+                    return Err(AiError::InvalidResponse(format!(
+                        "signature recovery contains duplicate function {}",
+                        signature.function_id
+                    )));
+                }
+                validate_signature_identifier(&signature.function_name, "function name")?;
+                validate_signature_type(&signature.return_type, "return type")?;
+                if signature.parameters.len() > 32 {
+                    return Err(AiError::InvalidResponse(format!(
+                        "signature for {} contains more than 32 parameters",
+                        signature.function_id
+                    )));
+                }
+                for parameter in signature.parameters {
+                    validate_signature_identifier(&parameter.name, "parameter name")?;
+                    validate_signature_type(&parameter.type_name, "parameter type")?;
+                    if let Some(role) = parameter.role {
+                        if role.len() > 128 || role.chars().any(|character| character.is_control())
+                        {
+                            return Err(AiError::InvalidResponse(
+                                "signature parameter role is not bounded plain text".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         ModelTask::Refinement => {
             let parsed: RefinementOutput = serde_json::from_value(output.clone())
                 .map_err(|error| AiError::InvalidResponse(error.to_string()))?;
@@ -2879,6 +2960,10 @@ fn validate_structured_output(task: ModelTask, output: &serde_json::Value) -> Re
             serde_json::from_value::<SemanticLabelingOutput>(output.clone())
                 .map(|_| "semantic_labeling")
         }
+        ModelTask::SignatureRecovery => {
+            serde_json::from_value::<SignatureRecoveryOutput>(output.clone())
+                .map(|_| "signature_recovery")
+        }
         ModelTask::Explanation => {
             serde_json::from_value::<ExplanationOutput>(output.clone()).map(|_| "explanation")
         }
@@ -2938,6 +3023,28 @@ fn structured_evidence_refs(
                 references.extend(label.evidence);
             }
         }
+        ModelTask::SignatureRecovery => {
+            let parsed: SignatureRecoveryOutput = serde_json::from_value(output.clone())
+                .map_err(|error| AiError::InvalidResponse(error.to_string()))?;
+            for signature in parsed.signatures {
+                if signature.evidence.is_empty() {
+                    return Err(AiError::InvalidResponse(format!(
+                        "recovered signature for {} has no evidence",
+                        signature.function_id
+                    )));
+                }
+                if signature
+                    .confidence
+                    .is_some_and(|value| !(0.0..=1.0).contains(&value))
+                {
+                    return Err(AiError::InvalidResponse(format!(
+                        "recovered signature for {} has confidence outside [0, 1]",
+                        signature.function_id
+                    )));
+                }
+                references.extend(signature.evidence);
+            }
+        }
         ModelTask::Refinement => {
             let parsed: RefinementOutput = serde_json::from_value(output.clone())
                 .map_err(|error| AiError::InvalidResponse(error.to_string()))?;
@@ -2964,6 +3071,49 @@ fn structured_evidence_refs(
         ModelTask::Explanation => {}
     }
     Ok(references)
+}
+
+fn validate_signature_identifier(value: &str, field: &str) -> Result<(), AiError> {
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_alphanumeric() && (index > 0 || !byte.is_ascii_digit())
+        });
+    if !valid {
+        return Err(AiError::InvalidResponse(format!(
+            "signature {field} is not a bounded Rust-like identifier"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_signature_type(value: &str, field: &str) -> Result<(), AiError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'_' | b':'
+                        | b'<'
+                        | b'>'
+                        | b'['
+                        | b']'
+                        | b'('
+                        | b')'
+                        | b','
+                        | b'&'
+                        | b'*'
+                        | b'\''
+                        | b' '
+                )
+        })
+    {
+        return Err(AiError::InvalidResponse(format!(
+            "signature {field} contains unsafe or unsupported syntax"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_readable_candidate(source: &str, function_id: &str) -> Result<(), AiError> {
@@ -3215,6 +3365,7 @@ mod tests {
         fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
             let structured_output = match request.task {
                 ModelTask::StructureRecovery => serde_json::json!({"functions": []}),
+                ModelTask::SignatureRecovery => serde_json::json!({"signatures": []}),
                 ModelTask::SemanticLabeling => serde_json::json!({"labels": []}),
                 ModelTask::Explanation => serde_json::json!({
                     "summary": "No additional explanation was generated.",
@@ -3597,12 +3748,14 @@ mod tests {
             model: "default-model".into(),
             stage_models: AiStageModels {
                 structure_recovery: Some("structure-model".into()),
+                signature_recovery: Some("signature-model".into()),
                 semantic_labeling: Some("semantic-model".into()),
                 explanation: None,
                 refinement: Some("refinement-model".into()),
             },
             stage_token_budgets: AiStageTokenBudgets {
                 structure_recovery: Some(2_000),
+                signature_recovery: Some(1_000),
                 semantic_labeling: Some(800),
                 explanation: Some(400),
                 refinement: Some(2_400),
@@ -3627,6 +3780,11 @@ mod tests {
                     ModelTask::StructureRecovery,
                     "structure-model".into(),
                     2_000
+                ),
+                (
+                    ModelTask::SignatureRecovery,
+                    "signature-model".into(),
+                    1_000
                 ),
                 (ModelTask::SemanticLabeling, "semantic-model".into(), 800),
                 (ModelTask::Explanation, "default-model".into(), 400),
@@ -3687,7 +3845,7 @@ mod tests {
             &pack.analysis,
             &pack.semantics,
         );
-        assert_eq!(*prior_counts.lock().unwrap(), vec![0, 1, 2, 3]);
+        assert_eq!(*prior_counts.lock().unwrap(), vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
@@ -3718,7 +3876,7 @@ mod tests {
             &pack.semantics,
             &context,
         );
-        assert_eq!(*prior_counts.lock().unwrap(), vec![4, 5, 6, 7]);
+        assert_eq!(*prior_counts.lock().unwrap(), vec![4, 5, 6, 7, 8]);
     }
 
     #[test]
@@ -3823,6 +3981,78 @@ mod tests {
             evidence: vec![],
         };
         assert!(validate_structured_output(response.task, &response.structured_output).is_err());
+    }
+
+    #[test]
+    fn signature_recovery_accepts_evidence_linked_bounded_hypotheses() {
+        let mut pack = empty_pack();
+        pack.task = ModelTask::SignatureRecovery;
+        let request = ModelRequest {
+            task: ModelTask::SignatureRecovery,
+            prompt_version: "v1".into(),
+            model: "test".into(),
+            evidence_pack: pack,
+            max_output_bytes: 10_000,
+            max_output_tokens: 1_200,
+        };
+        let output = serde_json::json!({
+            "signatures": [{
+                "function_id": "fn_0",
+                "function_name": "process_instruction",
+                "return_type": "Result<(), ProgramError>",
+                "parameters": [{
+                    "name": "instruction_data",
+                    "type_name": "&[u8]",
+                    "role": "serialized instruction input"
+                }],
+                "confidence": 0.6,
+                "evidence": [{"source": "ir", "location": "function:fn_0"}]
+            }]
+        });
+        assert!(validate_structured_output(ModelTask::SignatureRecovery, &output).is_ok());
+        assert!(validate_structured_consistency(&request, &output).is_ok());
+        assert_eq!(
+            structured_evidence_refs(ModelTask::SignatureRecovery, &output)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn signature_recovery_rejects_unknown_functions_unsafe_types_and_missing_evidence() {
+        let mut pack = empty_pack();
+        pack.task = ModelTask::SignatureRecovery;
+        let request = ModelRequest {
+            task: ModelTask::SignatureRecovery,
+            prompt_version: "v1".into(),
+            model: "test".into(),
+            evidence_pack: pack,
+            max_output_bytes: 10_000,
+            max_output_tokens: 1_200,
+        };
+        let base = serde_json::json!({
+            "signatures": [{
+                "function_id": "fn_missing",
+                "function_name": "process_instruction",
+                "return_type": "unknown",
+                "parameters": [],
+                "confidence": 0.5,
+                "evidence": [{"source": "ir", "location": "function:fn_0"}]
+            }]
+        });
+        assert!(validate_structured_consistency(&request, &base).is_err());
+
+        let mut unsafe_type = base.clone();
+        unsafe_type["signatures"][0]["function_id"] = serde_json::json!("fn_0");
+        unsafe_type["signatures"][0]["return_type"] =
+            serde_json::json!("u64; include_bytes!(\"secret\")");
+        assert!(validate_structured_consistency(&request, &unsafe_type).is_err());
+
+        let mut no_evidence = base;
+        no_evidence["signatures"][0]["function_id"] = serde_json::json!("fn_0");
+        no_evidence["signatures"][0]["evidence"] = serde_json::json!([]);
+        assert!(structured_evidence_refs(ModelTask::SignatureRecovery, &no_evidence).is_err());
     }
 
     #[test]

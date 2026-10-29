@@ -48,7 +48,7 @@ const DETERMINISTIC_HUMANIZER_ID: &str = "sos-deterministic-syntax-v1";
 const HUMANIZATION_CACHE_SCHEMA_VERSION: u32 = 1;
 const HUMANIZATION_CACHE_RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v3";
-const LIFT_CACHE_SCHEMA_VERSION: u32 = 3;
+const LIFT_CACHE_SCHEMA_VERSION: u32 = 4;
 const LIFT_CACHE_RECORD_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 fn main() -> ExitCode {
@@ -2776,7 +2776,7 @@ impl LiftOptions {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let Some(directory) = args.first() else {
             return Err(
-                "usage: sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq|cloudflare|huggingface|openai|anthropic] [--model MODEL] [--structure-model MODEL] [--semantic-model MODEL] [--explanation-model MODEL] [--refinement-model MODEL] [--structure-tokens N] [--semantic-tokens N] [--explanation-tokens N] [--refinement-tokens N] [--function fn_ID] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]".into(),
+                "usage: sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq|cloudflare|huggingface|openai|anthropic] [--model MODEL] [--structure-model MODEL] [--signature-model MODEL] [--semantic-model MODEL] [--explanation-model MODEL] [--refinement-model MODEL] [--structure-tokens N] [--signature-tokens N] [--semantic-tokens N] [--explanation-tokens N] [--refinement-tokens N] [--function fn_ID] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]".into(),
             );
         };
         let mut options = Self {
@@ -2823,11 +2823,18 @@ impl LiftOptions {
                 "--structure-model" => {
                     options.stage_models.structure_recovery = Some(value.clone())
                 }
+                "--signature-model" => {
+                    options.stage_models.signature_recovery = Some(value.clone())
+                }
                 "--semantic-model" => options.stage_models.semantic_labeling = Some(value.clone()),
                 "--explanation-model" => options.stage_models.explanation = Some(value.clone()),
                 "--refinement-model" => options.stage_models.refinement = Some(value.clone()),
                 "--structure-tokens" => {
                     options.stage_token_budgets.structure_recovery =
+                        Some(parse_stage_token_budget(flag, value)?)
+                }
+                "--signature-tokens" => {
+                    options.stage_token_budgets.signature_recovery =
                         Some(parse_stage_token_budget(flag, value)?)
                 }
                 "--semantic-tokens" => {
@@ -3239,7 +3246,7 @@ where
                     "status": checkpoint_status,
                 }));
             }
-            // Dependency context is derived from the checkpointed four-stage
+            // Dependency context is derived from the checkpointed five-stage
             // base bundle. Compiler-repair rounds are intentionally excluded
             // so resumed callers see byte-identical context even when repair
             // inference is unavailable.
@@ -3977,6 +3984,7 @@ impl ExplainOptions {
                 "--task" => {
                     options.task = match value.as_str() {
                         "structure" => ModelTask::StructureRecovery,
+                        "signature" => ModelTask::SignatureRecovery,
                         "semantic" => ModelTask::SemanticLabeling,
                         "explanation" => ModelTask::Explanation,
                         "refinement" => ModelTask::Refinement,
@@ -4140,6 +4148,9 @@ impl RemoteOptions {
                 "--structure-model" if command == "inspect" => {
                     options.stage_models.structure_recovery = Some(value.clone())
                 }
+                "--signature-model" if command == "inspect" => {
+                    options.stage_models.signature_recovery = Some(value.clone())
+                }
                 "--semantic-model" if command == "inspect" => {
                     options.stage_models.semantic_labeling = Some(value.clone())
                 }
@@ -4151,6 +4162,10 @@ impl RemoteOptions {
                 }
                 "--structure-tokens" if command == "inspect" => {
                     options.stage_token_budgets.structure_recovery =
+                        Some(parse_stage_token_budget(flag, value)?)
+                }
+                "--signature-tokens" if command == "inspect" => {
+                    options.stage_token_budgets.signature_recovery =
                         Some(parse_stage_token_budget(flag, value)?)
                 }
                 "--semantic-tokens" if command == "inspect" => {
@@ -4452,11 +4467,11 @@ fn usage() -> ExitCode {
     eprintln!("usage: sos artifact-info <path-to-sbf-elf> [--json]");
     eprintln!("       sos manifest <path-to-sbf-elf>");
     eprintln!("       sos fetch <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--commitment LEVEL] [--json]");
-    eprintln!("       sos inspect <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--history N] [--replay] [--signature SIGNATURE] [--provider ollama|groq|cloudflare|huggingface|openai|anthropic] [--model MODEL] [--structure-model MODEL] [--semantic-model MODEL] [--explanation-model MODEL] [--refinement-model MODEL] [--structure-tokens N] [--semantic-tokens N] [--explanation-tokens N] [--refinement-tokens N] [--function fn_ID] [--resume] [--cache-dir DIR] [--ollama-url URL] [--context-tokens N] [--model-command PATH|--model-endpoint URL] [--validate] [--repair --repair-rounds N] [--validation-trace PATH] [--commitment LEVEL] [--json]");
+    eprintln!("       sos inspect <program-address> [--cluster NAME] [--rpc-url URL] [--out DIR] [--slot SLOT] [--history N] [--replay] [--signature SIGNATURE] [--provider ollama|groq|cloudflare|huggingface|openai|anthropic] [--model MODEL] [--structure-model MODEL] [--signature-model MODEL] [--semantic-model MODEL] [--explanation-model MODEL] [--refinement-model MODEL] [--structure-tokens N] [--signature-tokens N] [--semantic-tokens N] [--explanation-tokens N] [--refinement-tokens N] [--function fn_ID] [--resume] [--cache-dir DIR] [--ollama-url URL] [--context-tokens N] [--model-command PATH|--model-endpoint URL] [--validate] [--repair --repair-rounds N] [--validation-trace PATH] [--commitment LEVEL] [--json]");
     eprintln!("       sos analyze <path-to-sbf-elf> [--out DIR]");
     eprintln!("       sos detect <analysis-directory> [--format json|sarif] [--out PATH]");
     eprintln!("       sos validate <analysis-directory> [--compiler PATH|--no-compile] [--trace PATH] [--repair --model-command PATH --repair-rounds N] [--out PATH]");
-    eprintln!("       sos explain <analysis-directory> --model-command PATH|--model-endpoint URL [--model NAME] [--task structure|semantic|explanation|refinement] [--out PATH]");
+    eprintln!("       sos explain <analysis-directory> --model-command PATH|--model-endpoint URL [--model NAME] [--task structure|signature|semantic|explanation|refinement] [--out PATH]");
     eprintln!(
         "       sos replay <program-address> --signature SIGNATURE [--rpc-url URL] [--out PATH]"
     );
@@ -4466,7 +4481,7 @@ fn usage() -> ExitCode {
     eprintln!(
         "       sos decompile <analysis-directory> [--format rust-like|c-like|json] [--out PATH]"
     );
-    eprintln!("       sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq|cloudflare|huggingface|openai|anthropic] [--model MODEL] [--structure-model MODEL] [--semantic-model MODEL] [--explanation-model MODEL] [--refinement-model MODEL] [--structure-tokens N] [--semantic-tokens N] [--explanation-tokens N] [--refinement-tokens N] [--function fn_ID] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]");
+    eprintln!("       sos lift <analysis-directory> [--resume] [--cache-dir DIR] [--provider ollama|groq|cloudflare|huggingface|openai|anthropic] [--model MODEL] [--structure-model MODEL] [--signature-model MODEL] [--semantic-model MODEL] [--explanation-model MODEL] [--refinement-model MODEL] [--structure-tokens N] [--signature-tokens N] [--semantic-tokens N] [--explanation-tokens N] [--refinement-tokens N] [--function fn_ID] [--ollama-url URL] [--context-tokens N] [--repair-rounds N] [--out DIR]");
     eprintln!("       sos humanize <pseudocode-file> [--deterministic|--plan] [--resume] [--cache-dir DIR] [--provider groq|cloudflare|huggingface|ollama|openai|anthropic] [--model MODEL] [--max-units N] [--out PATH] [--audit-out PATH]");
     eprintln!("       sos benchmark <artifact> [--repeats N] [--out PATH]");
     eprintln!("       sos judge <original-sbf-elf> <candidate-sbf-elf> [--minimum-score 0..1] [--require-exact] [--out PATH]");
@@ -4597,10 +4612,14 @@ mod tests {
             "openai-test-model".into(),
             "--structure-model".into(),
             "openai-structure-model".into(),
+            "--signature-model".into(),
+            "openai-signature-model".into(),
             "--refinement-model".into(),
             "openai-refinement-model".into(),
             "--structure-tokens".into(),
             "2400".into(),
+            "--signature-tokens".into(),
+            "1100".into(),
             "--explanation-tokens".into(),
             "512".into(),
         ])
@@ -4615,7 +4634,12 @@ mod tests {
             openai.stage_models.refinement.as_deref(),
             Some("openai-refinement-model")
         );
+        assert_eq!(
+            openai.stage_models.signature_recovery.as_deref(),
+            Some("openai-signature-model")
+        );
         assert_eq!(openai.stage_token_budgets.structure_recovery, Some(2_400));
+        assert_eq!(openai.stage_token_budgets.signature_recovery, Some(1_100));
         assert_eq!(openai.stage_token_budgets.explanation, Some(512));
         let anthropic = LiftOptions::parse(vec![
             "./analysis".into(),
@@ -4786,8 +4810,12 @@ mod tests {
                 "anthropic-test-model".into(),
                 "--semantic-model".into(),
                 "anthropic-semantic-model".into(),
+                "--signature-model".into(),
+                "anthropic-signature-model".into(),
                 "--semantic-tokens".into(),
                 "900".into(),
+                "--signature-tokens".into(),
+                "1000".into(),
             ],
             "inspect",
         )
@@ -4799,6 +4827,14 @@ mod tests {
             Some("anthropic-semantic-model")
         );
         assert_eq!(anthropic.stage_token_budgets.semantic_labeling, Some(900));
+        assert_eq!(
+            anthropic.stage_models.signature_recovery.as_deref(),
+            Some("anthropic-signature-model")
+        );
+        assert_eq!(
+            anthropic.stage_token_budgets.signature_recovery,
+            Some(1_000)
+        );
         assert!(RemoteOptions::parse(
             vec![
                 "11111111111111111111111111111111".into(),
@@ -5117,6 +5153,20 @@ mod tests {
                             }]
                         }]
                     }),
+                    sos_ai::ModelTask::SignatureRecovery => serde_json::json!({
+                        "signatures": [{
+                            "function_id": function_id,
+                            "function_name": "recovered_function",
+                            "return_type": "unknown",
+                            "parameters": [],
+                            "confidence": 0.5,
+                            "evidence": [{
+                                "source": "ir",
+                                "location": format!("operation:{operation_id}"),
+                                "detail": "bounded function operation"
+                            }]
+                        }]
+                    }),
                     sos_ai::ModelTask::SemanticLabeling => {
                         serde_json::json!({"labels": []})
                     }
@@ -5256,7 +5306,7 @@ mod tests {
         assert!(repairs
             .iter()
             .all(|record| record["kind"] == "pipeline_checkpoint"));
-        assert_eq!(bundle.stages.len(), 8);
+        assert_eq!(bundle.stages.len(), 10);
         let requests = requests.lock().unwrap();
         assert_eq!(requests[0].0, 8);
         assert!(requests[0].1.is_empty());
@@ -5286,7 +5336,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(resumed_bundle.stages.len(), 8);
+        assert_eq!(resumed_bundle.stages.len(), 10);
         assert!(resumed_requests.lock().unwrap().is_empty());
         assert!(resumed_audit
             .iter()

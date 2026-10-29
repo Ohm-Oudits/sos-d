@@ -38,10 +38,12 @@ unverified until compiler, replay, and binary-similarity checks support it.
 The current agent chain is:
 
 1. `structure_recovery`: reconstruct readable regions and function bodies.
-2. `semantic_labeling`: propose account roles, types, CPIs, PDAs, and checks.
-3. `explanation`: summarize security-relevant behavior.
-4. `refinement`: improve source while preserving evidence references.
-5. Local validation and bounded repair: reject malformed, unsupported, or
+2. `signature_recovery`: infer evidence-linked function names, parameter roles,
+   parameter types, and return types while preserving explicit unknowns.
+3. `semantic_labeling`: propose account roles, types, CPIs, PDAs, and checks.
+4. `explanation`: summarize security-relevant behavior.
+5. `refinement`: improve source while preserving evidence references.
+6. Local validation and bounded repair: reject malformed, unsupported, or
    evidence-free output and compare rebuilt candidates when a compiler is
    available.
 
@@ -58,6 +60,7 @@ credential boundary per run:
 | Stage | Model override | Output-token override | Default |
 | --- | --- | --- | ---: |
 | Structure recovery | `--structure-model MODEL` | `--structure-tokens N` | 1,200 |
+| Signature recovery | `--signature-model MODEL` | `--signature-tokens N` | 1,200 |
 | Semantic labeling | `--semantic-model MODEL` | `--semantic-tokens N` | 1,200 |
 | Explanation | `--explanation-model MODEL` | `--explanation-tokens N` | 640 |
 | Refinement and compiler repair | `--refinement-model MODEL` | `--refinement-tokens N` | 1,200 |
@@ -75,10 +78,12 @@ sos lift ./analysis \
   --provider openai \
   --model default-model-id \
   --structure-model reconstruction-model-id \
+  --signature-model signature-model-id \
   --semantic-model labeling-model-id \
   --explanation-model explanation-model-id \
   --refinement-model reconstruction-model-id \
   --structure-tokens 2400 \
+  --signature-tokens 1200 \
   --semantic-tokens 800 \
   --explanation-tokens 512 \
   --refinement-tokens 2400 \

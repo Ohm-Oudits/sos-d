@@ -177,6 +177,7 @@ impl GroqModelProvider {
 pub(crate) fn schema_name(task: ModelTask) -> &'static str {
     match task {
         ModelTask::StructureRecovery => "sos_structure_recovery",
+        ModelTask::SignatureRecovery => "sos_signature_recovery",
         ModelTask::SemanticLabeling => "sos_semantic_labeling",
         ModelTask::Explanation => "sos_explanation",
         ModelTask::Refinement => "sos_refinement",
@@ -211,6 +212,7 @@ fn groq_transport_error(error: ureq::Error, endpoint: &str) -> AiError {
 pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::Value {
     let (operation_limit, block_limit, prior_limit) = match pack.task {
         ModelTask::StructureRecovery => (96, 48, 2),
+        ModelTask::SignatureRecovery => (64, 32, 2),
         ModelTask::SemanticLabeling => (48, 24, 1),
         ModelTask::Explanation => (24, 12, 2),
         ModelTask::Refinement => (96, 48, 3),
