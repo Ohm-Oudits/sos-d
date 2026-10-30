@@ -127,10 +127,10 @@ state is unavailable, `replay.json` records `not_available` without substituting
 current account state.
 
 The address-first workflow can also invoke an explicitly configured local model
-adapter. It runs structure recovery, semantic labeling, explanation, and bounded
-refinement through the same gateway, writing a versioned per-stage audit bundle to
-`model.json`. Without a command, `--model` records `not_available` for every stage
-rather than contacting a hosted service:
+adapter. It runs signature recovery, structure recovery, semantic labeling,
+explanation, and bounded refinement through the same gateway, writing a
+versioned per-stage audit bundle to `model.json`. Without a command, `--model`
+records `not_available` for every stage rather than contacting a hosted service:
 
 When a model is requested, `ai-report.md` is emitted alongside `model.json`; it is
 explicitly labeled as untrusted hypothesis output and retains each claim's evidence.
@@ -222,7 +222,11 @@ weights running locally through Ollama:
 The stage order follows Patina's dependency discipline: recover the function
 signature first, then reconstruct the body under that interface. Structure
 responses must additionally cover every deterministic store, branch, recursive
-loop, call, and return with an exact IR evidence location. Signature recovery
+loop, call, and return with an exact IR evidence location. SOS also derives
+branch and loop regions from dominators, postdominators, backedges, and recursive
+SCCs. Every recovered region requires its own concrete source header tied to the
+exact CFG header block, preventing one generic `if` or `loop` from covering an
+entire function. Signature recovery
 is also constrained by a conservative SBPF live-in analysis: every incoming
 `r1`-`r5` value read on a reachable path before overwrite must be mapped to one
 model parameter and cited at its first-use instruction. Names and types remain

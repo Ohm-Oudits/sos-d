@@ -37,9 +37,11 @@ unverified until compiler, replay, and binary-similarity checks support it.
 
 The current agent chain is:
 
-1. `structure_recovery`: reconstruct readable regions and function bodies.
-2. `signature_recovery`: infer evidence-linked function names, parameter roles,
+1. `signature_recovery`: infer evidence-linked function names, parameter roles,
    parameter types, and return types while preserving explicit unknowns.
+2. `structure_recovery`: reconstruct readable regions and function bodies under
+   the accepted signature. Every deterministic branch/loop region must map to a
+   unique concrete source header citing its exact CFG header block.
 3. `semantic_labeling`: propose account roles, types, CPIs, PDAs, and checks.
 4. `explanation`: summarize security-relevant behavior.
 5. `refinement`: improve source while preserving evidence references.
@@ -52,6 +54,10 @@ budget, and request hash. Outputs become bounded, explicitly untrusted context
 for later stages. Checkpoints are scoped by source hash, provider, default and
 stage model identities, prompt version, stage input, and stage output. A changed
 provider or stage model cannot silently reuse another result.
+Structure-stage region contracts are derived locally from dominators,
+postdominators, natural backedges, and recursive SCCs; they are not model
+claims. Prompt v9 and lift-cache schema v10 invalidate earlier checkpoints that
+did not carry this per-region mapping proof.
 
 `--model` selects the default agent model. The following optional overrides
 implement Patina-style role specialization while retaining one provider and one

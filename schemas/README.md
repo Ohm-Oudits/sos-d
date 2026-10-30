@@ -13,6 +13,10 @@ carried as response-hash-bound contracts that later source stages must preserve.
 For textual pseudocode, it also carries deterministic source-line obligations
 for declarations, branches, loops, calls, writes, returns, and statements so a
 humanization response can prove coverage with unique concrete output fragments.
+For binary structure recovery, it carries deterministic CFG region contracts
+for branch arms/joins and loop bodies/exits/cycle edges. These contracts are
+derived from dominators, postdominators, backedges, and recursive SCCs and must
+map to distinct source headers in accepted model output.
 
 Compatibility rules:
 

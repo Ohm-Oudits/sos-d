@@ -43,7 +43,7 @@ report directory/
   report.md           human-readable conservative explanation
   pseudocode.rs       Rust-like output with uncertainty annotations
   pseudocode.c        C-like output with uncertainty annotations
-  model.json          optional four-stage AI audit bundle
+  model.json          optional five-stage AI audit bundle
   ai-report.md        optional human-readable AI hypotheses and stage audit
   validation.json     optional compilation/replay validation status
   binary-judge.json   optional original-vs-recompiled structural comparison
@@ -162,7 +162,10 @@ The AI subsystem is a constrained evidence consumer with five stages:
    parameters and cite the exact first-use instruction; inferred names and types
    remain hypotheses.
 2. Structure recovery over bounded IR, constrained by the signature hypothesis and
-   a required-effect coverage ledger.
+   a required-effect coverage ledger. Deterministic CFG region contracts must
+   separately describe branch arms/joins and loop bodies/exits/cycle edges, and
+   every contract must map to a unique concrete source header citing its exact
+   header block.
 3. Semantic labeling using IR, strings, known fingerprints, and traces.
 4. Explanation and report generation from verified graph data.
 5. Bounded refinement using schema validation, compilation, and replay comparison.

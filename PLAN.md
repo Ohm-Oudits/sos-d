@@ -110,6 +110,10 @@ Already implemented in this workspace:
   memory base/offset locations present in the bounded pack.
 - AI structure-recovery and refinement responses are constrained to known bounded
   IR function IDs, and refinement validation states use a closed status vocabulary.
+- Structure recovery now receives deterministic branch/loop region contracts
+  derived from dominators, postdominators, natural backedges, and recursive SCCs.
+  Every region must map to a unique concrete source header citing its exact CFG
+  header block; omission, merging, overlap, or wrong-header evidence is rejected.
 - The gateway rejects model self-assertions of `validated`; only an external compiler
   or replay validator may provide behavioral validation evidence.
 - `sos validate` compiles accepted refinement patches in a bounded direct `rustc`

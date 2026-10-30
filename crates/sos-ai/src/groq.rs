@@ -326,6 +326,15 @@ pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::V
     } else {
         Vec::new()
     };
+    let control_flow_regions = if pack.task == ModelTask::StructureRecovery {
+        pack.ir
+            .functions
+            .first()
+            .map(|function| crate::required_control_flow_regions(pack, &function.id))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let observed_abi_parameters = if pack.task == ModelTask::SignatureRecovery {
         pack.ir
             .functions
@@ -377,6 +386,7 @@ pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::V
             "strings": pack.analysis.strings.iter().take(32).collect::<Vec<_>>(),
             "public_keys": pack.analysis.public_key_candidates.iter().take(16).collect::<Vec<_>>(),
             "required_effects": required_effects,
+            "control_flow_regions": control_flow_regions,
             "observed_abi_parameters": observed_abi_parameters,
             "signature_contracts": pack.signature_contracts,
         },

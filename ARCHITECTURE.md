@@ -363,6 +363,9 @@ Rules:
 
 - no invented APIs or source comments;
 - preserve branch conditions and memory offsets;
+- consume deterministic region contracts derived from dominators,
+  postdominators, backedges, and recursive SCCs; emit one distinct concrete
+  source header for every branch/loop region and cite its exact CFG header;
 - identify uncertainty;
 - return byte ranges and IR node IDs supporting every statement.
 - process known callees before callers and pass only bounded, accepted callee

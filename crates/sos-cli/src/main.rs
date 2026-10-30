@@ -50,8 +50,8 @@ const HUMANIZATION_PROMPT_VERSION: &str = "sos-v2";
 const DETERMINISTIC_HUMANIZER_ID: &str = "sos-deterministic-syntax-v1";
 const HUMANIZATION_CACHE_SCHEMA_VERSION: u32 = 2;
 const HUMANIZATION_CACHE_RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
-const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v8";
-const LIFT_CACHE_SCHEMA_VERSION: u32 = 9;
+const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v9";
+const LIFT_CACHE_SCHEMA_VERSION: u32 = 10;
 const LIFT_CACHE_RECORD_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 fn main() -> ExitCode {
@@ -5464,6 +5464,33 @@ mod tests {
                             })
                         })
                         .collect::<Vec<_>>();
+                let regions =
+                    sos_ai::required_control_flow_regions(&request.evidence_pack, &function_id);
+                let mut region_headers = Vec::new();
+                let control_flow_mappings = regions
+                    .iter()
+                    .map(|region| {
+                        let suffix = region.id.replace('-', "_");
+                        let header = match region.kind {
+                            sos_ai::ControlFlowRegionKind::Branch => {
+                                format!("if unknown_{suffix}() {{")
+                            }
+                            sos_ai::ControlFlowRegionKind::Loop => {
+                                format!("while unknown_{suffix}() {{")
+                            }
+                        };
+                        region_headers.push(format!("{header}\nunknown_region_body();\n}}"));
+                        serde_json::json!({
+                            "region_id": region.id,
+                            "output_fragment": header,
+                            "evidence": [{
+                                "source": "ir",
+                                "location": format!("block:{}", region.header_block_id),
+                                "detail": null
+                            }]
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 if request.task == sos_ai::ModelTask::StructureRecovery {
                     self.requests.lock().unwrap().push((
                         request.evidence_pack.analysis.entrypoint,
@@ -5479,7 +5506,11 @@ mod tests {
                     sos_ai::ModelTask::StructureRecovery => serde_json::json!({
                         "functions": [{
                             "function_id": function_id,
-                            "pseudocode": format!("fn {function_id}() -> unknown {{}}"),
+                            "pseudocode": format!(
+                                "fn {function_id}() -> unknown {{\n{}\n}}",
+                                region_headers.join("\n")
+                            ),
+                            "control_flow_mappings": control_flow_mappings,
                             "effects": required_effects,
                             "evidence": [{
                                 "source": "ir",

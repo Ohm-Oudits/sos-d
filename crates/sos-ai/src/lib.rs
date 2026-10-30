@@ -221,6 +221,11 @@ pub struct RecoveredFunction {
     /// the readable output.
     #[serde(default)]
     pub source_mappings: Vec<RecoveredSourceMapping>,
+    /// One concrete source header for every deterministic branch/loop region
+    /// in the scoped CFG. This prevents a candidate from satisfying several
+    /// distinct regions with one generic `if` or `loop` token.
+    #[serde(default)]
+    pub control_flow_mappings: Vec<RecoveredControlFlowMapping>,
     #[serde(default)]
     pub effects: Vec<RecoveredEffect>,
     #[serde(default)]
@@ -231,6 +236,518 @@ pub struct RecoveredFunction {
 pub struct RecoveredSourceMapping {
     pub obligation_id: String,
     pub output_fragment: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveredControlFlowMapping {
+    pub region_id: String,
+    pub output_fragment: String,
+    #[serde(default)]
+    pub evidence: Vec<sos_types::EvidenceRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlFlowRegionKind {
+    Branch,
+    Loop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlFlowArmContract {
+    pub entry_block_id: String,
+    pub member_blocks: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlFlowEdgeContract {
+    pub source_block_id: String,
+    pub destination_block_id: String,
+}
+
+/// Deterministic structured-control-flow evidence derived from the bounded CFG.
+/// It is intentionally source-language neutral: the model chooses `if` versus
+/// `match` and `while` versus `loop`, but it cannot invent or merge regions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlFlowRegionContract {
+    pub id: String,
+    pub function_id: String,
+    pub kind: ControlFlowRegionKind,
+    pub header_block_id: String,
+    pub member_blocks: Vec<String>,
+    pub entry_blocks: Vec<String>,
+    pub exit_blocks: Vec<String>,
+    pub join_block_id: Option<String>,
+    pub arms: Vec<ControlFlowArmContract>,
+    pub cycle_edges: Vec<ControlFlowEdgeContract>,
+}
+
+pub fn required_control_flow_regions(
+    pack: &EvidencePack,
+    function_id: &str,
+) -> Vec<ControlFlowRegionContract> {
+    pack.control_flow_regions
+        .iter()
+        .filter(|region| region.function_id == function_id)
+        .cloned()
+        .collect()
+}
+
+fn derive_control_flow_regions(ir: &CanonicalIr) -> Vec<ControlFlowRegionContract> {
+    let mut regions = Vec::new();
+    for function in &ir.functions {
+        let mut blocks = ir
+            .blocks
+            .iter()
+            .filter(|block| block.function_id == function.id)
+            .collect::<Vec<_>>();
+        blocks.sort_by_key(|block| block.start_pc);
+        if blocks.is_empty() {
+            continue;
+        }
+        let order = blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (block.id.clone(), index))
+            .collect::<BTreeMap<_, _>>();
+        let block_ids = order.keys().cloned().collect::<BTreeSet<_>>();
+        let entry = blocks
+            .iter()
+            .find(|block| block.start_pc == function.entry_pc)
+            .unwrap_or(&blocks[0])
+            .id
+            .clone();
+        let successors = blocks
+            .iter()
+            .map(|block| {
+                let mut next = block
+                    .successors
+                    .iter()
+                    .filter(|successor| block_ids.contains(*successor))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                sort_block_ids(&mut next, &order);
+                next.dedup();
+                (block.id.clone(), next)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut predecessors = block_ids
+            .iter()
+            .map(|id| (id.clone(), Vec::new()))
+            .collect::<BTreeMap<_, Vec<String>>>();
+        for (source, destinations) in &successors {
+            for destination in destinations {
+                predecessors
+                    .entry(destination.clone())
+                    .or_default()
+                    .push(source.clone());
+            }
+        }
+        for incoming in predecessors.values_mut() {
+            sort_block_ids(incoming, &order);
+            incoming.dedup();
+        }
+        let reachable = reachable_blocks(&entry, &successors);
+        let dominators = dominator_sets(&entry, &reachable, &predecessors);
+
+        let mut loop_members = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut loop_edges = BTreeMap::<String, BTreeSet<(String, String)>>::new();
+        for source in &reachable {
+            for destination in successors.get(source).into_iter().flatten() {
+                if !dominators
+                    .get(source)
+                    .is_some_and(|set| set.contains(destination))
+                {
+                    continue;
+                }
+                let members = loop_members.entry(destination.clone()).or_default();
+                members.insert(destination.clone());
+                members.insert(source.clone());
+                let mut pending = vec![source.clone()];
+                while let Some(block) = pending.pop() {
+                    for predecessor in predecessors.get(&block).into_iter().flatten() {
+                        if reachable.contains(predecessor)
+                            && members.insert(predecessor.clone())
+                            && predecessor != destination
+                        {
+                            pending.push(predecessor.clone());
+                        }
+                    }
+                }
+                loop_edges
+                    .entry(destination.clone())
+                    .or_default()
+                    .insert((source.clone(), destination.clone()));
+            }
+        }
+
+        let mut function_regions = Vec::new();
+        for (header, members) in &loop_members {
+            function_regions.push(loop_region_contract(
+                &function.id,
+                header,
+                members,
+                loop_edges.get(header).cloned().unwrap_or_default(),
+                &successors,
+                &order,
+            ));
+        }
+
+        for scc in ir.sccs.iter().filter(|scc| scc.recursive) {
+            let mut members = scc
+                .block_starts
+                .iter()
+                .map(|pc| format!("bb_{pc:x}"))
+                .filter(|block| reachable.contains(block))
+                .collect::<BTreeSet<_>>();
+            if members.is_empty()
+                || function_regions.iter().any(|region| {
+                    region.kind == ControlFlowRegionKind::Loop
+                        && members
+                            .iter()
+                            .all(|block| region.member_blocks.contains(block))
+                })
+            {
+                continue;
+            }
+            let mut entries = members
+                .iter()
+                .filter(|block| {
+                    predecessors
+                        .get(*block)
+                        .into_iter()
+                        .flatten()
+                        .any(|predecessor| !members.contains(predecessor))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            sort_block_ids(&mut entries, &order);
+            let header = entries
+                .first()
+                .cloned()
+                .or_else(|| {
+                    members
+                        .iter()
+                        .min_by_key(|block| order.get(*block))
+                        .cloned()
+                })
+                .expect("a non-empty SCC has a header");
+            let mut cycle_edges = BTreeSet::new();
+            for source in &members {
+                for destination in successors.get(source).into_iter().flatten() {
+                    if members.contains(destination) {
+                        cycle_edges.insert((source.clone(), destination.clone()));
+                    }
+                }
+            }
+            members.insert(header.clone());
+            function_regions.push(loop_region_contract(
+                &function.id,
+                &header,
+                &members,
+                cycle_edges,
+                &successors,
+                &order,
+            ));
+        }
+
+        let loop_control_blocks = function_regions
+            .iter()
+            .filter(|region| region.kind == ControlFlowRegionKind::Loop)
+            .flat_map(|region| {
+                std::iter::once(region.header_block_id.clone()).chain(
+                    region
+                        .cycle_edges
+                        .iter()
+                        .map(|edge| edge.source_block_id.clone()),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let postdominators = postdominator_sets(&reachable, &successors);
+        for block in &blocks {
+            if !reachable.contains(&block.id) || loop_control_blocks.contains(&block.id) {
+                continue;
+            }
+            let entries = successors.get(&block.id).cloned().unwrap_or_default();
+            if entries.len() < 2 {
+                continue;
+            }
+            let join = immediate_postdominator(&block.id, &postdominators, &order);
+            let mut arms = Vec::new();
+            let mut members = BTreeSet::from([block.id.clone()]);
+            for arm_entry in &entries {
+                let arm_members = reachable_before_join(
+                    arm_entry,
+                    join.as_deref(),
+                    &block.id,
+                    &reachable,
+                    &successors,
+                );
+                members.extend(arm_members.iter().cloned());
+                let mut arm_members = arm_members.into_iter().collect::<Vec<_>>();
+                sort_block_ids(&mut arm_members, &order);
+                arms.push(ControlFlowArmContract {
+                    entry_block_id: arm_entry.clone(),
+                    member_blocks: arm_members,
+                });
+            }
+            let mut member_blocks = members.iter().cloned().collect::<Vec<_>>();
+            sort_block_ids(&mut member_blocks, &order);
+            let mut exits = if let Some(join) = join.clone() {
+                vec![join]
+            } else {
+                members
+                    .iter()
+                    .flat_map(|source| successors.get(source).into_iter().flatten())
+                    .filter(|destination| !members.contains(*destination))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            sort_block_ids(&mut exits, &order);
+            exits.dedup();
+            function_regions.push(ControlFlowRegionContract {
+                id: format!("region_branch_{}", block.id.trim_start_matches("bb_")),
+                function_id: function.id.clone(),
+                kind: ControlFlowRegionKind::Branch,
+                header_block_id: block.id.clone(),
+                member_blocks,
+                entry_blocks: entries,
+                exit_blocks: exits,
+                join_block_id: join,
+                arms,
+                cycle_edges: Vec::new(),
+            });
+        }
+        function_regions.sort_by_key(|region| {
+            (
+                order
+                    .get(&region.header_block_id)
+                    .copied()
+                    .unwrap_or(usize::MAX),
+                region.kind,
+            )
+        });
+        regions.extend(function_regions);
+    }
+    regions
+}
+
+fn sort_block_ids(blocks: &mut [String], order: &BTreeMap<String, usize>) {
+    blocks.sort_by_key(|block| order.get(block).copied().unwrap_or(usize::MAX));
+}
+
+fn reachable_blocks(entry: &str, successors: &BTreeMap<String, Vec<String>>) -> BTreeSet<String> {
+    let mut reachable = BTreeSet::new();
+    let mut pending = vec![entry.to_owned()];
+    while let Some(block) = pending.pop() {
+        if !reachable.insert(block.clone()) {
+            continue;
+        }
+        pending.extend(successors.get(&block).into_iter().flatten().cloned());
+    }
+    reachable
+}
+
+fn dominator_sets(
+    entry: &str,
+    reachable: &BTreeSet<String>,
+    predecessors: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut dominators = reachable
+        .iter()
+        .map(|block| {
+            let initial = if block == entry {
+                BTreeSet::from([block.clone()])
+            } else {
+                reachable.clone()
+            };
+            (block.clone(), initial)
+        })
+        .collect::<BTreeMap<_, _>>();
+    loop {
+        let mut changed = false;
+        for block in reachable.iter().filter(|block| block.as_str() != entry) {
+            let incoming = predecessors
+                .get(block)
+                .into_iter()
+                .flatten()
+                .filter(|predecessor| reachable.contains(*predecessor))
+                .collect::<Vec<_>>();
+            let mut next = if let Some(first) = incoming.first() {
+                dominators.get(*first).cloned().unwrap_or_default()
+            } else {
+                BTreeSet::new()
+            };
+            for predecessor in incoming.iter().skip(1) {
+                if let Some(set) = dominators.get(*predecessor) {
+                    next.retain(|candidate| set.contains(candidate));
+                }
+            }
+            next.insert(block.clone());
+            if dominators.get(block) != Some(&next) {
+                dominators.insert(block.clone(), next);
+                changed = true;
+            }
+        }
+        if !changed {
+            return dominators;
+        }
+    }
+}
+
+fn postdominator_sets(
+    reachable: &BTreeSet<String>,
+    successors: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let exits = reachable
+        .iter()
+        .filter(|block| {
+            successors
+                .get(*block)
+                .is_none_or(|next| next.iter().all(|successor| !reachable.contains(successor)))
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if exits.is_empty() {
+        return BTreeMap::new();
+    }
+    let mut postdominators = reachable
+        .iter()
+        .map(|block| {
+            let initial = if exits.contains(block) {
+                BTreeSet::from([block.clone()])
+            } else {
+                reachable.clone()
+            };
+            (block.clone(), initial)
+        })
+        .collect::<BTreeMap<_, _>>();
+    loop {
+        let mut changed = false;
+        for block in reachable.iter().filter(|block| !exits.contains(*block)) {
+            let next_blocks = successors
+                .get(block)
+                .into_iter()
+                .flatten()
+                .filter(|successor| reachable.contains(*successor))
+                .collect::<Vec<_>>();
+            let mut next = if let Some(first) = next_blocks.first() {
+                postdominators.get(*first).cloned().unwrap_or_default()
+            } else {
+                BTreeSet::new()
+            };
+            for successor in next_blocks.iter().skip(1) {
+                if let Some(set) = postdominators.get(*successor) {
+                    next.retain(|candidate| set.contains(candidate));
+                }
+            }
+            next.insert(block.clone());
+            if postdominators.get(block) != Some(&next) {
+                postdominators.insert(block.clone(), next);
+                changed = true;
+            }
+        }
+        if !changed {
+            return postdominators;
+        }
+    }
+}
+
+fn immediate_postdominator(
+    block: &str,
+    postdominators: &BTreeMap<String, BTreeSet<String>>,
+    order: &BTreeMap<String, usize>,
+) -> Option<String> {
+    let mut strict = postdominators
+        .get(block)?
+        .iter()
+        .filter(|candidate| candidate.as_str() != block)
+        .cloned()
+        .collect::<Vec<_>>();
+    sort_block_ids(&mut strict, order);
+    strict.iter().find_map(|candidate| {
+        (!strict.iter().any(|other| {
+            other != candidate
+                && postdominators
+                    .get(other)
+                    .is_some_and(|set| set.contains(candidate))
+        }))
+        .then(|| candidate.clone())
+    })
+}
+
+fn reachable_before_join(
+    entry: &str,
+    join: Option<&str>,
+    header: &str,
+    reachable: &BTreeSet<String>,
+    successors: &BTreeMap<String, Vec<String>>,
+) -> BTreeSet<String> {
+    let mut members = BTreeSet::new();
+    let mut pending = vec![entry.to_owned()];
+    while let Some(block) = pending.pop() {
+        if block == header || join == Some(block.as_str()) || !reachable.contains(&block) {
+            continue;
+        }
+        if !members.insert(block.clone()) {
+            continue;
+        }
+        pending.extend(successors.get(&block).into_iter().flatten().cloned());
+    }
+    members
+}
+
+fn loop_region_contract(
+    function_id: &str,
+    header: &str,
+    members: &BTreeSet<String>,
+    edges: BTreeSet<(String, String)>,
+    successors: &BTreeMap<String, Vec<String>>,
+    order: &BTreeMap<String, usize>,
+) -> ControlFlowRegionContract {
+    let mut member_blocks = members.iter().cloned().collect::<Vec<_>>();
+    sort_block_ids(&mut member_blocks, order);
+    let mut exits = members
+        .iter()
+        .flat_map(|source| successors.get(source).into_iter().flatten())
+        .filter(|destination| !members.contains(*destination))
+        .cloned()
+        .collect::<Vec<_>>();
+    sort_block_ids(&mut exits, order);
+    exits.dedup();
+    let mut cycle_edges = edges
+        .into_iter()
+        .map(
+            |(source_block_id, destination_block_id)| ControlFlowEdgeContract {
+                source_block_id,
+                destination_block_id,
+            },
+        )
+        .collect::<Vec<_>>();
+    cycle_edges.sort_by_key(|edge| {
+        (
+            order
+                .get(&edge.source_block_id)
+                .copied()
+                .unwrap_or(usize::MAX),
+            order
+                .get(&edge.destination_block_id)
+                .copied()
+                .unwrap_or(usize::MAX),
+        )
+    });
+    ControlFlowRegionContract {
+        id: format!("region_loop_{}", header.trim_start_matches("bb_")),
+        function_id: function_id.to_owned(),
+        kind: ControlFlowRegionKind::Loop,
+        header_block_id: header.to_owned(),
+        member_blocks,
+        entry_blocks: vec![header.to_owned()],
+        exit_blocks: exits,
+        join_block_id: None,
+        arms: Vec::new(),
+        cycle_edges,
+    }
 }
 
 /// Machine-checkable coverage ledger linking a readable reconstruction back
@@ -904,6 +1421,11 @@ pub struct EvidencePack {
     /// textual decompiler output. Empty for ELF/SBPF analysis tasks.
     #[serde(default)]
     pub pseudocode_obligations: Vec<PseudocodeObligation>,
+    /// Deterministic branch and loop regions recovered from the bounded CFG.
+    /// Structure-stage output must map every region to one concrete source
+    /// header; other tasks receive the same immutable contracts for context.
+    #[serde(default)]
+    pub control_flow_regions: Vec<ControlFlowRegionContract>,
     pub untrusted_evidence: Vec<UntrustedEvidence>,
 }
 
@@ -955,15 +1477,18 @@ impl EvidencePack {
         analysis: StaticAnalysis,
         semantics: SemanticAnalysis,
     ) -> Self {
+        let ir = build_canonical_ir(&analysis);
+        let control_flow_regions = derive_control_flow_regions(&ir);
         Self {
             schema_version: AI_SCHEMA_VERSION,
             task,
             artifact_sha256,
-            ir: build_canonical_ir(&analysis),
+            ir,
             analysis,
             semantics,
             signature_contracts: Vec::new(),
             pseudocode_obligations: Vec::new(),
+            control_flow_regions,
             untrusted_evidence: Vec::new(),
         }
     }
@@ -1262,6 +1787,7 @@ impl EvidencePack {
         pack.ir.blocks.truncate(limits.max_basic_blocks);
         pack.ir.functions.truncate(limits.max_functions);
         pack.ir.sccs.truncate(limits.max_sccs);
+        pack.control_flow_regions = derive_control_flow_regions(&pack.ir);
         pack
     }
 }
@@ -2671,13 +3197,37 @@ where
         task: ModelTask,
         model: impl Into<String>,
         prompt_version: impl Into<String>,
-        pack: EvidencePack,
+        mut pack: EvidencePack,
         max_output_tokens: usize,
     ) -> Result<ModelResponse, AiError> {
         if !(MIN_STAGE_OUTPUT_TOKENS..=MAX_STAGE_OUTPUT_TOKENS).contains(&max_output_tokens) {
             return Err(AiError::InvalidResponse(format!(
                 "model output token budget {max_output_tokens} is outside {MIN_STAGE_OUTPUT_TOKENS}..={MAX_STAGE_OUTPUT_TOKENS}"
             )));
+        }
+        // Region contracts are a deterministic projection of canonical IR.
+        // Recompute at the gateway boundary so a stale cache or external caller
+        // cannot suppress a branch/loop obligation by editing this convenience
+        // field before model inference.
+        pack.control_flow_regions = derive_control_flow_regions(&pack.ir);
+        if task == ModelTask::StructureRecovery {
+            let maximum = pack
+                .ir
+                .functions
+                .iter()
+                .map(|function| {
+                    pack.control_flow_regions
+                        .iter()
+                        .filter(|region| region.function_id == function.id)
+                        .count()
+                })
+                .max()
+                .unwrap_or(0);
+            if maximum > 128 {
+                return Err(AiError::InvalidResponse(format!(
+                    "bounded structure request contains {maximum} control-flow regions for one function; the supported maximum is 128"
+                )));
+            }
         }
         let input_bytes = serde_json::to_vec(&pack)
             .map_err(|error| AiError::InvalidResponse(error.to_string()))?;
@@ -4185,11 +4735,12 @@ fn validate_response_for_request(
 pub fn validate_model_response_for_pack(
     model: &str,
     prompt_version: &str,
-    pack: EvidencePack,
+    mut pack: EvidencePack,
     response: &ModelResponse,
 ) -> Result<(), AiError> {
     const MAX_CACHED_INPUT_BYTES: usize = 4 * 1024 * 1024;
     const MAX_CACHED_OUTPUT_BYTES: usize = 1024 * 1024;
+    pack.control_flow_regions = derive_control_flow_regions(&pack.ir);
     let input_bytes = serde_json::to_vec(&pack)
         .map_err(|error| AiError::InvalidResponse(error.to_string()))?
         .len();
@@ -4440,11 +4991,23 @@ fn validate_structure_candidate(
     )?;
     let required_effects =
         required_structure_effects(&request.evidence_pack, &function.function_id);
+    let expected_effects = required_effects
+        .iter()
+        .map(|required| {
+            (
+                required.kind,
+                required.location.clone(),
+                required.input_registers.clone(),
+                required.target_input_registers.clone(),
+                required.value_input_registers.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
     let mut covered_effects = BTreeSet::new();
     for effect in &function.effects {
-        if effect.evidence.is_empty() {
+        if effect.evidence.len() != 1 || effect.evidence[0].source != "ir" {
             return Err(AiError::InvalidResponse(format!(
-                "structure candidate for {} has an effect without evidence",
+                "structure candidate for {} must cite exactly one IR location per effect",
                 function.function_id
             )));
         }
@@ -4484,16 +5047,24 @@ fn validate_structure_candidate(
                 function.function_id
             )));
         }
-        for evidence in &effect.evidence {
-            if evidence.source == "ir" {
-                covered_effects.insert((
-                    effect.kind,
-                    evidence.location.clone(),
-                    normalized_inputs.clone(),
-                    normalized_targets.clone(),
-                    normalized_values.clone(),
-                ));
-            }
+        let key = (
+            effect.kind,
+            effect.evidence[0].location.clone(),
+            normalized_inputs,
+            normalized_targets,
+            normalized_values,
+        );
+        if !expected_effects.contains(&key) {
+            return Err(AiError::InvalidResponse(format!(
+                "structure candidate for {} invents a binary effect not present in the deterministic contract",
+                function.function_id
+            )));
+        }
+        if !covered_effects.insert(key) {
+            return Err(AiError::InvalidResponse(format!(
+                "structure candidate for {} duplicates one deterministic binary effect",
+                function.function_id
+            )));
         }
     }
     let missing_effects = required_effects
@@ -4525,6 +5096,7 @@ fn validate_structure_candidate(
             missing_effects.join(", ")
         )));
     }
+    validate_control_flow_mappings(request, function)?;
     let function_blocks = request
         .evidence_pack
         .ir
@@ -4582,6 +5154,119 @@ fn validate_structure_candidate(
         return Err(AiError::InvalidResponse(format!(
             "structure candidate for {} omits deterministic memory writes",
             function.function_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_control_flow_mappings(
+    request: &ModelRequest,
+    function: &RecoveredFunction,
+) -> Result<(), AiError> {
+    let contracts = required_control_flow_regions(&request.evidence_pack, &function.function_id)
+        .into_iter()
+        .map(|region| (region.id.clone(), region))
+        .collect::<BTreeMap<_, _>>();
+    if contracts.len() > 128 {
+        return Err(AiError::InvalidResponse(format!(
+            "function {} has {} deterministic control-flow regions, exceeding the supported mapping bound of 128",
+            function.function_id,
+            contracts.len()
+        )));
+    }
+    if function.control_flow_mappings.len() != contracts.len() {
+        return Err(AiError::InvalidResponse(format!(
+            "structure candidate for {} maps {} control-flow regions but {} are required",
+            function.function_id,
+            function.control_flow_mappings.len(),
+            contracts.len()
+        )));
+    }
+    let compact_output = compact_signature(&function.pseudocode);
+    let mut covered = BTreeSet::new();
+    let mut fragments = BTreeSet::new();
+    for mapping in &function.control_flow_mappings {
+        let Some(contract) = contracts.get(&mapping.region_id) else {
+            return Err(AiError::InvalidResponse(format!(
+                "structure candidate for {} maps unknown control-flow region {}",
+                function.function_id, mapping.region_id
+            )));
+        };
+        if !covered.insert(mapping.region_id.as_str()) {
+            return Err(AiError::InvalidResponse(format!(
+                "structure candidate for {} maps control-flow region {} more than once",
+                function.function_id, mapping.region_id
+            )));
+        }
+        let fragment = mapping.output_fragment.trim();
+        let compact_fragment = compact_signature(fragment);
+        if fragment.chars().count() < 2
+            || fragment.chars().count() > 256
+            || fragment.contains(['\n', '\r'])
+            || fragment.starts_with("//")
+            || fragment.starts_with("/*")
+            || compact_fragment.is_empty()
+            || !compact_output.contains(&compact_fragment)
+        {
+            return Err(AiError::InvalidResponse(format!(
+                "control-flow mapping {} must name a bounded one-line non-comment header present in the pseudocode",
+                mapping.region_id
+            )));
+        }
+        if !fragments.insert(compact_fragment.clone()) {
+            return Err(AiError::InvalidResponse(format!(
+                "structure candidate for {} reuses one source header for multiple control-flow regions",
+                function.function_id
+            )));
+        }
+        if fragments
+            .iter()
+            .filter(|candidate| **candidate != compact_fragment)
+            .any(|candidate| {
+                candidate.contains(&compact_fragment)
+                    || compact_fragment.contains(candidate.as_str())
+            })
+        {
+            return Err(AiError::InvalidResponse(format!(
+                "structure candidate for {} uses overlapping source headers for multiple control-flow regions",
+                function.function_id
+            )));
+        }
+        let realizes_kind = match contract.kind {
+            ControlFlowRegionKind::Branch => ["if", "match", "switch"].iter().any(|keyword| {
+                contains_pseudocode_keyword(&fragment.to_ascii_lowercase(), keyword)
+            }),
+            ControlFlowRegionKind::Loop => ["while", "for", "loop"].iter().any(|keyword| {
+                contains_pseudocode_keyword(&fragment.to_ascii_lowercase(), keyword)
+            }),
+        };
+        if !realizes_kind {
+            return Err(AiError::InvalidResponse(format!(
+                "control-flow mapping {} does not visibly preserve {:?}",
+                mapping.region_id, contract.kind
+            )));
+        }
+        let expected_location = format!("block:{}", contract.header_block_id);
+        if mapping.evidence.len() != 1
+            || mapping.evidence[0].source != "ir"
+            || mapping.evidence[0].location != expected_location
+        {
+            return Err(AiError::InvalidResponse(format!(
+                "control-flow mapping {} must cite its deterministic header {}",
+                mapping.region_id, expected_location
+            )));
+        }
+    }
+    let missing = contracts
+        .keys()
+        .filter(|region| !covered.contains(region.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(AiError::InvalidResponse(format!(
+            "structure candidate for {} omits control-flow regions: {}",
+            function.function_id,
+            missing.join(", ")
         )));
     }
     Ok(())
@@ -4835,6 +5520,15 @@ fn structured_evidence_refs(
                         )));
                     }
                     references.extend(effect.evidence);
+                }
+                for mapping in function.control_flow_mappings {
+                    if mapping.evidence.is_empty() {
+                        return Err(AiError::InvalidResponse(format!(
+                            "control-flow mapping {} for {} has no evidence",
+                            mapping.region_id, function.function_id
+                        )));
+                    }
+                    references.extend(mapping.evidence);
                 }
                 references.extend(function.evidence);
             }
@@ -5285,6 +5979,87 @@ mod tests {
         })
     }
 
+    fn test_structure_output(
+        pack: &EvidencePack,
+        function_id: &str,
+        declaration: &str,
+        evidence: serde_json::Value,
+    ) -> serde_json::Value {
+        let effects = required_structure_effects(pack, function_id)
+            .into_iter()
+            .map(|effect| {
+                serde_json::json!({
+                    "kind": effect.kind,
+                    "input_registers": effect.input_registers,
+                    "target_input_registers": effect.target_input_registers,
+                    "value_input_registers": effect.value_input_registers,
+                    "evidence": [{
+                        "source": "ir",
+                        "location": effect.location,
+                        "detail": null
+                    }]
+                })
+            })
+            .collect::<Vec<_>>();
+        let regions = required_control_flow_regions(pack, function_id);
+        let mut body = Vec::new();
+        let mut mappings = Vec::new();
+        for region in &regions {
+            let suffix = region.id.replace('-', "_");
+            let header = match region.kind {
+                ControlFlowRegionKind::Branch => {
+                    format!("if unknown_{suffix}() {{")
+                }
+                ControlFlowRegionKind::Loop => {
+                    format!("while unknown_{suffix}() {{")
+                }
+            };
+            body.push(header.clone());
+            body.push("unknown_region_body();".into());
+            body.push("}".into());
+            mappings.push(serde_json::json!({
+                "region_id": region.id,
+                "output_fragment": header,
+                "evidence": [{
+                    "source": "ir",
+                    "location": format!("block:{}", region.header_block_id),
+                    "detail": null
+                }]
+            }));
+        }
+        let required = required_structure_effects(pack, function_id);
+        if required
+            .iter()
+            .any(|effect| effect.kind == RecoveredEffectKind::MemoryWrite)
+        {
+            body.push("unknown_memory_write();".into());
+        }
+        if required
+            .iter()
+            .any(|effect| effect.kind == RecoveredEffectKind::Call)
+        {
+            body.push("unknown_call();".into());
+        }
+        if required
+            .iter()
+            .any(|effect| effect.kind == RecoveredEffectKind::Return)
+        {
+            body.push("return unknown_result();".into());
+        }
+        if body.is_empty() {
+            body.push("unknown_semantics();".into());
+        }
+        serde_json::json!({
+            "functions": [{
+                "function_id": function_id,
+                "pseudocode": format!("{declaration} {{\n{}\n}}", body.join("\n")),
+                "control_flow_mappings": mappings,
+                "effects": effects,
+                "evidence": [evidence]
+            }]
+        })
+    }
+
     struct EchoProvider;
 
     impl ModelProvider for EchoProvider {
@@ -5317,13 +6092,12 @@ mod tests {
                         .find(|contract| contract.signature.function_id == function_id)
                         .map(|contract| signature_contract_declaration(&contract.signature))
                         .unwrap_or_else(|| format!("fn {function_id}()"));
-                    serde_json::json!({
-                        "functions": [{
-                            "function_id": function_id,
-                            "pseudocode": format!("{declaration} {{ unknown_semantics(); }}"),
-                            "evidence": [function_evidence]
-                        }]
-                    })
+                    test_structure_output(
+                        &request.evidence_pack,
+                        &function_id,
+                        &declaration,
+                        function_evidence,
+                    )
                 }
                 ModelTask::PseudocodeHumanization => test_humanization_output(
                     &request.evidence_pack,
@@ -6477,6 +7251,7 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
             function_id: "fn_0".into(),
             pseudocode: valid_source.into(),
             source_mappings: Vec::new(),
+            control_flow_mappings: Vec::new(),
             effects,
             evidence: vec![sos_types::EvidenceRef {
                 source: "ir".into(),
@@ -6664,6 +7439,27 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
             serde_json::json!([1]);
         assert!(validate_structured_consistency(&request, &swapped_roles).is_err());
 
+        let mut invented = valid.clone();
+        invented["functions"][0]["effects"]
+            .as_array_mut()
+            .unwrap()
+            .push(effect("call", "operation:op_0"));
+        assert!(validate_structured_consistency(&request, &invented)
+            .unwrap_err()
+            .to_string()
+            .contains("invents a binary effect"));
+
+        let mut duplicated = valid.clone();
+        let duplicate = duplicated["functions"][0]["effects"][0].clone();
+        duplicated["functions"][0]["effects"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        assert!(validate_structured_consistency(&request, &duplicated)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicates one deterministic binary effect"));
+
         let mut missing_write = valid;
         missing_write["functions"][0]["effects"]
             .as_array_mut()
@@ -6671,6 +7467,232 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
             .remove(0);
         let error = validate_structured_consistency(&request, &missing_write).unwrap_err();
         assert!(error.to_string().contains("MemoryWrite:operation:op_0"));
+    }
+
+    #[test]
+    fn structure_recovery_must_map_each_deterministic_cfg_region() {
+        let mut pack = empty_pack();
+        pack.task = ModelTask::StructureRecovery;
+        pack.ir.blocks = vec![
+            sos_analysis::IrBlock {
+                id: "bb_0".into(),
+                function_id: "fn_0".into(),
+                start_pc: 0,
+                end_instruction_index: 1,
+                successors: vec!["bb_1".into(), "bb_4".into()],
+                scc_id: None,
+            },
+            sos_analysis::IrBlock {
+                id: "bb_1".into(),
+                function_id: "fn_0".into(),
+                start_pc: 1,
+                end_instruction_index: 2,
+                successors: vec!["bb_2".into()],
+                scc_id: Some(7),
+            },
+            sos_analysis::IrBlock {
+                id: "bb_2".into(),
+                function_id: "fn_0".into(),
+                start_pc: 2,
+                end_instruction_index: 3,
+                successors: vec!["bb_1".into(), "bb_3".into()],
+                scc_id: Some(7),
+            },
+            sos_analysis::IrBlock {
+                id: "bb_3".into(),
+                function_id: "fn_0".into(),
+                start_pc: 3,
+                end_instruction_index: 4,
+                successors: vec![],
+                scc_id: None,
+            },
+            sos_analysis::IrBlock {
+                id: "bb_4".into(),
+                function_id: "fn_0".into(),
+                start_pc: 4,
+                end_instruction_index: 5,
+                successors: vec!["bb_3".into()],
+                scc_id: None,
+            },
+        ];
+        pack.ir.sccs = vec![sos_analysis::SccFact {
+            id: 7,
+            block_starts: vec![1, 2],
+            recursive: true,
+        }];
+        pack.control_flow_regions = derive_control_flow_regions(&pack.ir);
+        assert_eq!(pack.control_flow_regions.len(), 2);
+        let branch = pack
+            .control_flow_regions
+            .iter()
+            .find(|region| region.kind == ControlFlowRegionKind::Branch)
+            .unwrap();
+        assert_eq!(branch.header_block_id, "bb_0");
+        assert_eq!(branch.join_block_id.as_deref(), Some("bb_3"));
+        assert_eq!(branch.entry_blocks, vec!["bb_1", "bb_4"]);
+        assert_eq!(branch.arms.len(), 2);
+        let loop_region = pack
+            .control_flow_regions
+            .iter()
+            .find(|region| region.kind == ControlFlowRegionKind::Loop)
+            .unwrap();
+        assert_eq!(loop_region.header_block_id, "bb_1");
+        assert_eq!(loop_region.member_blocks, vec!["bb_1", "bb_2"]);
+        assert_eq!(loop_region.exit_blocks, vec!["bb_3"]);
+        assert_eq!(loop_region.cycle_edges.len(), 1);
+        let hosted = crate::groq::hosted_model_evidence(&pack);
+        assert_eq!(
+            hosted["program"]["control_flow_regions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let request = ModelRequest {
+            task: ModelTask::StructureRecovery,
+            prompt_version: "v1".into(),
+            model: "test".into(),
+            evidence_pack: pack,
+            max_output_bytes: 10_000,
+            max_output_tokens: 1_200,
+        };
+        let valid = serde_json::json!({"functions": [{
+            "function_id": "fn_0",
+            "pseudocode": "fn fn_0() {\nif choose_path {\nloop {\nunknown_body();\n}\n}\n}",
+            "control_flow_mappings": [
+                {
+                    "region_id": "region_branch_0",
+                    "output_fragment": "if choose_path {",
+                    "evidence": [{"source": "ir", "location": "block:bb_0", "detail": null}]
+                },
+                {
+                    "region_id": "region_loop_1",
+                    "output_fragment": "loop {",
+                    "evidence": [{"source": "ir", "location": "block:bb_1", "detail": null}]
+                }
+            ],
+            "effects": [
+                {
+                    "kind": "loop",
+                    "input_registers": [],
+                    "target_input_registers": [],
+                    "value_input_registers": [],
+                    "evidence": [{"source": "ir", "location": "block:bb_1", "detail": null}]
+                },
+                {
+                    "kind": "loop",
+                    "input_registers": [],
+                    "target_input_registers": [],
+                    "value_input_registers": [],
+                    "evidence": [{"source": "ir", "location": "block:bb_2", "detail": null}]
+                }
+            ],
+            "evidence": [{"source": "ir", "location": "function:fn_0", "detail": null}]
+        }]});
+        if let Err(error) = validate_structured_consistency(&request, &valid) {
+            panic!("valid region mapping was rejected: {error}");
+        }
+
+        let mut omitted = valid.clone();
+        omitted["functions"][0]["control_flow_mappings"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(validate_structured_consistency(&request, &omitted)
+            .unwrap_err()
+            .to_string()
+            .contains("control-flow regions"));
+
+        let mut wrong_header = valid;
+        wrong_header["functions"][0]["control_flow_mappings"][1]["evidence"][0]["location"] =
+            serde_json::json!("block:bb_2");
+        assert!(validate_structured_consistency(&request, &wrong_header)
+            .unwrap_err()
+            .to_string()
+            .contains("must cite its deterministic header"));
+
+        #[derive(Clone)]
+        struct RegionEchoProvider;
+        impl ModelProvider for RegionEchoProvider {
+            fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
+                let output = test_structure_output(
+                    &request.evidence_pack,
+                    "fn_0",
+                    "fn fn_0()",
+                    serde_json::json!({
+                        "source": "ir",
+                        "location": "function:fn_0",
+                        "detail": null
+                    }),
+                );
+                Ok(ModelResponse {
+                    task: request.task,
+                    model: request.model,
+                    prompt_version: request.prompt_version,
+                    structured_output: output,
+                    evidence: Vec::new(),
+                })
+            }
+        }
+        let mut stale_pack = request.evidence_pack.clone();
+        stale_pack.control_flow_regions.clear();
+        let response = ModelGateway::new(RegionEchoProvider, 1024 * 1024, 1024 * 1024)
+            .submit(ModelTask::StructureRecovery, "test", "v1", stale_pack)
+            .unwrap();
+        assert_eq!(
+            response.structured_output["functions"][0]["control_flow_mappings"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn irreducible_recursive_scc_still_becomes_a_loop_region() {
+        let block = |pc: usize, successors: &[usize], scc_id| sos_analysis::IrBlock {
+            id: format!("bb_{pc:x}"),
+            function_id: "fn_0".into(),
+            start_pc: pc,
+            end_instruction_index: pc + 1,
+            successors: successors
+                .iter()
+                .map(|successor| format!("bb_{successor:x}"))
+                .collect(),
+            scc_id,
+        };
+        let ir = CanonicalIr {
+            schema_version: sos_analysis::IR_SCHEMA_VERSION,
+            functions: vec![sos_analysis::IrFunction {
+                id: "fn_0".into(),
+                entry_pc: 0,
+                name: "entry".into(),
+            }],
+            blocks: vec![
+                block(0, &[1, 2], None),
+                block(1, &[2, 3], Some(9)),
+                block(2, &[1, 3], Some(9)),
+                block(3, &[], None),
+            ],
+            operations: Vec::new(),
+            sccs: vec![sos_analysis::SccFact {
+                id: 9,
+                block_starts: vec![1, 2],
+                recursive: true,
+            }],
+        };
+        let regions = derive_control_flow_regions(&ir);
+        let loop_region = regions
+            .iter()
+            .find(|region| region.kind == ControlFlowRegionKind::Loop)
+            .unwrap();
+        assert_eq!(loop_region.member_blocks, vec!["bb_1", "bb_2"]);
+        assert_eq!(loop_region.exit_blocks, vec!["bb_3"]);
+        assert_eq!(loop_region.cycle_edges.len(), 2);
+        assert!(regions.iter().any(|region| {
+            region.kind == ControlFlowRegionKind::Branch && region.header_block_id == "bb_0"
+        }));
     }
 
     #[test]

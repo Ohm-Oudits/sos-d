@@ -53,7 +53,14 @@ names, parameter types, order, or return type; raw prior-stage prose cannot
 satisfy this gate. Structure output also includes a machine-checkable
 effect ledger. Every deterministic store, branch, recursive CFG loop, call, and
 return in the scoped IR must be covered by a matching exact IR location; prose
-citations alone cannot satisfy this contract.
+citations alone cannot satisfy this contract. SOS additionally derives explicit
+control-flow region contracts from dominators, postdominators, natural
+backedges, and recursive SCCs. Each branch contract records its header, arm
+entries and members, join, and exits; each loop records its header, body, exits,
+and cycle edges. The structure agent must map every contract to a distinct
+one-line `if`/`match` or loop header in its returned pseudocode and cite the
+exact deterministic header block. One generic branch or loop can no longer
+satisfy several CFG regions.
 
 Before accepting a signature, SOS runs a conservative forward live-in analysis
 over the scoped SBPF CFG. Argument registers `r1` through `r5` begin as possible
@@ -131,6 +138,9 @@ The local GPT-OSS adapter selects Ollama's `low` reasoning mode so reasoning
 tokens leave room for final schema-constrained JSON. Structure and signature
 schemas require a candidate for every scoped IR function; an empty array is not
 treated as successful decompilation.
+Semantic-lift prompt v9 and lift-cache schema v10 bind checkpoints to the CFG
+region mapping contract, so older effect-only structure responses are never
+silently reused.
 
 ## Running a lift
 

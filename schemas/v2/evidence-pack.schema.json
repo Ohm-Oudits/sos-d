@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://sos-decompiler.dev/schema/v2/evidence-pack.json",
-  "title": "SOS AI evidence pack with accepted signature contracts",
+  "title": "SOS AI evidence pack with accepted signatures and CFG region contracts",
   "type": "object",
   "additionalProperties": true,
   "required": [
@@ -89,6 +89,82 @@
                     "detail": { "type": ["string", "null"] }
                   }
                 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "control_flow_regions": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "function_id",
+          "kind",
+          "header_block_id",
+          "member_blocks",
+          "entry_blocks",
+          "exit_blocks",
+          "join_block_id",
+          "arms",
+          "cycle_edges"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "function_id": { "type": "string" },
+          "kind": { "enum": ["branch", "loop"] },
+          "header_block_id": { "type": "string" },
+          "member_blocks": {
+            "type": "array",
+            "maxItems": 256,
+            "uniqueItems": true,
+            "items": { "type": "string" }
+          },
+          "entry_blocks": {
+            "type": "array",
+            "maxItems": 256,
+            "uniqueItems": true,
+            "items": { "type": "string" }
+          },
+          "exit_blocks": {
+            "type": "array",
+            "maxItems": 256,
+            "uniqueItems": true,
+            "items": { "type": "string" }
+          },
+          "join_block_id": { "type": ["string", "null"] },
+          "arms": {
+            "type": "array",
+            "maxItems": 256,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["entry_block_id", "member_blocks"],
+              "properties": {
+                "entry_block_id": { "type": "string" },
+                "member_blocks": {
+                  "type": "array",
+                  "maxItems": 256,
+                  "uniqueItems": true,
+                  "items": { "type": "string" }
+                }
+              }
+            }
+          },
+          "cycle_edges": {
+            "type": "array",
+            "maxItems": 1024,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["source_block_id", "destination_block_id"],
+              "properties": {
+                "source_block_id": { "type": "string" },
+                "destination_block_id": { "type": "string" }
               }
             }
           }
