@@ -7,7 +7,7 @@ use sos_ai::{
     CLOUDFLARE_GPT_OSS_120B, GROQ_GPT_OSS_120B, HUGGING_FACE_GPT_OSS_120B,
 };
 
-const DEFAULT_CORPUS_PROMPT: &str = "sos-model-qualification-v1";
+const DEFAULT_CORPUS_PROMPT: &str = "sos-model-qualification-v2";
 
 fn anthropic_provider(api_key: String) -> Result<AnthropicModelProvider, sos_ai::AiError> {
     let provider = AnthropicModelProvider::new(api_key)?;

@@ -216,10 +216,21 @@ pub struct StructureRecoveryOutput {
 pub struct RecoveredFunction {
     pub function_id: String,
     pub pseudocode: String,
+    /// Required only for textual pseudocode humanization. Each entry binds one
+    /// deterministic source-line obligation to a concrete fragment retained in
+    /// the readable output.
+    #[serde(default)]
+    pub source_mappings: Vec<RecoveredSourceMapping>,
     #[serde(default)]
     pub effects: Vec<RecoveredEffect>,
     #[serde(default)]
     pub evidence: Vec<sos_types::EvidenceRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveredSourceMapping {
+    pub obligation_id: String,
+    pub output_fragment: String,
 }
 
 /// Machine-checkable coverage ledger linking a readable reconstruction back
@@ -611,6 +622,28 @@ pub struct PseudocodeUnit {
     pub referenced_functions: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PseudocodeConstruct {
+    FunctionDeclaration,
+    Branch,
+    Loop,
+    Call,
+    MemoryWrite,
+    Return,
+    Statement,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PseudocodeObligation {
+    pub id: String,
+    pub source_line: usize,
+    pub source_sha256: String,
+    pub operation_ids: Vec<String>,
+    pub constructs: Vec<PseudocodeConstruct>,
+}
+
 /// Evidence-preserving syntax normalization used when semantic model inference
 /// is unavailable or rejected. This deliberately does not claim recovered
 /// types or behavior: it only rewrites recognized decompiler syntax and keeps
@@ -867,6 +900,10 @@ pub struct EvidencePack {
     /// as exact interfaces on later source-producing stages.
     #[serde(default)]
     pub signature_contracts: Vec<SignatureContract>,
+    /// Line-level preservation obligations derived deterministically from
+    /// textual decompiler output. Empty for ELF/SBPF analysis tasks.
+    #[serde(default)]
+    pub pseudocode_obligations: Vec<PseudocodeObligation>,
     pub untrusted_evidence: Vec<UntrustedEvidence>,
 }
 
@@ -926,6 +963,7 @@ impl EvidencePack {
             analysis,
             semantics,
             signature_contracts: Vec::new(),
+            pseudocode_obligations: Vec::new(),
             untrusted_evidence: Vec::new(),
         }
     }
@@ -2056,7 +2094,7 @@ pub fn evidence_pack_from_pseudocode_unit(unit: &PseudocodeUnit) -> Result<Evide
         "declared_function": unit.function_name,
         "referenced_known_functions": unit.referenced_functions,
     });
-    Ok(EvidencePack::from_analysis(
+    let mut pack = EvidencePack::from_analysis(
         ModelTask::PseudocodeHumanization,
         Some(sha256_bytes(unit.source.as_bytes())),
         analysis,
@@ -2065,7 +2103,204 @@ pub fn evidence_pack_from_pseudocode_unit(unit: &PseudocodeUnit) -> Result<Evide
     .with_untrusted_evidence(vec![UntrustedEvidence {
         source: "deterministic_pseudocode_index".into(),
         content: context.to_string(),
-    }]))
+    }]);
+    pack.pseudocode_obligations = build_pseudocode_obligations(unit, &lines, &pack.ir.operations);
+    Ok(pack)
+}
+
+fn build_pseudocode_obligations(
+    unit: &PseudocodeUnit,
+    lines: &[&str],
+    operations: &[sos_analysis::IrOperation],
+) -> Vec<PseudocodeObligation> {
+    let labels = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            pseudocode_label(line).map(|label| (label, unit.start_line + index))
+        })
+        .collect::<BTreeMap<_, _>>();
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, source)| {
+            let source_line = unit.start_line + index;
+            let constructs = pseudocode_line_constructs(source, source_line, &labels);
+            if constructs.is_empty() {
+                return None;
+            }
+            let operation_ids = operations
+                .iter()
+                .filter(|operation| (operation.pc >> 8) + 1 == source_line)
+                .map(|operation| operation.id.clone())
+                .collect::<Vec<_>>();
+            (!operation_ids.is_empty()).then(|| PseudocodeObligation {
+                id: format!("source_line_{source_line:04}"),
+                source_line,
+                source_sha256: sha256_bytes(source.as_bytes()),
+                operation_ids,
+                constructs,
+            })
+        })
+        .collect()
+}
+
+fn pseudocode_label(source: &str) -> Option<String> {
+    let label = source.trim().strip_suffix(':')?.trim();
+    if label.is_empty()
+        || label.contains("::")
+        || !label
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return None;
+    }
+    Some(label.to_ascii_lowercase())
+}
+
+fn pseudocode_line_constructs(
+    source: &str,
+    source_line: usize,
+    labels: &BTreeMap<String, usize>,
+) -> Vec<PseudocodeConstruct> {
+    let trimmed = source.trim();
+    if trimmed.is_empty()
+        || matches!(trimmed, "{" | "}" | "};")
+        || trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with("* ")
+        || pseudocode_label(trimmed).is_some()
+    {
+        return Vec::new();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let normalized = normalize_pseudocode_line(trimmed);
+    let mut constructs = BTreeSet::new();
+    let open_brace = trimmed.find('{');
+    let declaration_like = normalized.kind == "function_signature"
+        || open_brace.is_some_and(|brace| {
+            let prefix = &trimmed[..brace];
+            prefix.contains('(')
+                && prefix.contains(')')
+                && !["if", "for", "while", "switch", "match", "catch"]
+                    .iter()
+                    .any(|keyword| prefix.trim_start().starts_with(keyword))
+        });
+    if declaration_like {
+        constructs.insert(PseudocodeConstruct::FunctionDeclaration);
+    }
+    if contains_pseudocode_keyword(&lower, "if")
+        || contains_pseudocode_keyword(&lower, "switch")
+        || contains_pseudocode_keyword(&lower, "match")
+        || contains_pseudocode_keyword(&lower, "goto")
+    {
+        constructs.insert(PseudocodeConstruct::Branch);
+    }
+    if contains_pseudocode_keyword(&lower, "while")
+        || contains_pseudocode_keyword(&lower, "for")
+        || contains_pseudocode_keyword(&lower, "loop")
+        || backward_goto_target(&lower, source_line, labels)
+    {
+        constructs.insert(PseudocodeConstruct::Loop);
+    }
+    if contains_pseudocode_keyword(&lower, "return") {
+        constructs.insert(PseudocodeConstruct::Return);
+    }
+    if pseudocode_has_call(trimmed, declaration_like) {
+        constructs.insert(PseudocodeConstruct::Call);
+    }
+    if pseudocode_has_memory_write(trimmed) {
+        constructs.insert(PseudocodeConstruct::MemoryWrite);
+    }
+    if constructs.is_empty() {
+        constructs.insert(PseudocodeConstruct::Statement);
+    }
+    constructs.into_iter().collect()
+}
+
+fn contains_pseudocode_keyword(source: &str, keyword: &str) -> bool {
+    source.match_indices(keyword).any(|(index, _)| {
+        let before = source[..index].chars().next_back();
+        let after = source[index + keyword.len()..].chars().next();
+        !before.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+            && !after.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+    })
+}
+
+fn backward_goto_target(lower: &str, source_line: usize, labels: &BTreeMap<String, usize>) -> bool {
+    lower.match_indices("goto").any(|(goto_index, _)| {
+        let before = lower[..goto_index].chars().next_back();
+        let after_keyword = &lower[goto_index + "goto".len()..];
+        let after = after_keyword.chars().next();
+        if before.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+            || after.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return false;
+        }
+        let target = after_keyword
+            .trim_start()
+            .chars()
+            .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+            .collect::<String>();
+        labels
+            .get(&target)
+            .is_some_and(|target_line| *target_line < source_line)
+            || (!target.is_empty() && lower[..goto_index].contains(&format!("{target}:")))
+    })
+}
+
+fn pseudocode_has_call(source: &str, declaration_like: bool) -> bool {
+    let search = if declaration_like {
+        source
+            .find('{')
+            .map(|brace| &source[brace + 1..])
+            .unwrap_or_default()
+    } else {
+        source
+    };
+    search.match_indices('(').any(|(open, _)| {
+        let prefix = search[..open].trim_end();
+        let name = prefix
+            .chars()
+            .rev()
+            .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
+            .to_ascii_lowercase();
+        !name.is_empty()
+            && !matches!(
+                name.as_str(),
+                "fn" | "if" | "for" | "while" | "switch" | "match" | "sizeof" | "return"
+            )
+    })
+}
+
+fn pseudocode_has_memory_write(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    source.char_indices().any(|(index, character)| {
+        if character != '=' {
+            return false;
+        }
+        let previous = index
+            .checked_sub(1)
+            .and_then(|prior| bytes.get(prior))
+            .copied();
+        let next = bytes.get(index + 1).copied();
+        if matches!(previous, Some(b'=' | b'!' | b'<' | b'>')) || next == Some(b'=') {
+            return false;
+        }
+        let statement_start = source[..index]
+            .rfind([';', '{', '}'])
+            .map_or(0, |delimiter| delimiter + 1);
+        let left = source[statement_start..index].trim();
+        left.starts_with('*')
+            || left.contains("*(")
+            || left.contains('[')
+            || left.contains("->")
+            || left.contains('.')
+    })
 }
 
 /// Produce a deterministic one-function analysis slice. Global read-only data
@@ -4016,6 +4251,8 @@ fn validate_structured_consistency(
                 }
                 if request.task == ModelTask::StructureRecovery {
                     validate_structure_candidate(request, &function)?;
+                } else {
+                    validate_pseudocode_humanization_candidate(request, &function)?;
                 }
             }
         }
@@ -4348,6 +4585,128 @@ fn validate_structure_candidate(
         )));
     }
     Ok(())
+}
+
+fn validate_pseudocode_humanization_candidate(
+    request: &ModelRequest,
+    function: &RecoveredFunction,
+) -> Result<(), AiError> {
+    let obligations = request
+        .evidence_pack
+        .pseudocode_obligations
+        .iter()
+        .map(|obligation| (obligation.id.as_str(), obligation))
+        .collect::<BTreeMap<_, _>>();
+    if function.source_mappings.len() != obligations.len() {
+        return Err(AiError::InvalidResponse(format!(
+            "humanization candidate for {} maps {} source obligations but {} are required",
+            function.function_id,
+            function.source_mappings.len(),
+            obligations.len()
+        )));
+    }
+    let compact_output = compact_signature(&function.pseudocode);
+    let mut covered = BTreeSet::new();
+    let mut fragments = BTreeSet::new();
+    for mapping in &function.source_mappings {
+        let Some(obligation) = obligations.get(mapping.obligation_id.as_str()) else {
+            return Err(AiError::InvalidResponse(format!(
+                "humanization candidate for {} maps unknown source obligation {}",
+                function.function_id, mapping.obligation_id
+            )));
+        };
+        if !covered.insert(mapping.obligation_id.as_str()) {
+            return Err(AiError::InvalidResponse(format!(
+                "humanization candidate for {} maps source obligation {} more than once",
+                function.function_id, mapping.obligation_id
+            )));
+        }
+        let fragment = mapping.output_fragment.trim();
+        let compact_fragment = compact_signature(fragment);
+        if fragment.chars().count() < 2
+            || fragment.chars().count() > 1_024
+            || fragment.starts_with("//")
+            || fragment.starts_with("/*")
+            || compact_fragment.is_empty()
+            || !compact_output.contains(&compact_fragment)
+        {
+            return Err(AiError::InvalidResponse(format!(
+                "humanization mapping {} must name a bounded non-comment code fragment present in the output",
+                mapping.obligation_id
+            )));
+        }
+        if !fragments.insert(compact_fragment.clone()) {
+            return Err(AiError::InvalidResponse(format!(
+                "humanization candidate for {} reuses one output fragment for multiple source obligations",
+                function.function_id
+            )));
+        }
+        if fragments
+            .iter()
+            .filter(|candidate| **candidate != compact_fragment)
+            .any(|candidate| {
+                candidate.contains(&compact_fragment)
+                    || compact_fragment.contains(candidate.as_str())
+            })
+        {
+            return Err(AiError::InvalidResponse(format!(
+                "humanization candidate for {} uses overlapping output fragments for multiple source obligations",
+                function.function_id
+            )));
+        }
+        for construct in &obligation.constructs {
+            if !fragment_realizes_construct(fragment, *construct) {
+                return Err(AiError::InvalidResponse(format!(
+                    "humanization mapping {} does not visibly preserve {:?}",
+                    mapping.obligation_id, construct
+                )));
+            }
+        }
+    }
+    let missing = obligations
+        .keys()
+        .filter(|obligation| !covered.contains(**obligation))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(AiError::InvalidResponse(format!(
+            "humanization candidate for {} omits source obligations: {}",
+            function.function_id,
+            missing.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+fn fragment_realizes_construct(fragment: &str, construct: PseudocodeConstruct) -> bool {
+    let lower = fragment.to_ascii_lowercase();
+    match construct {
+        PseudocodeConstruct::FunctionDeclaration => {
+            contains_pseudocode_keyword(&lower, "fn") && fragment.contains('(')
+        }
+        PseudocodeConstruct::Branch => [
+            "if", "match", "switch", "while", "for", "loop", "break", "continue",
+        ]
+        .iter()
+        .any(|keyword| contains_pseudocode_keyword(&lower, keyword)),
+        PseudocodeConstruct::Loop => ["while", "for", "loop"]
+            .iter()
+            .any(|keyword| contains_pseudocode_keyword(&lower, keyword)),
+        PseudocodeConstruct::Call => {
+            pseudocode_has_call(fragment, lower.trim_start().starts_with("fn "))
+        }
+        PseudocodeConstruct::MemoryWrite => {
+            pseudocode_has_memory_write(fragment)
+                || [".copy", ".fill", ".write", ".insert", ".push", "write_"]
+                    .iter()
+                    .any(|token| lower.contains(token))
+        }
+        PseudocodeConstruct::Return => contains_pseudocode_keyword(&lower, "return"),
+        PseudocodeConstruct::Statement => true,
+        PseudocodeConstruct::Unknown => {
+            lower.contains("unknown_") || lower.contains("untranslated")
+        }
+    }
 }
 
 fn validate_signature_contract(
@@ -4846,6 +5205,86 @@ mod tests {
     use super::*;
     use sos_analysis::{BasicBlockFact, FunctionFact, InstructionFact, StaticAnalysis};
 
+    fn test_humanization_output(
+        pack: &EvidencePack,
+        function_id: &str,
+        evidence: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut fragments = Vec::new();
+        let mut mappings = Vec::new();
+        let mut open_declaration = false;
+        for obligation in &pack.pseudocode_obligations {
+            let suffix = obligation.id.replace('-', "_");
+            let has = |construct| obligation.constructs.contains(&construct);
+            let mut statements = Vec::new();
+            if has(PseudocodeConstruct::Loop) {
+                statements.push(format!(
+                    "while unknown_condition_{suffix}() {{ unknown_loop_{suffix}(); break; }}"
+                ));
+            } else if has(PseudocodeConstruct::Branch) {
+                statements.push(format!(
+                    "if unknown_condition_{suffix}() {{ unknown_branch_{suffix}(); }}"
+                ));
+            }
+            if has(PseudocodeConstruct::Call)
+                && !statements.iter().any(|statement| statement.contains('('))
+            {
+                statements.push(format!("unknown_call_{suffix}();"));
+            }
+            if has(PseudocodeConstruct::MemoryWrite) {
+                statements.push(format!(
+                    "write_unknown_target_{suffix}(unknown_value_{suffix});"
+                ));
+            }
+            if has(PseudocodeConstruct::Return) {
+                statements.push(format!("return unknown_result_{suffix}();"));
+            }
+            if has(PseudocodeConstruct::Unknown) {
+                statements.push(format!("unknown_source_{suffix}();"));
+            }
+            if statements.is_empty() && !has(PseudocodeConstruct::FunctionDeclaration) {
+                statements.push(format!("let recovered_{suffix} = ();"));
+            }
+            let fragment = if has(PseudocodeConstruct::FunctionDeclaration) {
+                if statements.is_empty() {
+                    open_declaration = true;
+                    format!("fn recovered_{function_id}() {{")
+                } else {
+                    format!(
+                        "fn recovered_{function_id}() {{ {} }}",
+                        statements.join(" ")
+                    )
+                }
+            } else {
+                statements.join(" ")
+            };
+            fragments.push(fragment.clone());
+            mappings.push(serde_json::json!({
+                "obligation_id": obligation.id,
+                "output_fragment": fragment,
+            }));
+        }
+        if open_declaration {
+            fragments.push("}".into());
+        }
+        if !pack.pseudocode_obligations.iter().any(|obligation| {
+            obligation
+                .constructs
+                .contains(&PseudocodeConstruct::FunctionDeclaration)
+        }) {
+            fragments.insert(0, format!("fn recovered_{function_id}() {{"));
+            fragments.push("}".into());
+        }
+        serde_json::json!({
+            "functions": [{
+                "function_id": function_id,
+                "pseudocode": fragments.join("\n"),
+                "source_mappings": mappings,
+                "evidence": [evidence]
+            }]
+        })
+    }
+
     struct EchoProvider;
 
     impl ModelProvider for EchoProvider {
@@ -4886,13 +5325,11 @@ mod tests {
                         }]
                     })
                 }
-                ModelTask::PseudocodeHumanization => serde_json::json!({
-                    "functions": [{
-                        "function_id": function_id,
-                        "pseudocode": format!("fn {function_id}() {{ unknown_semantics(); }}"),
-                        "evidence": [function_evidence]
-                    }]
-                }),
+                ModelTask::PseudocodeHumanization => test_humanization_output(
+                    &request.evidence_pack,
+                    &function_id,
+                    function_evidence,
+                ),
                 ModelTask::SignatureRecovery => serde_json::json!({
                     "signatures": [{
                         "function_id": function_id,
@@ -6039,6 +6476,7 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
         let candidate = RecoveredFunction {
             function_id: "fn_0".into(),
             pseudocode: valid_source.into(),
+            source_mappings: Vec::new(),
             effects,
             evidence: vec![sos_types::EvidenceRef {
                 source: "ir".into(),
@@ -6682,6 +7120,13 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
         assert!(pack.ir.operations[1]
             .assembly
             .starts_with("line_0002_part_01:"));
+        assert_eq!(pack.pseudocode_obligations.len(), 3);
+        assert!(pack.pseudocode_obligations[1]
+            .constructs
+            .contains(&PseudocodeConstruct::Branch));
+        assert!(pack.pseudocode_obligations[2]
+            .constructs
+            .contains(&PseudocodeConstruct::Return));
 
         let long_line = "x".repeat(150);
         let segmented = evidence_pack_from_pseudocode(&long_line).unwrap();
@@ -6704,7 +7149,12 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
                     structured_output: serde_json::json!({
                         "functions": [{
                             "function_id": "fn_0",
-                            "pseudocode": "fn read_value(ctx: &Context) -> Result<u64, Error> { /* recovered */ }",
+                            "pseudocode": "fn read_value(ctx: &Context) -> Result<u64, Error> {\nlet tmp = read_u64(ctx, 8);\nif tmp == 0 { return Err(Error::Invalid); }\nreturn Ok(tmp);\n}",
+                            "source_mappings": [
+                                {"obligation_id": "source_line_0001", "output_fragment": "let tmp = read_u64(ctx, 8);"},
+                                {"obligation_id": "source_line_0002", "output_fragment": "if tmp == 0 { return Err(Error::Invalid); }"},
+                                {"obligation_id": "source_line_0003", "output_fragment": "return Ok(tmp);"}
+                            ],
                             "evidence": [{
                                 "source": "ir",
                                 "location": "operation:op_100",
@@ -6732,6 +7182,98 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
     }
 
     #[test]
+    fn one_line_decompiler_input_recovers_loop_write_and_control_obligations() {
+        let pack = evidence_pack_from_pseudocode(
+            "void clear(u8 *dst) { LAB_1: if (i >= n) goto LAB_2; dst[i] = 0; i = i + 1; goto LAB_1; LAB_2: return; }",
+        )
+        .unwrap();
+        assert_eq!(pack.pseudocode_obligations.len(), 1);
+        let constructs = &pack.pseudocode_obligations[0].constructs;
+        for expected in [
+            PseudocodeConstruct::FunctionDeclaration,
+            PseudocodeConstruct::Branch,
+            PseudocodeConstruct::Loop,
+            PseudocodeConstruct::MemoryWrite,
+            PseudocodeConstruct::Return,
+        ] {
+            assert!(constructs.contains(&expected), "missing {expected:?}");
+        }
+    }
+
+    #[test]
+    fn humanization_rejects_omitted_reused_and_semantically_wrong_source_mappings() {
+        let pack =
+            evidence_pack_from_pseudocode("if (flag) return 1;\nstate.value = 2;\nreturn 0;")
+                .unwrap();
+        let request = ModelRequest {
+            task: ModelTask::PseudocodeHumanization,
+            prompt_version: "sos-v2".into(),
+            model: "test".into(),
+            evidence_pack: pack,
+            max_output_bytes: 10_000,
+            max_output_tokens: default_stage_output_tokens(ModelTask::PseudocodeHumanization),
+        };
+        let valid = test_humanization_output(
+            &request.evidence_pack,
+            "fn_0",
+            serde_json::json!({
+                "source": "ir",
+                "location": "function:fn_0",
+                "detail": null
+            }),
+        );
+        assert!(validate_structured_consistency(&request, &valid).is_ok());
+
+        let mut omitted = valid.clone();
+        omitted["functions"][0]["source_mappings"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(validate_structured_consistency(&request, &omitted)
+            .unwrap_err()
+            .to_string()
+            .contains("source obligations"));
+
+        let statement_pack = evidence_pack_from_pseudocode("x = 1;\ny = 2;").unwrap();
+        let statement_request = ModelRequest {
+            evidence_pack: statement_pack,
+            ..request.clone()
+        };
+        let reused = serde_json::json!({
+            "functions": [{
+                "function_id": "fn_0",
+                "pseudocode": "fn recovered() { let same = (); }",
+                "source_mappings": [
+                    {"obligation_id": "source_line_0001", "output_fragment": "let same = ();"},
+                    {"obligation_id": "source_line_0002", "output_fragment": "let same = ();"}
+                ],
+                "evidence": []
+            }]
+        });
+        assert!(validate_structured_consistency(&statement_request, &reused)
+            .unwrap_err()
+            .to_string()
+            .contains("reuses one output fragment"));
+
+        let wrong_construct = serde_json::json!({
+            "functions": [{
+                "function_id": "fn_0",
+                "pseudocode": "fn recovered() { let branch_missing = (); state.value = 2; return 0; }",
+                "source_mappings": [
+                    {"obligation_id": "source_line_0001", "output_fragment": "let branch_missing = ();"},
+                    {"obligation_id": "source_line_0002", "output_fragment": "state.value = 2;"},
+                    {"obligation_id": "source_line_0003", "output_fragment": "return 0;"}
+                ],
+                "evidence": []
+            }]
+        });
+        assert!(validate_structured_consistency(&request, &wrong_construct)
+            .unwrap_err()
+            .to_string()
+            .contains("does not visibly preserve Branch"));
+    }
+
+    #[test]
     fn persisted_humanization_response_is_revalidated_against_fresh_evidence() {
         let pack = evidence_pack_from_pseudocode("let value = 7\nreturn value").unwrap();
         let response = ModelResponse {
@@ -6741,7 +7283,11 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
             structured_output: serde_json::json!({
                 "functions": [{
                     "function_id": "fn_0",
-                    "pseudocode": "fn recovered() -> u64 { 7 }",
+                    "pseudocode": "fn recovered() -> u64 { let value = 7; return value; }",
+                    "source_mappings": [
+                        {"obligation_id": "source_line_0001", "output_fragment": "let value = 7;"},
+                        {"obligation_id": "source_line_0002", "output_fragment": "return value;"}
+                    ],
                     "evidence": [{
                         "source": "ir",
                         "location": "operation:op_100",
@@ -6903,24 +7449,27 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
     impl ModelProvider for QualificationProvider {
         fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
             let function_id = request.evidence_pack.ir.functions[0].id.clone();
+            let mut structured_output = test_humanization_output(
+                &request.evidence_pack,
+                &function_id,
+                serde_json::json!({
+                    "source": "ir",
+                    "location": format!("function:{function_id}"),
+                    "detail": null
+                }),
+            );
+            let function = structured_output["functions"][0]["pseudocode"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            structured_output["functions"][0]["pseudocode"] = serde_json::json!(format!(
+                "{function}\n// require signer; verify owner; reject invalid instruction tag; match instruction; invoke token program CPI; checked arithmetic;"
+            ));
             Ok(ModelResponse {
                 task: request.task,
                 model: request.model,
                 prompt_version: request.prompt_version,
-                structured_output: serde_json::json!({
-                    "functions": [{
-                        "function_id": function_id,
-                        "pseudocode": format!(
-                            "fn {}() {{ require signer; verify owner; reject invalid instruction tag; match instruction; invoke token program; checked arithmetic; }}",
-                            request.evidence_pack.ir.functions[0].id
-                        ),
-                        "evidence": [{
-                            "source": "ir",
-                            "location": format!("function:{}", request.evidence_pack.ir.functions[0].id),
-                            "detail": null
-                        }]
-                    }]
-                }),
+                structured_output,
                 evidence: Vec::new(),
             })
         }

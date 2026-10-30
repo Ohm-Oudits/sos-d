@@ -95,6 +95,44 @@
         }
       }
     },
+    "pseudocode_obligations": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "source_line", "source_sha256", "operation_ids", "constructs"],
+        "properties": {
+          "id": { "type": "string" },
+          "source_line": { "type": "integer", "minimum": 1 },
+          "source_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "operation_ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 128,
+            "uniqueItems": true,
+            "items": { "type": "string" }
+          },
+          "constructs": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "enum": [
+                "function_declaration",
+                "branch",
+                "loop",
+                "call",
+                "memory_write",
+                "return",
+                "statement",
+                "unknown"
+              ]
+            }
+          }
+        }
+      }
+    },
     "untrusted_evidence": {
       "type": "array",
       "items": {

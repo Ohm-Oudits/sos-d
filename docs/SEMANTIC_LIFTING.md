@@ -239,8 +239,15 @@ Face checkpoints cannot be confused or silently reused across providers.
 
 The adapter creates one synthetic `fn_0` and one or more
 `op_<hex-operation-index>` records per source line. Original line and segment
-numbers are embedded in each operation. The model
-must cite valid operation, block, or function IDs, and SOS rejects unknown
+numbers are embedded in each operation. It also derives a source obligation for
+every non-trivial line, classifying function declarations, branches, backward
+`goto` loops, calls, memory writes, returns, and ordinary statements. The model
+must return exactly one unique, non-comment output fragment for every obligation;
+SOS verifies that the fragment occurs in the returned pseudocode and visibly
+realizes every classified construct. A citation alone cannot satisfy this gate,
+and omitted or reused behavior causes the entire unit to fall back to the
+deterministic humanizer. The model must also cite valid operation, block, or
+function IDs, and SOS rejects unknown
 references, inline assembly, raw byte arrays, include directives, unsafe code,
 and raw-operation passthroughs. The output is a reconstruction hypothesis—not
 original source or proof of equivalence.
@@ -266,7 +273,9 @@ For interruption-safe hosted runs, `--resume` checkpoints a unit only after the
 gateway accepts its schema and evidence references. Before reuse, SOS rebuilds
 the current evidence pack and verifies the source, provider, model, prompt,
 unit hash, full staged request hash, anti-cheese constraints, and evidence
-references. Invalid or stale records are warned about and recomputed rather
+references, including every source-obligation mapping. Humanization prompt and
+cache schema v2 invalidate checkpoints produced before this coverage contract.
+Invalid or stale records are warned about and recomputed rather
 than trusted. The default directory is derived from `--audit-out`; specify
 `--cache-dir DIR` for a stable path. Checkpoints contain no API credentials.
 If every unit is cached, SOS can validate and reconstruct the accepted model

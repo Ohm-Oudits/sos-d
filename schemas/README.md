@@ -8,8 +8,11 @@ the original trace contract. The AI pipeline bundle is v3 because an
 evidence-constrained signature-recovery stage now sits between structure
 recovery and semantic labeling. Version 2 added each stage's enforced
 output-token budget in addition to model identity.
-The evidence pack is v2 because gateway-accepted signature hypotheses are now
+The evidence pack is v2 because gateway-accepted signature hypotheses are
 carried as response-hash-bound contracts that later source stages must preserve.
+For textual pseudocode, it also carries deterministic source-line obligations
+for declarations, branches, loops, calls, writes, returns, and statements so a
+humanization response can prove coverage with unique concrete output fragments.
 
 Compatibility rules:
 

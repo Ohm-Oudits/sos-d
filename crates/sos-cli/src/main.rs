@@ -46,9 +46,9 @@ use sos_types::{ArtifactManifest, ProgramArtifact};
 mod qualification;
 mod rebuild;
 
-const HUMANIZATION_PROMPT_VERSION: &str = "sos-v1";
+const HUMANIZATION_PROMPT_VERSION: &str = "sos-v2";
 const DETERMINISTIC_HUMANIZER_ID: &str = "sos-deterministic-syntax-v1";
-const HUMANIZATION_CACHE_SCHEMA_VERSION: u32 = 1;
+const HUMANIZATION_CACHE_SCHEMA_VERSION: u32 = 2;
 const HUMANIZATION_CACHE_RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v8";
 const LIFT_CACHE_SCHEMA_VERSION: u32 = 9;
@@ -4727,8 +4727,95 @@ mod tests {
     };
     use sos_ai::{
         AiError, AiStageModels, AiStageTokenBudgets, ModelProvider, ModelRequest, ModelResponse,
-        ModelTask,
+        ModelTask, PseudocodeConstruct,
     };
+
+    fn test_humanization_output(request: &ModelRequest) -> serde_json::Value {
+        let function = &request.evidence_pack.ir.functions[0];
+        let mut fragments = Vec::new();
+        let mut mappings = Vec::new();
+        let mut open_declaration = false;
+        for obligation in &request.evidence_pack.pseudocode_obligations {
+            let suffix = obligation.id.replace('-', "_");
+            let has = |construct| obligation.constructs.contains(&construct);
+            let mut statements = Vec::new();
+            if has(PseudocodeConstruct::Loop) {
+                statements.push(format!(
+                    "while unknown_condition_{suffix}() {{ unknown_loop_{suffix}(); break; }}"
+                ));
+            } else if has(PseudocodeConstruct::Branch) {
+                statements.push(format!(
+                    "if unknown_condition_{suffix}() {{ unknown_branch_{suffix}(); }}"
+                ));
+            }
+            if has(PseudocodeConstruct::Call)
+                && !statements.iter().any(|statement| statement.contains('('))
+            {
+                statements.push(format!("unknown_call_{suffix}();"));
+            }
+            if has(PseudocodeConstruct::MemoryWrite) {
+                statements.push(format!(
+                    "write_unknown_target_{suffix}(unknown_value_{suffix});"
+                ));
+            }
+            if has(PseudocodeConstruct::Return) {
+                statements.push(format!("return unknown_result_{suffix}();"));
+            }
+            if has(PseudocodeConstruct::Unknown) {
+                statements.push(format!("unknown_source_{suffix}();"));
+            }
+            if statements.is_empty() && !has(PseudocodeConstruct::FunctionDeclaration) {
+                statements.push(format!("let recovered_{suffix} = ();"));
+            }
+            let fragment = if has(PseudocodeConstruct::FunctionDeclaration) {
+                if statements.is_empty() {
+                    open_declaration = true;
+                    format!("fn recovered_{}() {{", function.name)
+                } else {
+                    format!(
+                        "fn recovered_{}() {{ {} }}",
+                        function.name,
+                        statements.join(" ")
+                    )
+                }
+            } else {
+                statements.join(" ")
+            };
+            fragments.push(fragment.clone());
+            mappings.push(serde_json::json!({
+                "obligation_id": obligation.id,
+                "output_fragment": fragment,
+            }));
+        }
+        if open_declaration {
+            fragments.push("}".into());
+        }
+        if !request
+            .evidence_pack
+            .pseudocode_obligations
+            .iter()
+            .any(|obligation| {
+                obligation
+                    .constructs
+                    .contains(&PseudocodeConstruct::FunctionDeclaration)
+            })
+        {
+            fragments.insert(0, format!("fn recovered_{}() {{", function.name));
+            fragments.push("}".into());
+        }
+        serde_json::json!({
+            "functions": [{
+                "function_id": function.id,
+                "pseudocode": fragments.join("\n"),
+                "source_mappings": mappings,
+                "evidence": [{
+                    "source": "ir",
+                    "location": format!("function:{}", function.id),
+                    "detail": null
+                }]
+            }]
+        })
+    }
 
     #[test]
     fn transaction_accounts_include_static_and_loaded_keys_without_duplicates() {
@@ -5228,23 +5315,12 @@ mod tests {
                         .map(|item| item.source.clone())
                         .collect(),
                 );
-                let function_id = request.evidence_pack.ir.functions[0].id.clone();
-                let operation_id = request.evidence_pack.ir.operations[0].id.clone();
+                let structured_output = test_humanization_output(&request);
                 Ok(ModelResponse {
                     task: request.task,
                     model: request.model,
                     prompt_version: request.prompt_version,
-                    structured_output: serde_json::json!({
-                        "functions": [{
-                            "function_id": function_id,
-                            "pseudocode": format!("fn recovered_{operation_id}() {{}}"),
-                            "evidence": [{
-                                "source": "ir",
-                                "location": format!("operation:{operation_id}"),
-                                "detail": null
-                            }]
-                        }]
-                    }),
+                    structured_output,
                     evidence: Vec::new(),
                 })
             }
@@ -5314,7 +5390,6 @@ mod tests {
         impl ModelProvider for RecordingHumanizer {
             fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
                 let function = request.evidence_pack.ir.functions[0].clone();
-                let operation_id = request.evidence_pack.ir.operations[0].id.clone();
                 self.requests.lock().unwrap().push((
                     function.name.clone(),
                     request
@@ -5324,21 +5399,12 @@ mod tests {
                         .map(|item| item.source.clone())
                         .collect(),
                 ));
+                let structured_output = test_humanization_output(&request);
                 Ok(ModelResponse {
                     task: request.task,
                     model: request.model,
                     prompt_version: request.prompt_version,
-                    structured_output: serde_json::json!({
-                        "functions": [{
-                            "function_id": function.id,
-                            "pseudocode": format!("fn {}() {{}}", function.name),
-                            "evidence": [{
-                                "source": "ir",
-                                "location": format!("operation:{operation_id}"),
-                                "detail": null
-                            }]
-                        }]
-                    }),
+                    structured_output,
                     evidence: Vec::new(),
                 })
             }
@@ -5655,23 +5721,12 @@ mod tests {
         impl ModelProvider for CountingHumanizer {
             fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
                 *self.calls.lock().unwrap() += 1;
-                let function = request.evidence_pack.ir.functions[0].clone();
-                let operation_id = request.evidence_pack.ir.operations[0].id.clone();
+                let structured_output = test_humanization_output(&request);
                 Ok(ModelResponse {
                     task: request.task,
                     model: request.model,
                     prompt_version: request.prompt_version,
-                    structured_output: serde_json::json!({
-                        "functions": [{
-                            "function_id": function.id,
-                            "pseudocode": format!("fn {}() {{}}", function.name),
-                            "evidence": [{
-                                "source": "ir",
-                                "location": format!("operation:{operation_id}"),
-                                "detail": null
-                            }]
-                        }]
-                    }),
+                    structured_output,
                     evidence: Vec::new(),
                 })
             }

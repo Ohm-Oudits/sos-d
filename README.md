@@ -421,10 +421,16 @@ sos humanize ./decompiler-output.txt \
   --audit-out ./humanize.json
 ```
 
-Every source line receives one or more deterministic IR operation IDs. Model output must
-cite those IDs, passes the same anti-cheese checks as binary lifting, and is
-marked unverified. `humanize.json` stores the input hash, evidence pack, model
-identity, and response without storing the API key. SOS automatically detects
+Every behavioral source line receives one or more deterministic IR operation
+IDs plus a source obligation for its declarations, branches, backward loops,
+calls, memory writes, returns, and statements. Model output must cite valid IDs
+and map every obligation to one unique concrete code fragment retained in the
+returned pseudocode. SOS rejects omitted behavior, comment-only mappings,
+reused fragments, or fragments that do not visibly realize the required
+construct. Accepted output still passes the same anti-cheese checks as binary
+lifting and is marked unverified. `humanize.json` stores the input hash,
+evidence pack, model identity, and response without storing the API key. SOS
+automatically detects
 function boundaries and partitions larger input into free-tier-sized units of
 at most 128 evidence operations, following the GoonFi/Patina workflow. Hosted
 rate-limit pacing applies between units. A run defaults to at most 16 units;
@@ -447,7 +453,9 @@ audit. A checked example is
 `--resume` writes each accepted unit to a checkpoint directory (by default,
 next to the audit output). On restart, SOS verifies the source, provider, model,
 prompt, unit hash, complete staged evidence-pack hash, output schema,
-anti-cheese rules, and every evidence reference before reuse. Stale or edited
+anti-cheese rules, every source-obligation mapping, and every evidence reference
+before reuse. Humanization prompt/cache v2 prevents older citation-only
+checkpoints from being reused. Stale or edited
 checkpoints are ignored and recomputed. Use `--cache-dir DIR` with `--resume`
 to choose a stable location. A fully cached hosted run can be reconstructed
 without the selected provider credential; any cache miss

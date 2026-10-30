@@ -7,6 +7,17 @@ import sys
 
 request = json.load(sys.stdin)
 function_id = request["evidence_pack"]["ir"]["functions"][0]["id"]
+pseudocode = (
+    f"fn {function_id}() {{ let instruction_tag = data[0]; "
+    "require_signer(); verify_owner(); "
+    "if invalid_input { return error; } "
+    "match instruction_tag { transfer => token_program_cpi(), close => close_account_cpi() }; "
+    "let updated_balance = checked_arithmetic(); state.balance = updated_balance; "
+    "for destination in buffer { destination.clear(); } return 0; } "
+    "// instruction length, discriminator, reject invalid input, bounds check on index, "
+    "checked overflow arithmetic, transfer or close account, clear destination buffer"
+)
+obligations = request["evidence_pack"].get("pseudocode_obligations", [])
 response = {
     "task": request["task"],
     "model": request["model"],
@@ -15,13 +26,14 @@ response = {
         "functions": [
             {
                 "function_id": function_id,
-                "pseudocode": (
-                    f"fn {function_id}() {{ /* instruction tag and length */ "
-                    "require signer; verify owner; reject invalid input; return 0; "
-                    "match opcode; invoke token program CPI for transfer or close account; "
-                    "perform bounds check on index and checked overflow arithmetic; "
-                    "update balance; loop over destination buffer and clear to zero; }"
-                ),
+                "pseudocode": pseudocode,
+                "source_mappings": [
+                    {
+                        "obligation_id": obligation["id"],
+                        "output_fragment": pseudocode,
+                    }
+                    for obligation in obligations
+                ],
                 "evidence": [
                     {
                         "source": "ir",

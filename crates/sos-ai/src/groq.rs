@@ -250,6 +250,17 @@ pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::V
         })
         .collect::<Vec<_>>();
     if pack.task == ModelTask::PseudocodeHumanization {
+        let source_obligations = pack
+            .pseudocode_obligations
+            .iter()
+            .map(|obligation| {
+                serde_json::json!({
+                    "id": obligation.id,
+                    "source_line": obligation.source_line,
+                    "constructs": obligation.constructs,
+                })
+            })
+            .collect::<Vec<_>>();
         let context = pack
             .untrusted_evidence
             .iter()
@@ -281,6 +292,7 @@ pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::V
                 "functions": pack.ir.functions.iter().take(1).collect::<Vec<_>>(),
                 "blocks": blocks,
                 "operations": operations,
+                "source_obligations": source_obligations,
                 "operations_total": pack.ir.operations.len(),
                 "truncated": pack.ir.operations.len() > operation_limit,
             },
