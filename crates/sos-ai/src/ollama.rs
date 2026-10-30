@@ -241,7 +241,7 @@ pub(crate) fn output_schema(task: ModelTask) -> serde_json::Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["function_id", "pseudocode", "control_flow_mappings", "memory_field_mappings", "effects", "evidence"],
+                    "required": ["function_id", "pseudocode", "control_flow_mappings", "memory_field_mappings", "direct_call_mappings", "effects", "evidence"],
                     "properties": {
                         "function_id": {"type": "string"},
                         "pseudocode": {"type": "string"},
@@ -266,6 +266,17 @@ pub(crate) fn output_schema(task: ModelTask) -> serde_json::Value {
                                 "offset": {"type": "integer"},
                                 "layout_type": {"type": "string", "minLength": 1, "maxLength": 128},
                                 "layout_field": {"type": "string", "minLength": 1, "maxLength": 128},
+                                "output_fragment": {"type": "string", "minLength": 2, "maxLength": 512},
+                                "evidence": {"type": "array", "minItems": 1, "maxItems": 1, "items": evidence}
+                            }
+                        }},
+                        "direct_call_mappings": {"type": "array", "maxItems": 1024, "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["contract_id", "target_function_id", "output_fragment", "evidence"],
+                            "properties": {
+                                "contract_id": {"type": "string"},
+                                "target_function_id": {"type": "string", "minLength": 1, "maxLength": 128},
                                 "output_fragment": {"type": "string", "minLength": 2, "maxLength": 512},
                                 "evidence": {"type": "array", "minItems": 1, "maxItems": 1, "items": evidence}
                             }
@@ -379,11 +390,11 @@ pub(crate) fn output_schema(task: ModelTask) -> serde_json::Value {
             "additionalProperties": false,
             "required": ["schema_version", "patches", "observations", "validation"],
             "properties": {
-                "schema_version": {"type": "integer", "const": 2},
+                "schema_version": {"type": "integer", "const": 3},
                 "patches": {"type": "array", "maxItems": 1, "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["function_id", "replacement", "memory_field_mappings", "evidence"],
+                    "required": ["function_id", "replacement", "memory_field_mappings", "direct_call_mappings", "evidence"],
                     "properties": {
                         "function_id": {"type": "string"},
                         "replacement": {"type": "string"},
@@ -398,6 +409,17 @@ pub(crate) fn output_schema(task: ModelTask) -> serde_json::Value {
                                 "offset": {"type": "integer"},
                                 "layout_type": {"type": "string", "minLength": 1, "maxLength": 128},
                                 "layout_field": {"type": "string", "minLength": 1, "maxLength": 128},
+                                "output_fragment": {"type": "string", "minLength": 2, "maxLength": 512},
+                                "evidence": {"type": "array", "minItems": 1, "maxItems": 1, "items": evidence}
+                            }
+                        }},
+                        "direct_call_mappings": {"type": "array", "maxItems": 1024, "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["contract_id", "target_function_id", "output_fragment", "evidence"],
+                            "properties": {
+                                "contract_id": {"type": "string"},
+                                "target_function_id": {"type": "string", "minLength": 1, "maxLength": 128},
                                 "output_fragment": {"type": "string", "minLength": 2, "maxLength": 512},
                                 "evidence": {"type": "array", "minItems": 1, "maxItems": 1, "items": evidence}
                             }
@@ -435,6 +457,7 @@ pub(crate) fn system_prompt(task: ModelTask) -> &'static str {
             "The evidence pack contains required_effects. Return an effects coverage ledger with the same kind, exact IR location, exact input_registers, exact target_input_registers, and exact value_input_registers for every required effect. These arrays are deterministic incoming SBPF ABI dependencies, not names or type guesses. For memory writes, target_input_registers identify inputs influencing the destination address and value_input_registers identify inputs influencing the stored value; both role arrays must be empty for other effect kinds. The ledger is not a substitute for code: the pseudocode must visibly realize each listed effect and preserve those data dependencies and roles.\n",
             "The evidence pack also contains control_flow_regions derived from dominators, postdominators, backedges, and recursive SCCs. Preserve every region independently. Return exactly one control_flow_mappings entry per region, copy its exact region_id, cite only its header as block:<header_block_id>, and set output_fragment to one unique one-line `if`/`match` or `while`/`for`/`loop` header copied exactly from the pseudocode. Use arms, member_blocks, join_block_id, exit_blocks, and cycle_edges to nest the body correctly; never merge several deterministic regions into one generic construct.\n",
             "The evidence pack also contains memory_field_contracts derived from fixed-width machine accesses. Return exactly one memory_field_mappings entry per contract. Copy contract_id, field_path, type_name, offset, layout_type, and layout_field exactly; cite one listed instruction; and provide one unique non-comment source expression copied exactly from the pseudocode that contains the field_path. A semantic_name_recovered=true SolAccountInfo path is deterministic. Every other unknown_memory_* path is deliberately unresolved: preserve that exact neutral name instead of guessing an account field.\n",
+            "The evidence pack also contains direct_call_contracts for resolved internal SBPF call edges. Return exactly one direct_call_mappings entry per contract, copy contract_id and target_function_id exactly, cite the listed IR operation, and copy one unique one-line source call to that exact function ID. A generic helper or a different callee cannot satisfy the contract.\n",
             "Treat recovered deserialization_candidates, instruction_data_guard_candidates, resolved_log_calls, stack_account_field_candidates, runtime_error_candidates, and validation_checks as high-value semantic anchors. Render those anchors explicitly when present and keep their exact values and failure paths.\n",
             "Never invent Anchor/Rust SDK types, instruction tags, errors, account roles, or entrypoint signatures. Use unknown_* names where evidence is insufficient. Never emit inline assembly, raw byte arrays, include directives, unsafe code, or sos_raw_op calls. Never claim the output is original source. Cite exact existing evidence identifiers and prefer operation:op_* references for concrete behavior; set every evidence detail field to null because SOS resolves details itself. Return only schema-valid JSON."
         ),
@@ -461,6 +484,7 @@ pub(crate) fn system_prompt(task: ModelTask) -> &'static str {
             "Produce readable, idiomatic Rust-like replacements for recovered IR functions. Reconcile earlier structure and semantic labels with the raw IR. The evidence pack's signature_contracts are immutable: every replacement must copy its matching parameter names, types, order, and return type exactly while retaining the IR function_id as the declaration name. Preserve every meaningful branch, validation, memory effect, CPI, PDA derivation, log, and error path. Prefer explicit unknown_* helpers over invented behavior.\n",
             "When deterministic semantic facts recover the Solana C SDK deserializer, instruction-data length/tag guards, exact log strings, SolAccountInfo fields, or built-in errors, express them directly in the replacement and do not degrade them back to register-level operations.\n",
             "Preserve every deterministic memory_field_contract in the final replacement. Return one memory_field_mappings entry per contract, copying contract_id, field_path, type_name, offset, layout_type, and layout_field exactly, citing one listed instruction, and copying a unique source expression containing that field_path from the replacement. For every nonnegative offset, declare the exact layout_type as an immediately attributed #[repr(C)] struct containing the exact layout_field with the recovered primitive type and sufficient explicit padding. The external compiler injects offset_of! and field-type assertions, so a cosmetic mapping or incorrect declaration will fail. Do not rename unknown_memory_* fields from semantic-stage guesses.\n",
+            "Preserve every deterministic direct_call_contract in the final replacement. Return one direct_call_mappings entry per contract with the exact contract_id and target_function_id, cite the listed IR operation, and copy a unique one-line call to that exact function ID. The external MIR gate checks the compiled call target, so comments, wrappers that call another helper, and generic placeholder calls do not satisfy it. Include minimal safe declarations for referenced recovered callees when needed for standalone compilation.\n",
             "Produce standalone safe Rust using only the standard library. Include minimal type or helper declarations when the function needs them, and use compiler diagnostics from external_validation to repair syntax and type errors without deleting behavior.\n",
             "External validation may report candidate MIR effect mismatches. Repair the named function so its compiled MIR actually contains every required write, branch, loop, call, or return; do not merely add comments or claim coverage in prose.\n",
             "Never emit inline assembly, raw byte arrays, include directives, unsafe code, or sos_raw_op calls. Never claim original source or validation. Set validation.status to unverified. Every patch must cite existing evidence identifiers exactly. Return only schema-valid JSON."
@@ -524,6 +548,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(required.contains(&"control_flow_mappings"));
         assert!(required.contains(&"memory_field_mappings"));
+        assert!(required.contains(&"direct_call_mappings"));
     }
 
     #[test]

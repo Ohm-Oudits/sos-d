@@ -147,7 +147,7 @@ The default `--model` can be overridden independently with
 validation rejects any bundle created with a different stage assignment.
 The parallel `--structure-tokens`, `--signature-tokens`, `--semantic-tokens`,
 `--explanation-tokens`, and `--refinement-tokens` flags bound generated output;
-the selected budget is sent to the provider, recorded in AI bundle schema v7,
+the selected budget is sent to the provider, recorded in AI bundle schema v8,
 and included in checkpoint validation.
 The local GPT-OSS adapter selects Ollama's `low` reasoning mode so reasoning
 tokens leave room for final schema-constrained JSON. Structure and signature
@@ -460,5 +460,8 @@ branch arity, joins/exits, and nesting. Deterministic memory-field contracts now
 preserve fixed widths and byte offsets through both source-producing stages, and
 rustc now verifies nonnegative `#[repr(C)]` offsets and primitive field types.
 Negative frame-relative offsets remain explicit evidence rather than record
-layout assertions. The remaining judge work is stronger call-graph
-non-regression constraints and multi-transaction path coverage.
+layout assertions. Resolved internal SBPF calls now retain exact caller, call
+site, and callee contracts through both source stages; rustc MIR verifies target
+identity and repeated-call multiplicity. Indirect and hash-ambiguous calls remain
+unresolved. The remaining judge work is indirect-call recovery and
+multi-transaction path coverage.

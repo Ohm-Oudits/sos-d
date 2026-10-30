@@ -36,8 +36,8 @@ pub use huggingface::{HuggingFaceModelProvider, HUGGING_FACE_GPT_OSS_120B};
 pub use ollama::{trusted_open_model, OllamaModelProvider, OpenModelProfile, TRUSTED_OPEN_MODELS};
 pub use openai::OpenAiModelProvider;
 
-pub const AI_SCHEMA_VERSION: u32 = 4;
-pub const AI_BUNDLE_SCHEMA_VERSION: u32 = 7;
+pub const AI_SCHEMA_VERSION: u32 = 5;
+pub const AI_BUNDLE_SCHEMA_VERSION: u32 = 8;
 pub const MIN_STAGE_OUTPUT_TOKENS: usize = 128;
 pub const MAX_STAGE_OUTPUT_TOKENS: usize = 32_768;
 
@@ -231,6 +231,10 @@ pub struct RecoveredFunction {
     /// their recovered names; unresolved offsets use stable unknown names.
     #[serde(default)]
     pub memory_field_mappings: Vec<RecoveredMemoryFieldMapping>,
+    /// One exact source call for every deterministically resolved internal
+    /// SBPF call edge made by this function.
+    #[serde(default)]
+    pub direct_call_mappings: Vec<RecoveredDirectCallMapping>,
     #[serde(default)]
     pub effects: Vec<RecoveredEffect>,
     #[serde(default)]
@@ -259,6 +263,15 @@ pub struct RecoveredMemoryFieldMapping {
     pub offset: i32,
     pub layout_type: String,
     pub layout_field: String,
+    pub output_fragment: String,
+    #[serde(default)]
+    pub evidence: Vec<sos_types::EvidenceRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveredDirectCallMapping {
+    pub contract_id: String,
+    pub target_function_id: String,
     pub output_fragment: String,
     #[serde(default)]
     pub evidence: Vec<sos_types::EvidenceRef>,
@@ -332,6 +345,18 @@ pub struct MemoryFieldContract {
     pub evidence: Vec<sos_types::EvidenceRef>,
 }
 
+/// A resolved internal SBPF call edge. Unlike a generic call effect, this
+/// contract preserves the exact caller, call site, and callee identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectCallContract {
+    pub id: String,
+    pub caller_function_id: String,
+    pub target_function_id: String,
+    pub call_pc: usize,
+    pub operation_id: String,
+    pub evidence: Vec<sos_types::EvidenceRef>,
+}
+
 pub fn required_control_flow_regions(
     pack: &EvidencePack,
     function_id: &str,
@@ -350,6 +375,17 @@ pub fn required_memory_field_contracts(
     pack.memory_field_contracts
         .iter()
         .filter(|contract| contract.function_id == function_id)
+        .cloned()
+        .collect()
+}
+
+pub fn required_direct_call_contracts(
+    pack: &EvidencePack,
+    function_id: &str,
+) -> Vec<DirectCallContract> {
+    pack.direct_call_contracts
+        .iter()
+        .filter(|contract| contract.caller_function_id == function_id)
         .cloned()
         .collect()
 }
@@ -959,6 +995,57 @@ fn derive_memory_field_contracts(
     contracts
 }
 
+fn derive_direct_call_contracts(
+    analysis: &StaticAnalysis,
+    ir: &CanonicalIr,
+) -> Vec<DirectCallContract> {
+    let function_for_block = ir
+        .blocks
+        .iter()
+        .map(|block| (block.id.as_str(), block.function_id.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let resolved_calls = analysis
+        .calls
+        .iter()
+        .filter(|call| call.kind == "direct_internal_call" && call.status == "resolved")
+        .filter_map(|call| call.target_pc.map(|target| ((call.call_pc, target), call)))
+        .collect::<BTreeMap<_, _>>();
+    let mut contracts = BTreeMap::new();
+    for operation in &ir.operations {
+        let Some(target_pc) = operation.call_target_pc else {
+            continue;
+        };
+        if !resolved_calls.contains_key(&(operation.pc, target_pc)) {
+            continue;
+        }
+        let Some(caller_function_id) = function_for_block.get(operation.block_id.as_str()) else {
+            continue;
+        };
+        let target_function_id = format!("fn_{target_pc:x}");
+        let id = format!(
+            "direct_call_{}_0x{:x}_{}",
+            sanitize_contract_component(caller_function_id),
+            operation.pc,
+            sanitize_contract_component(&target_function_id)
+        );
+        contracts
+            .entry(id.clone())
+            .or_insert_with(|| DirectCallContract {
+                id,
+                caller_function_id: (*caller_function_id).to_owned(),
+                target_function_id,
+                call_pc: operation.pc,
+                operation_id: operation.id.clone(),
+                evidence: vec![sos_types::EvidenceRef {
+                    source: "ir".into(),
+                    location: format!("operation:{}", operation.id),
+                    detail: None,
+                }],
+            });
+    }
+    contracts.into_values().collect()
+}
+
 fn fixed_width_type(widths: &[u8]) -> String {
     match widths {
         [1] => "u8".into(),
@@ -1249,7 +1336,7 @@ pub struct RefinementOutput {
     pub validation: RefinementValidation,
 }
 
-pub const REFINEMENT_SCHEMA_VERSION: u32 = 2;
+pub const REFINEMENT_SCHEMA_VERSION: u32 = 3;
 
 fn default_refinement_schema_version() -> u32 {
     REFINEMENT_SCHEMA_VERSION
@@ -1262,6 +1349,8 @@ pub struct RefinementPatch {
     #[serde(default)]
     pub memory_field_mappings: Vec<RecoveredMemoryFieldMapping>,
     #[serde(default)]
+    pub direct_call_mappings: Vec<RecoveredDirectCallMapping>,
+    #[serde(default)]
     pub evidence: Vec<sos_types::EvidenceRef>,
 }
 
@@ -1271,8 +1360,8 @@ pub struct RefinementValidation {
     pub notes: Vec<String>,
 }
 
-pub const VALIDATION_SCHEMA_VERSION: u32 = 1;
-pub const VALIDATION_BUNDLE_SCHEMA_VERSION: u32 = 1;
+pub const VALIDATION_SCHEMA_VERSION: u32 = 2;
+pub const VALIDATION_BUNDLE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1295,8 +1384,8 @@ pub struct CompilationResult {
     pub limitations: Vec<String>,
 }
 
-pub const MIR_SUMMARY_SCHEMA_VERSION: u32 = 2;
-pub const MIR_EFFECT_COMPARISON_SCHEMA_VERSION: u32 = 2;
+pub const MIR_SUMMARY_SCHEMA_VERSION: u32 = 3;
+pub const MIR_EFFECT_COMPARISON_SCHEMA_VERSION: u32 = 3;
 
 /// Bounded, compiler-produced control/effect summary of a reconstructed Rust
 /// candidate. The raw textual MIR is intentionally not persisted: rustc marks
@@ -1321,6 +1410,10 @@ pub struct MirFunctionSummary {
     pub effect_dependencies: Vec<MirEffectDependency>,
     #[serde(default)]
     pub memory_write_dependencies: Vec<MirMemoryWriteDependency>,
+    /// Direct call operands recovered from rustc MIR. Local-number operands
+    /// remain unresolved; named recovered functions retain their exact ID.
+    #[serde(default)]
+    pub direct_calls: Vec<MirDirectCallSummary>,
     /// Structured regions recovered from rustc's compiler-produced CFG. These
     /// are compared with the binary-derived contracts without requiring block
     /// numbers or compiler-inserted safety paths to match exactly.
@@ -1365,6 +1458,13 @@ pub struct MirMemoryWriteDependency {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MirDirectCallSummary {
+    pub block: usize,
+    pub statement_index: usize,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct MirEdge {
     pub source: usize,
     pub destination: usize,
@@ -1388,6 +1488,8 @@ pub struct MirFunctionEffectComparison {
     pub memory_write_mismatches: Vec<MirMemoryWriteMismatch>,
     #[serde(default)]
     pub region_mismatches: Vec<MirRegionMismatch>,
+    #[serde(default)]
+    pub direct_call_mismatches: Vec<MirDirectCallMismatch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1407,6 +1509,14 @@ pub struct MirMemoryWriteMismatch {
     pub required_target_input_registers: Vec<u8>,
     pub required_value_input_registers: Vec<u8>,
     pub observed_role_signatures: Vec<MirMemoryWriteDependency>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MirDirectCallMismatch {
+    pub required_contract_id: String,
+    pub required_location: String,
+    pub required_target_function_id: String,
+    pub observed_targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1739,6 +1849,10 @@ pub struct EvidencePack {
     /// offsets with unsupported semantic names.
     #[serde(default)]
     pub memory_field_contracts: Vec<MemoryFieldContract>,
+    /// Resolved internal call edges that source-producing stages and rustc MIR
+    /// must preserve with the exact target function identity.
+    #[serde(default)]
+    pub direct_call_contracts: Vec<DirectCallContract>,
     pub untrusted_evidence: Vec<UntrustedEvidence>,
 }
 
@@ -1793,6 +1907,7 @@ impl EvidencePack {
         let ir = build_canonical_ir(&analysis);
         let control_flow_regions = derive_control_flow_regions(&ir);
         let memory_field_contracts = derive_memory_field_contracts(&analysis, &ir, &semantics);
+        let direct_call_contracts = derive_direct_call_contracts(&analysis, &ir);
         Self {
             schema_version: AI_SCHEMA_VERSION,
             task,
@@ -1804,6 +1919,7 @@ impl EvidencePack {
             pseudocode_obligations: Vec::new(),
             control_flow_regions,
             memory_field_contracts,
+            direct_call_contracts,
             untrusted_evidence: Vec::new(),
         }
     }
@@ -2105,6 +2221,7 @@ impl EvidencePack {
         pack.control_flow_regions = derive_control_flow_regions(&pack.ir);
         pack.memory_field_contracts =
             derive_memory_field_contracts(&pack.analysis, &pack.ir, &pack.semantics);
+        pack.direct_call_contracts = derive_direct_call_contracts(&pack.analysis, &pack.ir);
         pack
     }
 }
@@ -3529,6 +3646,7 @@ where
         pack.control_flow_regions = derive_control_flow_regions(&pack.ir);
         pack.memory_field_contracts =
             derive_memory_field_contracts(&pack.analysis, &pack.ir, &pack.semantics);
+        pack.direct_call_contracts = derive_direct_call_contracts(&pack.analysis, &pack.ir);
         if task == ModelTask::StructureRecovery {
             let maximum_regions = pack
                 .ir
@@ -3562,6 +3680,23 @@ where
             if maximum_fields > 1_024 {
                 return Err(AiError::InvalidResponse(format!(
                     "bounded structure request contains {maximum_fields} memory fields for one function; the supported maximum is 1024"
+                )));
+            }
+            let maximum_calls = pack
+                .ir
+                .functions
+                .iter()
+                .map(|function| {
+                    pack.direct_call_contracts
+                        .iter()
+                        .filter(|contract| contract.caller_function_id == function.id)
+                        .count()
+                })
+                .max()
+                .unwrap_or(0);
+            if maximum_calls > 1_024 {
+                return Err(AiError::InvalidResponse(format!(
+                    "bounded structure request contains {maximum_calls} resolved direct calls for one function; the supported maximum is 1024"
                 )));
             }
         }
@@ -3967,6 +4102,7 @@ pub fn summarize_rustc_mir(source: &str) -> MirProgramSummary {
         returns: usize,
         current_block: Option<usize>,
         block_lines: BTreeMap<usize, Vec<String>>,
+        direct_calls: BTreeSet<MirDirectCallSummary>,
     }
 
     fn finish(builder: Builder) -> MirFunctionSummary {
@@ -3994,6 +4130,7 @@ pub fn summarize_rustc_mir(source: &str) -> MirProgramSummary {
             has_loop,
             effect_dependencies,
             memory_write_dependencies,
+            direct_calls: builder.direct_calls.into_iter().collect(),
             control_flow_regions,
         }
     }
@@ -4054,6 +4191,17 @@ pub fn summarize_rustc_mir(source: &str) -> MirProgramSummary {
                 .is_some_and(|(_, right)| right.contains('('));
         if is_call {
             builder.calls = builder.calls.saturating_add(1);
+            if let Some(target) = mir_call_target(trimmed) {
+                let statement_index = builder
+                    .block_lines
+                    .get(&source_block)
+                    .map_or(0, |lines| lines.len().saturating_sub(1));
+                builder.direct_calls.insert(MirDirectCallSummary {
+                    block: source_block,
+                    statement_index,
+                    target,
+                });
+            }
         } else if !targets.is_empty()
             && (trimmed.starts_with("goto ->")
                 || trimmed.starts_with("switchInt(")
@@ -4087,6 +4235,16 @@ pub fn summarize_rustc_mir(source: &str) -> MirProgramSummary {
 fn parse_mir_block_label(line: &str) -> Option<usize> {
     let digits = line.strip_prefix("bb")?.strip_suffix(": {")?;
     digits.parse().ok()
+}
+
+fn mir_call_target(line: &str) -> Option<String> {
+    if !line.contains(" -> [return: bb") {
+        return None;
+    }
+    let (_, right) = line.split_once(" = ")?;
+    let (target, _) = right.split_once('(')?;
+    let target = target.trim();
+    (!target.is_empty()).then(|| target.to_owned())
 }
 
 fn mir_block_targets(line: &str) -> Vec<usize> {
@@ -4830,10 +4988,51 @@ pub fn compare_mir_effects(
                 .map(|candidate| candidate.control_flow_regions.as_slice())
                 .unwrap_or_default(),
         );
+        let observed_call_targets = candidate
+            .map(|candidate| {
+                candidate
+                    .direct_calls
+                    .iter()
+                    .map(|call| call.target.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let observed_target_counts = observed_call_targets.iter().fold(
+            BTreeMap::<String, usize>::new(),
+            |mut counts, target| {
+                *counts.entry(target.clone()).or_default() += 1;
+                counts
+            },
+        );
+        let mut matched_target_counts = BTreeMap::<String, usize>::new();
+        let direct_call_mismatches = required_direct_call_contracts(pack, &function.id)
+            .into_iter()
+            .filter_map(|contract| {
+                let matched = matched_target_counts
+                    .entry(contract.target_function_id.clone())
+                    .or_default();
+                if *matched
+                    < observed_target_counts
+                        .get(&contract.target_function_id)
+                        .copied()
+                        .unwrap_or_default()
+                {
+                    *matched += 1;
+                    return None;
+                }
+                Some(MirDirectCallMismatch {
+                    required_contract_id: contract.id,
+                    required_location: format!("operation:{}", contract.operation_id),
+                    required_target_function_id: contract.target_function_id,
+                    observed_targets: observed_call_targets.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
         has_mismatch |= !missing.is_empty()
             || !dependency_mismatches.is_empty()
             || !memory_write_mismatches.is_empty()
             || !region_mismatches.is_empty()
+            || !direct_call_mismatches.is_empty()
             || !summary
                 .functions
                 .iter()
@@ -4846,6 +5045,7 @@ pub fn compare_mir_effects(
             dependency_mismatches,
             memory_write_mismatches,
             region_mismatches,
+            direct_call_mismatches,
         });
     }
     MirEffectComparison {
@@ -4857,7 +5057,7 @@ pub fn compare_mir_effects(
         },
         functions,
         limitations: vec![
-            "MIR validation checks effect/dependency coverage and one-to-one branch/loop region topology, not full semantic equivalence or one-to-one instruction lowering".into(),
+            "MIR validation checks effect/dependency coverage, resolved direct-call targets, and one-to-one branch/loop region topology, not full semantic equivalence or one-to-one instruction lowering".into(),
             "extra rustc regions are permitted for bounds checks, cleanup, and other compiler-introduced control flow, but cannot satisfy more than one binary-derived region".into(),
             "region matching preserves branch arity, join/exit presence, and recovered region nesting while allowing compiler block identifiers and member counts to differ".into(),
             "memory-write target/value role signatures are checked per required SBPF store, but identical signatures may reuse one MIR assignment because one source assignment can lower to multiple stores".into(),
@@ -5720,6 +5920,7 @@ pub fn validate_model_response_for_pack(
     pack.control_flow_regions = derive_control_flow_regions(&pack.ir);
     pack.memory_field_contracts =
         derive_memory_field_contracts(&pack.analysis, &pack.ir, &pack.semantics);
+    pack.direct_call_contracts = derive_direct_call_contracts(&pack.analysis, &pack.ir);
     let input_bytes = serde_json::to_vec(&pack)
         .map_err(|error| AiError::InvalidResponse(error.to_string()))?
         .len();
@@ -5930,6 +6131,13 @@ fn validate_structured_consistency(
                     &patch.memory_field_mappings,
                     "refinement patch",
                 )?;
+                validate_direct_call_mappings(
+                    &request.evidence_pack,
+                    &patch.function_id,
+                    &patch.replacement,
+                    &patch.direct_call_mappings,
+                    "refinement patch",
+                )?;
             }
             if parsed.observations.len() > 64 {
                 return Err(AiError::InvalidResponse(
@@ -6090,6 +6298,13 @@ fn validate_structure_candidate(
         &function.memory_field_mappings,
         "structure candidate",
     )?;
+    validate_direct_call_mappings(
+        &request.evidence_pack,
+        &function.function_id,
+        &function.pseudocode,
+        &function.direct_call_mappings,
+        "structure candidate",
+    )?;
     let function_blocks = request
         .evidence_pack
         .ir
@@ -6242,6 +6457,87 @@ fn validate_memory_field_mappings(
         if !supported_evidence {
             return Err(AiError::InvalidResponse(format!(
                 "memory field mapping {} must cite exactly one instruction from its deterministic contract",
+                mapping.contract_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_direct_call_mappings(
+    pack: &EvidencePack,
+    function_id: &str,
+    source: &str,
+    mappings: &[RecoveredDirectCallMapping],
+    candidate_kind: &str,
+) -> Result<(), AiError> {
+    let contracts = required_direct_call_contracts(pack, function_id)
+        .into_iter()
+        .map(|contract| (contract.id.clone(), contract))
+        .collect::<BTreeMap<_, _>>();
+    if mappings.len() != contracts.len() {
+        return Err(AiError::InvalidResponse(format!(
+            "{candidate_kind} for {function_id} maps {} resolved direct calls but {} are required",
+            mappings.len(),
+            contracts.len()
+        )));
+    }
+    let compact_source = rust_code_without_comments_and_literals(source)
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    let mut covered = BTreeSet::new();
+    let mut fragments = BTreeSet::new();
+    for mapping in mappings {
+        let Some(contract) = contracts.get(&mapping.contract_id) else {
+            return Err(AiError::InvalidResponse(format!(
+                "{candidate_kind} for {function_id} maps unknown direct-call contract {}",
+                mapping.contract_id
+            )));
+        };
+        if !covered.insert(mapping.contract_id.as_str()) {
+            return Err(AiError::InvalidResponse(format!(
+                "{candidate_kind} for {function_id} maps direct call {} more than once",
+                mapping.contract_id
+            )));
+        }
+        if mapping.target_function_id != contract.target_function_id {
+            return Err(AiError::InvalidResponse(format!(
+                "direct-call mapping {} must preserve deterministic target {}",
+                mapping.contract_id, contract.target_function_id
+            )));
+        }
+        let fragment = mapping.output_fragment.trim();
+        let compact_fragment = rust_code_without_comments_and_literals(fragment)
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        let expected_call = format!("{}(", contract.target_function_id);
+        if fragment.chars().count() < 2
+            || fragment.chars().count() > 512
+            || fragment.contains(['\n', '\r'])
+            || compact_fragment.is_empty()
+            || !compact_source.contains(&compact_fragment)
+            || !compact_fragment.contains(&expected_call)
+        {
+            return Err(AiError::InvalidResponse(format!(
+                "direct-call mapping {} must name a bounded one-line source call to {} present in the candidate",
+                mapping.contract_id, contract.target_function_id
+            )));
+        }
+        if !fragments.insert(compact_fragment) {
+            return Err(AiError::InvalidResponse(format!(
+                "{candidate_kind} for {function_id} reuses one source fragment for multiple direct calls"
+            )));
+        }
+        let supported_evidence = mapping.evidence.len() == 1
+            && contract.evidence.iter().any(|evidence| {
+                evidence.source == mapping.evidence[0].source
+                    && evidence.location == mapping.evidence[0].location
+            });
+        if !supported_evidence {
+            return Err(AiError::InvalidResponse(format!(
+                "direct-call mapping {} must cite exactly its deterministic call operation",
                 mapping.contract_id
             )));
         }
@@ -6750,6 +7046,15 @@ fn structured_evidence_refs(
                     }
                     references.extend(mapping.evidence);
                 }
+                for mapping in function.direct_call_mappings {
+                    if mapping.evidence.is_empty() {
+                        return Err(AiError::InvalidResponse(format!(
+                            "direct-call mapping {} for {} has no evidence",
+                            mapping.contract_id, function.function_id
+                        )));
+                    }
+                    references.extend(mapping.evidence);
+                }
                 references.extend(function.evidence);
             }
         }
@@ -6814,6 +7119,15 @@ fn structured_evidence_refs(
                     if mapping.evidence.is_empty() {
                         return Err(AiError::InvalidResponse(format!(
                             "memory field mapping {} for refinement {} has no evidence",
+                            mapping.contract_id, patch.function_id
+                        )));
+                    }
+                    references.extend(mapping.evidence);
+                }
+                for mapping in patch.direct_call_mappings {
+                    if mapping.evidence.is_empty() {
+                        return Err(AiError::InvalidResponse(format!(
+                            "direct-call mapping {} for refinement {} has no evidence",
                             mapping.contract_id, patch.function_id
                         )));
                     }
@@ -7276,6 +7590,18 @@ mod tests {
                 "evidence": contract.evidence.first().into_iter().collect::<Vec<_>>(),
             }));
         }
+        let direct_calls = required_direct_call_contracts(pack, function_id);
+        let mut direct_call_mappings = Vec::new();
+        for contract in &direct_calls {
+            let fragment = format!("{}();", contract.target_function_id);
+            body.push(fragment.clone());
+            direct_call_mappings.push(serde_json::json!({
+                "contract_id": contract.id,
+                "target_function_id": contract.target_function_id,
+                "output_fragment": fragment,
+                "evidence": contract.evidence.first().into_iter().collect::<Vec<_>>(),
+            }));
+        }
         let required = required_structure_effects(pack, function_id);
         if required
             .iter()
@@ -7304,6 +7630,7 @@ mod tests {
                 "pseudocode": format!("{declaration} {{\n{}\n}}", body.join("\n")),
                 "control_flow_mappings": mappings,
                 "memory_field_mappings": memory_field_mappings,
+                "direct_call_mappings": direct_call_mappings,
                 "effects": effects,
                 "evidence": [evidence]
             }]
@@ -7463,6 +7790,7 @@ mod tests {
                         "function_id": "fn_0",
                         "replacement": replacement,
                         "memory_field_mappings": [],
+                        "direct_call_mappings": [],
                         "evidence": [{"source": "ir", "location": "function:fn_0"}]
                     }],
                     "observations": [],
@@ -7638,6 +7966,7 @@ mod tests {
                 function_id: "fn_0".into(),
                 replacement: "fn fn_0() { sos_raw_op!(0, 1, 2, 3, 4); unknown_return(); }".into(),
                 memory_field_mappings: Vec::new(),
+                direct_call_mappings: Vec::new(),
                 evidence: vec![],
             }],
             observations: Vec::new(),
@@ -7660,6 +7989,7 @@ mod tests {
                 function_id: "fn_0".into(),
                 replacement: "fn broken( {".into(),
                 memory_field_mappings: Vec::new(),
+                direct_call_mappings: Vec::new(),
                 evidence: vec![],
             }],
             observations: Vec::new(),
@@ -7690,6 +8020,7 @@ mod tests {
                     output_fragment: "unknown_memory_r1.field_pos_0x8".into(),
                     evidence: vec![],
                 }],
+                direct_call_mappings: Vec::new(),
                 evidence: vec![],
             }],
             observations: Vec::new(),
@@ -7797,6 +8128,14 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
         assert_eq!(function.parameter_count, 3);
         assert_eq!(function.basic_block_count, 4);
         assert_eq!(function.calls, 1);
+        assert_eq!(
+            function.direct_calls,
+            vec![MirDirectCallSummary {
+                block: 2,
+                statement_index: 1,
+                target: "helper".into(),
+            }]
+        );
         assert_eq!(function.memory_writes, 1);
         assert_eq!(function.returns, 1);
         assert!(function.branch_terminators >= 2);
@@ -7873,6 +8212,171 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
         let comparison = compare_mir_effects(&pack, Some(&summary));
         assert_eq!(comparison.status, MirEffectComparisonStatus::Covered);
         assert!(comparison.functions[0].missing.is_empty());
+    }
+
+    #[test]
+    fn resolved_internal_calls_require_exact_source_and_mir_targets() {
+        let mut analysis = empty_pack().analysis;
+        analysis.instructions = vec![
+            InstructionFact {
+                pc: 0,
+                opcode: 0,
+                dst: 0,
+                src: 0,
+                offset: 0,
+                immediate: 8,
+                assembly: "call 8".into(),
+            },
+            InstructionFact {
+                pc: 8,
+                opcode: 0,
+                dst: 0,
+                src: 0,
+                offset: 0,
+                immediate: 0,
+                assembly: "exit".into(),
+            },
+        ];
+        analysis.functions = vec![
+            FunctionFact {
+                pc: 0,
+                symbol_hash: 1,
+                name: "caller".into(),
+            },
+            FunctionFact {
+                pc: 8,
+                symbol_hash: 8,
+                name: "callee".into(),
+            },
+        ];
+        analysis.basic_blocks = vec![
+            BasicBlockFact {
+                start_pc: 0,
+                end_instruction_index: 1,
+                destinations: Vec::new(),
+                label: "caller".into(),
+            },
+            BasicBlockFact {
+                start_pc: 8,
+                end_instruction_index: 2,
+                destinations: Vec::new(),
+                label: "callee".into(),
+            },
+        ];
+        analysis.calls = vec![sos_analysis::CallFact {
+            call_pc: 0,
+            caller_pc: Some(0),
+            kind: "direct_internal_call".into(),
+            target_pc: Some(8),
+            target_symbol_hash: Some(8),
+            status: "resolved".into(),
+        }];
+        let semantics = sos_solana::analyze(&analysis);
+        let mut pack =
+            EvidencePack::from_analysis(ModelTask::StructureRecovery, None, analysis, semantics);
+        let contracts = required_direct_call_contracts(&pack, "fn_0");
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0].target_function_id, "fn_8");
+        assert_eq!(contracts[0].evidence[0].location, "operation:op_0");
+        let hosted = crate::groq::hosted_model_evidence(&pack);
+        assert_eq!(
+            hosted["program"]["direct_call_contracts"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let output = test_structure_output(
+            &pack,
+            "fn_0",
+            "fn fn_0()",
+            serde_json::json!({
+                "source": "ir",
+                "location": "function:fn_0",
+                "detail": null
+            }),
+        );
+        let request = ModelRequest {
+            task: ModelTask::StructureRecovery,
+            prompt_version: "v1".into(),
+            model: "test".into(),
+            evidence_pack: pack.clone(),
+            max_output_bytes: 100_000,
+            max_output_tokens: 2_400,
+        };
+        validate_structured_consistency(&request, &output).unwrap();
+        let mut renamed = output;
+        renamed["functions"][0]["direct_call_mappings"][0]["target_function_id"] =
+            serde_json::json!("fn_10");
+        assert!(validate_structured_consistency(&request, &renamed)
+            .unwrap_err()
+            .to_string()
+            .contains("deterministic target fn_8"));
+
+        let mut suppressed = pack.clone();
+        suppressed.direct_call_contracts.clear();
+        let restored = ModelGateway::new(EchoProvider, 1024 * 1024, 1024 * 1024)
+            .submit(ModelTask::StructureRecovery, "test", "v1", suppressed)
+            .unwrap();
+        assert_eq!(
+            restored.structured_output["functions"][0]["direct_call_mappings"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let refinement = RefinementOutput {
+            schema_version: REFINEMENT_SCHEMA_VERSION,
+            patches: vec![RefinementPatch {
+                function_id: "fn_0".into(),
+                replacement: "#[inline(never)] fn fn_8(value: u64) -> u64 { value + 1 } fn fn_0() -> u64 { fn_8(1) }".into(),
+                memory_field_mappings: Vec::new(),
+                direct_call_mappings: vec![RecoveredDirectCallMapping {
+                    contract_id: contracts[0].id.clone(),
+                    target_function_id: "fn_8".into(),
+                    output_fragment: "fn_8(1)".into(),
+                    evidence: contracts[0].evidence.clone(),
+                }],
+                evidence: Vec::new(),
+            }],
+            observations: Vec::new(),
+            validation: RefinementValidation {
+                status: "unverified".into(),
+                notes: Vec::new(),
+            },
+        };
+        let compilation = compile_refinement_output(
+            &refinement,
+            Some(Path::new("rustc")),
+            Duration::from_secs(10),
+        );
+        assert_eq!(compilation.status, CompilationStatus::Passed);
+        pack.task = ModelTask::Refinement;
+        let comparison = compare_mir_effects(&pack, compilation.mir_summary.as_ref());
+        assert!(comparison.functions[0].direct_call_mismatches.is_empty());
+
+        let mut wrong = refinement;
+        wrong.patches[0].replacement = "#[inline(never)] fn fn_8(value: u64) -> u64 { value + 1 } #[inline(never)] fn fn_10(value: u64) -> u64 { value + 2 } fn mapped_only() { let _ = fn_8(1); } fn fn_0() -> u64 { fn_10(1) }".into();
+        validate_direct_call_mappings(
+            &pack,
+            "fn_0",
+            &wrong.patches[0].replacement,
+            &wrong.patches[0].direct_call_mappings,
+            "refinement patch",
+        )
+        .unwrap();
+        let wrong_compilation =
+            compile_refinement_output(&wrong, Some(Path::new("rustc")), Duration::from_secs(10));
+        assert_eq!(wrong_compilation.status, CompilationStatus::Passed);
+        let wrong_comparison = compare_mir_effects(&pack, wrong_compilation.mir_summary.as_ref());
+        assert_eq!(wrong_comparison.status, MirEffectComparisonStatus::Mismatch);
+        assert_eq!(
+            wrong_comparison.functions[0].direct_call_mismatches[0].required_target_function_id,
+            "fn_8"
+        );
+        assert!(wrong_comparison.functions[0].direct_call_mismatches[0]
+            .observed_targets
+            .contains(&"fn_10".into()));
     }
 
     #[test]
@@ -8072,6 +8576,7 @@ fn fn_80(_1: bool, _2: bool) -> () {
                     value_input_parameters: Vec::new(),
                 }],
                 memory_write_dependencies: Vec::new(),
+                direct_calls: Vec::new(),
                 control_flow_regions: Vec::new(),
             }],
         };
@@ -8131,6 +8636,7 @@ fn fn_80(_1: bool, _2: bool) -> () {
                     target_input_parameters: vec![2],
                     value_input_parameters: vec![1],
                 }],
+                direct_calls: Vec::new(),
                 control_flow_regions: Vec::new(),
             }],
         };
@@ -8248,6 +8754,7 @@ fn fn_80(_1: bool, _2: bool) -> () {
                         value_input_parameters: vec![2],
                     },
                 ],
+                direct_calls: Vec::new(),
                 control_flow_regions: Vec::new(),
             }],
         };
@@ -8788,6 +9295,7 @@ fn fn_80(_1: bool, _2: bool) -> () {
             source_mappings: Vec::new(),
             control_flow_mappings: Vec::new(),
             memory_field_mappings: Vec::new(),
+            direct_call_mappings: Vec::new(),
             effects,
             evidence: vec![sos_types::EvidenceRef {
                 source: "ir".into(),
@@ -8833,6 +9341,7 @@ fn fn_80(_1: bool, _2: bool) -> () {
                 "function_id": "fn_0",
                 "replacement": valid_source,
                 "memory_field_mappings": [],
+                "direct_call_mappings": [],
                 "evidence": [{"source": "ir", "location": "function:fn_0", "detail": null}]
             }],
             "observations": [],
@@ -9282,6 +9791,7 @@ fn fn_80(_1: bool, _2: bool) -> () {
                     "output_fragment": "let recovered: u64 = unknown_memory_r1.field_pos_0x8;",
                     "evidence": [contracts[0].evidence[0].clone()]
                 }],
+                "direct_call_mappings": [],
                 "evidence": [{"source": "ir", "location": "function:fn_0", "detail": null}]
             }],
             "observations": [],
@@ -9768,6 +10278,7 @@ fn fn_80(_1: bool, _2: bool) -> () {
                 "function_id": "fn_missing",
                 "replacement": "fn recovered() { }",
                 "memory_field_mappings": [],
+                "direct_call_mappings": [],
                 "evidence": [{
                     "source": "ir",
                     "location": "function:fn_0"

@@ -237,7 +237,7 @@ is also constrained by a conservative SBPF live-in analysis: every incoming
 model parameter and cited at its first-use instruction. Names and types remain
 explicit hypotheses; the register mapping is deterministic evidence.
 
-Evidence-pack schema v4 additionally derives immutable fixed-offset memory-field
+Evidence-pack schema v5 derives immutable fixed-offset memory-field
 contracts. Each contract records its function, logical offset, observed machine
 offset, access widths/kinds/PCs, conservative field path, and exact instruction
 evidence, plus deterministic Rust layout type and field identifiers. Fully
@@ -251,6 +251,13 @@ field-type assertions into the bounded rustc input. A cosmetic mapping, wrong
 padding, or wrong primitive field type therefore fails compilation. Negative
 machine-relative stack offsets remain evidence-only because they are not Rust
 record offsets.
+
+The same evidence pack now carries resolved internal-call contracts. Unique SBPF
+function hashes are resolved to exact `fn_<pc>` identities; structure and
+refinement output must map every call site to that exact target. Rustc MIR
+validation checks target identity and multiplicity, so calling an unrelated
+helper no longer satisfies a generic call effect. Indirect and unresolved calls
+remain explicitly unresolved rather than being guessed.
 
 ```bash
 ollama pull gpt-oss:20b

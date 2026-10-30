@@ -347,6 +347,18 @@ pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::V
     } else {
         Vec::new()
     };
+    let direct_call_contracts = if matches!(
+        pack.task,
+        ModelTask::StructureRecovery | ModelTask::Refinement
+    ) {
+        pack.ir
+            .functions
+            .first()
+            .map(|function| crate::required_direct_call_contracts(pack, &function.id))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let observed_abi_parameters = if pack.task == ModelTask::SignatureRecovery {
         pack.ir
             .functions
@@ -400,6 +412,7 @@ pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::V
             "required_effects": required_effects,
             "control_flow_regions": control_flow_regions,
             "memory_field_contracts": memory_field_contracts,
+            "direct_call_contracts": direct_call_contracts,
             "observed_abi_parameters": observed_abi_parameters,
             "signature_contracts": pack.signature_contracts,
         },

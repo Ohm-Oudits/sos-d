@@ -50,8 +50,8 @@ const HUMANIZATION_PROMPT_VERSION: &str = "sos-v2";
 const DETERMINISTIC_HUMANIZER_ID: &str = "sos-deterministic-syntax-v1";
 const HUMANIZATION_CACHE_SCHEMA_VERSION: u32 = 2;
 const HUMANIZATION_CACHE_RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
-const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v11";
-const LIFT_CACHE_SCHEMA_VERSION: u32 = 12;
+const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v12";
+const LIFT_CACHE_SCHEMA_VERSION: u32 = 13;
 const LIFT_CACHE_RECORD_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 fn main() -> ExitCode {
@@ -744,10 +744,20 @@ fn validate_command_inner(args: Vec<String>, announce_output: bool) -> ExitCode 
                                 mismatch.reasons.join("; ")
                             )
                         });
+                        let wrong_calls = function.direct_call_mismatches.iter().map(|mismatch| {
+                            format!(
+                                "candidate MIR does not preserve resolved call {} to {} at {}; observed targets {:?}",
+                                mismatch.required_contract_id,
+                                mismatch.required_target_function_id,
+                                mismatch.required_location,
+                                mismatch.observed_targets
+                            )
+                        });
                         missing_effects
                             .chain(missing_dependencies)
                             .chain(missing_write_roles)
                             .chain(missing_regions)
+                            .chain(wrong_calls)
                     })
                     .collect::<Vec<_>>();
                 let (behavioral_status, mut mismatches, mut limitations) =
@@ -5500,6 +5510,25 @@ mod tests {
                         })
                     })
                     .collect::<Vec<_>>();
+                let direct_calls =
+                    sos_ai::required_direct_call_contracts(&request.evidence_pack, &function_id);
+                let direct_call_fragments = direct_calls
+                    .iter()
+                    .map(|contract| format!("{}();", contract.target_function_id))
+                    .collect::<Vec<_>>();
+                let direct_call_mappings = direct_calls
+                    .iter()
+                    .zip(&direct_call_fragments)
+                    .map(|(contract, fragment)| {
+                        serde_json::json!({
+                            "contract_id": contract.id,
+                            "target_function_id": contract.target_function_id,
+                            "output_fragment": fragment,
+                            "evidence": contract.evidence,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                region_headers.extend(direct_call_fragments.iter().cloned());
                 if request.task == sos_ai::ModelTask::StructureRecovery {
                     self.requests.lock().unwrap().push((
                         request.evidence_pack.analysis.entrypoint,
@@ -5521,6 +5550,7 @@ mod tests {
                             ),
                             "control_flow_mappings": control_flow_mappings,
                             "memory_field_mappings": [],
+                            "direct_call_mappings": direct_call_mappings.clone(),
                             "effects": required_effects,
                             "evidence": [{
                                 "source": "ir",
@@ -5554,8 +5584,12 @@ mod tests {
                         "schema_version": sos_ai::REFINEMENT_SCHEMA_VERSION,
                         "patches": [{
                             "function_id": function_id,
-                            "replacement": format!("fn {function_id}() -> unknown {{}}"),
+                            "replacement": format!(
+                                "fn {function_id}() -> unknown {{ {} }}",
+                                direct_call_fragments.join(" ")
+                            ),
                             "memory_field_mappings": [],
+                            "direct_call_mappings": direct_call_mappings,
                             "evidence": [{
                                 "source": "ir",
                                 "location": format!("operation:{operation_id}"),

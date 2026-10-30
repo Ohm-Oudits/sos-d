@@ -124,11 +124,14 @@ Already implemented in this workspace:
   exits, and cycle edges from compiler CFGs. It requires distinct compatible
   regions and preserves nesting while allowing unmatched rustc safety/cleanup
   regions; topology mismatches feed the bounded repair loop.
-- Evidence-pack schema v3 and AI-bundle schema v6 add deterministic memory-field
+- Evidence-pack schema v5 and AI-bundle schema v8 add deterministic memory-field
   contracts spanning logical/machine offsets, widths, access kinds/PCs, and
   exact evidence. Structure and refinement must preserve every contract; only
   complete SolAccountInfo layouts receive semantic names, while unresolved
   offsets keep stable neutral paths.
+- Unique internal SBPF call hashes are resolved to function entries and emitted
+  as immutable call-edge contracts. Structure/refinement mappings preserve exact
+  callees, and rustc MIR rejects wrong targets or missing repeated calls.
 - `sos judge` compares an original SBPF ELF with a recompiled candidate using
   deterministic name-independent function pairing, normalized instruction
   n-grams, instruction counts, CFG/call/memory shape, unmatched-function

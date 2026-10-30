@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sos-decompiler.dev/schema/v2/validation.schema.json",
+  "title": "SOS candidate validation bundle with resolved call-target checks",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version", "artifact_sha256", "refinement_output_sha256",
+    "compilation", "behavioral_status", "behavioral_evidence",
+    "behavioral_mismatches", "repair", "limitations"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "artifact_sha256": {"type": ["string", "null"]},
+    "refinement_output_sha256": {"type": ["string", "null"]},
+    "compilation": {
+      "type": "object",
+      "required": ["schema_version", "status", "compiler", "source_sha256", "diagnostics", "limitations"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "status": {"enum": ["passed", "failed", "timed_out", "not_available"]},
+        "compiler": {"type": ["string", "null"]},
+        "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "mir_summary": {
+          "type": ["object", "null"],
+          "properties": {
+            "schema_version": {"const": 3},
+            "functions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "name", "parameter_count", "basic_block_count", "edges",
+                  "branch_terminators", "calls", "memory_writes", "returns",
+                  "has_loop", "effect_dependencies", "memory_write_dependencies",
+                  "direct_calls", "control_flow_regions"
+                ],
+                "properties": {
+                  "name": {"type": "string"},
+                  "parameter_count": {"type": "integer", "minimum": 0},
+                  "direct_calls": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["block", "statement_index", "target"],
+                      "properties": {
+                        "block": {"type": "integer", "minimum": 0},
+                        "statement_index": {"type": "integer", "minimum": 0},
+                        "target": {"type": "string", "minLength": 1}
+                      }
+                    }
+                  },
+                  "effect_dependencies": {"type": "array"},
+                  "memory_write_dependencies": {"type": "array"},
+                  "control_flow_regions": {"type": "array"}
+                }
+              }
+            }
+          }
+        },
+        "limitations": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "mir_effects": {
+      "type": ["object", "null"],
+      "properties": {
+        "schema_version": {"const": 3},
+        "status": {"enum": ["covered", "mismatch", "not_available"]},
+        "functions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "direct_call_mismatches": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "required_contract_id", "required_location",
+                    "required_target_function_id", "observed_targets"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "limitations": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "behavioral_status": {"enum": ["not_requested", "not_available", "behaviorally_validated", "mismatch", "unverified"]},
+    "behavioral_evidence": {"type": "array", "items": {"type": "string"}},
+    "behavioral_mismatches": {"type": "array", "items": {"type": "string"}},
+    "repair": {
+      "type": ["object", "null"],
+      "required": ["schema_version", "model", "prompt_version", "status", "rounds", "final_output", "limitations"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "model": {"type": "string"},
+        "max_output_tokens": {"type": "integer", "minimum": 128, "maximum": 32768},
+        "prompt_version": {"type": "string"},
+        "status": {"enum": ["behaviorally_validated", "compiled_unverified", "exhausted", "not_available", "rejected"]},
+        "rounds": {"type": "array", "maxItems": 8},
+        "final_output": {"type": ["object", "null"]},
+        "limitations": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "limitations": {"type": "array", "items": {"type": "string"}}
+  }
+}

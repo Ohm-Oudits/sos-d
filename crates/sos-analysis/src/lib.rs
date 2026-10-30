@@ -1075,12 +1075,28 @@ fn collect_calls(instructions: &[InstructionFact], functions: &[FunctionFact]) -
                     Some(instruction.immediate as u32),
                     "resolved",
                 ),
-                ebpf::CALL_IMM => (
-                    "direct_or_relocated",
-                    None,
-                    Some(instruction.immediate as u32),
-                    "unresolved",
-                ),
+                ebpf::CALL_IMM => {
+                    let symbol_hash = instruction.immediate as u32;
+                    let mut targets = functions
+                        .iter()
+                        .filter(|function| symbol_hash != 0 && function.symbol_hash == symbol_hash)
+                        .map(|function| function.pc);
+                    let first = targets.next();
+                    if first.is_some() && targets.next().is_none() {
+                        ("direct_internal_call", first, Some(symbol_hash), "resolved")
+                    } else {
+                        (
+                            "direct_or_relocated",
+                            None,
+                            Some(symbol_hash),
+                            if first.is_some() {
+                                "ambiguous"
+                            } else {
+                                "unresolved"
+                            },
+                        )
+                    }
+                }
                 _ => return None,
             };
             let caller_pc = functions
@@ -2106,6 +2122,67 @@ mod static_tests {
         assert_eq!(calls[1].kind, "indirect");
         assert_eq!(calls[2].kind, "syscall");
         assert_eq!(calls[2].status, "resolved");
+    }
+
+    #[test]
+    fn resolves_unique_internal_call_hashes_to_function_entries() {
+        use solana_sbpf::ebpf;
+
+        let calls = collect_calls(
+            &[InstructionFact {
+                pc: 4,
+                opcode: ebpf::CALL_IMM,
+                dst: 0,
+                src: 0,
+                offset: 0,
+                immediate: 0x1234,
+                assembly: "call 0x1234".into(),
+            }],
+            &[
+                FunctionFact {
+                    pc: 0,
+                    symbol_hash: 0xaaaa,
+                    name: "caller".into(),
+                },
+                FunctionFact {
+                    pc: 16,
+                    symbol_hash: 0x1234,
+                    name: "callee".into(),
+                },
+            ],
+        );
+
+        assert_eq!(calls[0].kind, "direct_internal_call");
+        assert_eq!(calls[0].caller_pc, Some(0));
+        assert_eq!(calls[0].target_pc, Some(16));
+        assert_eq!(calls[0].target_symbol_hash, Some(0x1234));
+        assert_eq!(calls[0].status, "resolved");
+
+        let ambiguous = collect_calls(
+            &[InstructionFact {
+                pc: 4,
+                opcode: ebpf::CALL_IMM,
+                dst: 0,
+                src: 0,
+                offset: 0,
+                immediate: 0x1234,
+                assembly: "call 0x1234".into(),
+            }],
+            &[
+                FunctionFact {
+                    pc: 16,
+                    symbol_hash: 0x1234,
+                    name: "collision_a".into(),
+                },
+                FunctionFact {
+                    pc: 32,
+                    symbol_hash: 0x1234,
+                    name: "collision_b".into(),
+                },
+            ],
+        );
+        assert_eq!(ambiguous[0].target_pc, None);
+        assert_eq!(ambiguous[0].status, "ambiguous");
     }
 
     #[test]

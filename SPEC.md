@@ -195,6 +195,15 @@ must retain deterministic `unknown_memory_*` paths. Structure and refinement
 outputs must map every contract exactly once to a unique non-comment source
 expression and must not substitute unsupported names or widths.
 
+Every uniquely resolved internal SBPF call must produce an immutable call-edge
+contract containing caller identity, call PC, IR operation, target function
+identity, and evidence. Structure and refinement output must map each contract
+to a unique source call to the exact target. Compiler validation must recover
+named MIR call operands and preserve target multiplicity per caller; a generic
+call effect, wrapper to another function, comment, or unrelated helper call is
+not sufficient. Indirect, relocated, and hash-ambiguous calls must remain
+unresolved until deterministic evidence identifies a target.
+
 Each stage returns strict JSON. Inputs are tagged as untrusted data, and model output
 cannot alter facts, evidence references, or confidence values directly.
 

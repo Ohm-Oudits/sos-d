@@ -601,7 +601,8 @@ and security tooling do not have to scrape human output.
 - Historical account hydration where supported.
 - Sandboxed SVM/LiteSVM replay.
 - Pinned candidate compilation and deterministic binary-similarity judging.
-- Type-layout and call-graph non-regression checks.
+- Type-layout and resolved-direct-call non-regression checks; retain indirect
+  and hash-ambiguous calls as explicit unresolved edges.
 - Trace comparison and bounded AI repair loop.
 
 ### Phase 6 — research-grade product
