@@ -46,7 +46,11 @@ function must target a known IR function and cite valid instruction, block,
 operation, memory, or read-only-data evidence. Signature recovery runs before
 body reconstruction, following Patina's key dependency: the body agent receives
 the accepted interface hypothesis instead of inventing an interface while
-rewriting control flow. Structure output also includes a machine-checkable
+rewriting control flow. SOS promotes a gateway-accepted signature into an
+explicit, response-hash-bound contract in evidence-pack schema v2. Structure
+and refinement candidates are rejected if they change the contract's parameter
+names, parameter types, order, or return type; raw prior-stage prose cannot
+satisfy this gate. Structure output also includes a machine-checkable
 effect ledger. Every deterministic store, branch, recursive CFG loop, call, and
 return in the scoped IR must be covered by a matching exact IR location; prose
 citations alone cannot satisfy this contract.

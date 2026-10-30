@@ -366,6 +366,7 @@ pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::V
             "public_keys": pack.analysis.public_key_candidates.iter().take(16).collect::<Vec<_>>(),
             "required_effects": required_effects,
             "observed_abi_parameters": observed_abi_parameters,
+            "signature_contracts": pack.signature_contracts,
         },
         "solana": {
             "deserializers": bounded_json_array(&pack.semantics.deserialization_candidates, 8),

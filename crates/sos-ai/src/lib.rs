@@ -36,7 +36,7 @@ pub use huggingface::{HuggingFaceModelProvider, HUGGING_FACE_GPT_OSS_120B};
 pub use ollama::{trusted_open_model, OllamaModelProvider, OpenModelProfile, TRUSTED_OPEN_MODELS};
 pub use openai::OpenAiModelProvider;
 
-pub const AI_SCHEMA_VERSION: u32 = 1;
+pub const AI_SCHEMA_VERSION: u32 = 2;
 pub const AI_BUNDLE_SCHEMA_VERSION: u32 = 5;
 pub const MIN_STAGE_OUTPUT_TOKENS: usize = 128;
 pub const MAX_STAGE_OUTPUT_TOKENS: usize = 32_768;
@@ -397,6 +397,15 @@ pub struct RecoveredSignature {
     pub confidence: Option<f32>,
     #[serde(default)]
     pub evidence: Vec<sos_types::EvidenceRef>,
+}
+
+/// A signature-stage hypothesis that later source-producing stages must carry
+/// forward exactly. The source response hash binds the contract to the
+/// accepted, gateway-validated model response that introduced it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignatureContract {
+    pub source_output_sha256: String,
+    pub signature: RecoveredSignature,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -852,6 +861,12 @@ pub struct EvidencePack {
     pub analysis: StaticAnalysis,
     pub ir: CanonicalIr,
     pub semantics: SemanticAnalysis,
+    /// Validated output from the earlier signature stage. Unlike
+    /// `untrusted_evidence`, these entries are populated by the orchestrator
+    /// only after the gateway accepts the signature response, and are enforced
+    /// as exact interfaces on later source-producing stages.
+    #[serde(default)]
+    pub signature_contracts: Vec<SignatureContract>,
     pub untrusted_evidence: Vec<UntrustedEvidence>,
 }
 
@@ -910,8 +925,14 @@ impl EvidencePack {
             ir: build_canonical_ir(&analysis),
             analysis,
             semantics,
+            signature_contracts: Vec::new(),
             untrusted_evidence: Vec::new(),
         }
+    }
+
+    pub fn with_signature_contracts(mut self, contracts: Vec<SignatureContract>) -> Self {
+        self.signature_contracts = contracts;
+        self
     }
 
     pub fn with_untrusted_evidence(mut self, evidence: Vec<UntrustedEvidence>) -> Self {
@@ -2543,6 +2564,7 @@ pub fn run_pipeline_with_context<P: ModelProvider>(
     let gateway = ModelGateway::new(provider, 4 * 1024 * 1024, 1024 * 1024);
     let mut stages = Vec::with_capacity(ModelTask::ALL.len());
     let mut accepted_prior_stages = bounded_initial_context(initial_context);
+    let mut signature_contracts = Vec::new();
 
     for task in ModelTask::ALL {
         let stage_model = stage_models.model_for(task, &model).to_owned();
@@ -2554,6 +2576,7 @@ pub fn run_pipeline_with_context<P: ModelProvider>(
             semantics,
             limits,
         );
+        pack.signature_contracts = signature_contracts.clone();
         // Patina/Goonfi-style staged lifting: later stages receive accepted
         // earlier output as hypotheses while deterministic facts remain
         // immutable. The gateway still validates all evidence references.
@@ -2569,6 +2592,20 @@ pub fn run_pipeline_with_context<P: ModelProvider>(
             max_output_tokens,
         ) {
             Ok(response) => {
+                let output_sha256 = sha256_json(&response);
+                if task == ModelTask::SignatureRecovery {
+                    let parsed: SignatureRecoveryOutput =
+                        serde_json::from_value(response.structured_output.clone())
+                            .expect("gateway-validated signature output must deserialize");
+                    signature_contracts = parsed
+                        .signatures
+                        .into_iter()
+                        .map(|signature| SignatureContract {
+                            source_output_sha256: output_sha256.clone(),
+                            signature,
+                        })
+                        .collect();
+                }
                 let prior = serde_json::to_string(&response.structured_output)
                     .unwrap_or_else(|_| "{}".into())
                     .chars()
@@ -2585,7 +2622,7 @@ pub fn run_pipeline_with_context<P: ModelProvider>(
                     max_output_tokens,
                     prompt_version: prompt_version.clone(),
                     input_sha256,
-                    output_sha256: Some(sha256_json(&response)),
+                    output_sha256: Some(output_sha256),
                     response: Some(response),
                     error: None,
                 })
@@ -2658,6 +2695,7 @@ pub fn validate_pipeline_bundle_with_context(
     }
 
     let mut accepted_prior_stages = bounded_initial_context(initial_context);
+    let mut signature_contracts = Vec::new();
     for (stage, expected_task) in bundle.stages.iter().zip(ModelTask::ALL) {
         let expected_model = config.stage_models.model_for(expected_task, &config.model);
         let expected_tokens = config.stage_token_budgets.tokens_for(expected_task);
@@ -2679,6 +2717,7 @@ pub fn validate_pipeline_bundle_with_context(
             semantics,
             config.limits,
         );
+        pack.signature_contracts = signature_contracts.clone();
         pack.untrusted_evidence
             .extend(accepted_prior_stages.iter().cloned());
         if stage.input_sha256 != sha256_json(&pack) {
@@ -2697,6 +2736,22 @@ pub fn validate_pipeline_bundle_with_context(
             return Err(AiError::InvalidResponse(format!(
                 "checkpointed {expected_task:?} output hash does not match its response"
             )));
+        }
+        if expected_task == ModelTask::SignatureRecovery {
+            let parsed: SignatureRecoveryOutput =
+                serde_json::from_value(response.structured_output.clone()).map_err(|error| {
+                    AiError::InvalidResponse(format!(
+                        "checkpointed signature output cannot populate contracts: {error}"
+                    ))
+                })?;
+            signature_contracts = parsed
+                .signatures
+                .into_iter()
+                .map(|signature| SignatureContract {
+                    source_output_sha256: output_sha256.clone(),
+                    signature,
+                })
+                .collect();
         }
         let prior = serde_json::to_string(&response.structured_output)
             .unwrap_or_else(|_| "{}".into())
@@ -4095,6 +4150,12 @@ fn validate_structured_consistency(
                         patch.function_id
                     )));
                 }
+                validate_signature_contract(
+                    &request.evidence_pack,
+                    &patch.function_id,
+                    &patch.replacement,
+                    "refinement patch",
+                )?;
             }
             if parsed.observations.len() > 64 {
                 return Err(AiError::InvalidResponse(
@@ -4134,6 +4195,12 @@ fn validate_structure_candidate(
             function.function_id
         )));
     }
+    validate_signature_contract(
+        &request.evidence_pack,
+        &function.function_id,
+        &function.pseudocode,
+        "structure candidate",
+    )?;
     let required_effects =
         required_structure_effects(&request.evidence_pack, &function.function_id);
     let mut covered_effects = BTreeSet::new();
@@ -4281,6 +4348,78 @@ fn validate_structure_candidate(
         )));
     }
     Ok(())
+}
+
+fn validate_signature_contract(
+    pack: &EvidencePack,
+    function_id: &str,
+    source: &str,
+    candidate_kind: &str,
+) -> Result<(), AiError> {
+    let contracts = pack
+        .signature_contracts
+        .iter()
+        .filter(|contract| contract.signature.function_id == function_id)
+        .collect::<Vec<_>>();
+    if contracts.len() > 1 {
+        return Err(AiError::InvalidResponse(format!(
+            "{candidate_kind} for {function_id} has multiple accepted signature contracts"
+        )));
+    }
+    let Some(contract) = contracts.first() else {
+        return Ok(());
+    };
+    if contract.source_output_sha256.len() != 64
+        || !contract
+            .source_output_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(AiError::InvalidResponse(format!(
+            "{candidate_kind} for {function_id} has an invalid signature-contract source hash"
+        )));
+    }
+    let expected = signature_contract_declaration(&contract.signature);
+    let observed = candidate_function_declaration(source, function_id).ok_or_else(|| {
+        AiError::InvalidResponse(format!(
+            "{candidate_kind} for {function_id} does not contain a complete function declaration"
+        ))
+    })?;
+    if compact_signature(&observed) != compact_signature(&expected) {
+        return Err(AiError::InvalidResponse(format!(
+            "{candidate_kind} for {function_id} changes the accepted signature contract; expected `{expected}`, observed `{observed}`"
+        )));
+    }
+    Ok(())
+}
+
+fn signature_contract_declaration(signature: &RecoveredSignature) -> String {
+    let parameters = signature
+        .parameters
+        .iter()
+        .map(|parameter| format!("{}: {}", parameter.name, parameter.type_name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "fn {}({parameters}) -> {}",
+        signature.function_id, signature.return_type
+    )
+}
+
+fn candidate_function_declaration(source: &str, function_id: &str) -> Option<String> {
+    let marker = format!("fn {function_id}");
+    let start = source.find(&marker)?;
+    let remainder = &source[start..];
+    let body = remainder.find('{')?;
+    let declaration = remainder[..body].trim();
+    (!declaration.is_empty()).then(|| declaration.to_owned())
+}
+
+fn compact_signature(source: &str) -> String {
+    source
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
 }
 
 fn validate_structured_output(task: ModelTask, output: &serde_json::Value) -> Result<(), AiError> {
@@ -4731,15 +4870,29 @@ mod tests {
                 "detail": null
             });
             let structured_output = match request.task {
-                ModelTask::StructureRecovery | ModelTask::PseudocodeHumanization => {
+                ModelTask::StructureRecovery => {
+                    let declaration = request
+                        .evidence_pack
+                        .signature_contracts
+                        .iter()
+                        .find(|contract| contract.signature.function_id == function_id)
+                        .map(|contract| signature_contract_declaration(&contract.signature))
+                        .unwrap_or_else(|| format!("fn {function_id}()"));
                     serde_json::json!({
                         "functions": [{
                             "function_id": function_id,
-                            "pseudocode": format!("fn {function_id}() {{ unknown_semantics(); }}"),
+                            "pseudocode": format!("{declaration} {{ unknown_semantics(); }}"),
                             "evidence": [function_evidence]
                         }]
                     })
                 }
+                ModelTask::PseudocodeHumanization => serde_json::json!({
+                    "functions": [{
+                        "function_id": function_id,
+                        "pseudocode": format!("fn {function_id}() {{ unknown_semantics(); }}"),
+                        "evidence": [function_evidence]
+                    }]
+                }),
                 ModelTask::SignatureRecovery => serde_json::json!({
                     "signatures": [{
                         "function_id": function_id,
@@ -4780,6 +4933,20 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(request.evidence_pack.untrusted_evidence.len());
+            EchoProvider.generate_structured(request)
+        }
+    }
+
+    struct ContractRecordingProvider {
+        contract_counts: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl ModelProvider for ContractRecordingProvider {
+        fn generate_structured(&self, request: ModelRequest) -> Result<ModelResponse, AiError> {
+            self.contract_counts
+                .lock()
+                .unwrap()
+                .push(request.evidence_pack.signature_contracts.len());
             EchoProvider.generate_structured(request)
         }
     }
@@ -5536,6 +5703,34 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
     }
 
     #[test]
+    fn pipeline_promotes_only_the_accepted_signature_stage_into_contracts() {
+        let pack = empty_pack();
+        let contract_counts = Arc::new(Mutex::new(Vec::new()));
+        let bundle = run_pipeline(
+            ContractRecordingProvider {
+                contract_counts: contract_counts.clone(),
+            },
+            AiPipelineConfig {
+                provider_name: "test-provider".into(),
+                model: "test-model".into(),
+                stage_models: AiStageModels::default(),
+                stage_token_budgets: AiStageTokenBudgets::default(),
+                prompt_version: "sos-v2".into(),
+                artifact_sha256: None,
+                limits: EvidencePackLimits::default(),
+                max_attempts: 1,
+            },
+            &pack.analysis,
+            &pack.semantics,
+        );
+        assert_eq!(*contract_counts.lock().unwrap(), vec![0, 1, 1, 1, 1]);
+        assert!(bundle
+            .stages
+            .iter()
+            .all(|stage| stage.status == AiStageStatus::Accepted));
+    }
+
+    #[test]
     fn pipeline_passes_bounded_dependency_context_into_the_first_stage() {
         let pack = empty_pack();
         let prior_counts = Arc::new(Mutex::new(Vec::new()));
@@ -5792,6 +5987,113 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
         no_evidence["signatures"][0]["function_id"] = serde_json::json!("fn_0");
         no_evidence["signatures"][0]["evidence"] = serde_json::json!([]);
         assert!(structured_evidence_refs(ModelTask::SignatureRecovery, &no_evidence).is_err());
+    }
+
+    #[test]
+    fn source_stages_must_preserve_the_accepted_signature_contract() {
+        let mut pack = empty_pack();
+        pack.task = ModelTask::StructureRecovery;
+        pack.signature_contracts = vec![SignatureContract {
+            source_output_sha256: "ab".repeat(32),
+            signature: RecoveredSignature {
+                function_id: "fn_0".into(),
+                function_name: "process_instruction".into(),
+                return_type: "Result<(), ProgramError>".into(),
+                parameters: vec![
+                    RecoveredParameter {
+                        name: "instruction_data".into(),
+                        type_name: "&[u8]".into(),
+                        role: Some("serialized instruction input".into()),
+                        abi_register: Some(1),
+                    },
+                    RecoveredParameter {
+                        name: "account_count".into(),
+                        type_name: "u64".into(),
+                        role: Some("number of supplied accounts".into()),
+                        abi_register: Some(2),
+                    },
+                ],
+                confidence: Some(0.6),
+                evidence: vec![sos_types::EvidenceRef {
+                    source: "ir".into(),
+                    location: "function:fn_0".into(),
+                    detail: None,
+                }],
+            },
+        }];
+        let valid_source = "fn fn_0(instruction_data: &[u8], account_count: u64) -> Result<(), ProgramError> { unknown_semantics(); }";
+        let effects = required_structure_effects(&pack, "fn_0")
+            .into_iter()
+            .map(|required| RecoveredEffect {
+                kind: required.kind,
+                input_registers: required.input_registers,
+                target_input_registers: required.target_input_registers,
+                value_input_registers: required.value_input_registers,
+                evidence: vec![sos_types::EvidenceRef {
+                    source: "ir".into(),
+                    location: required.location,
+                    detail: None,
+                }],
+            })
+            .collect();
+        let candidate = RecoveredFunction {
+            function_id: "fn_0".into(),
+            pseudocode: valid_source.into(),
+            effects,
+            evidence: vec![sos_types::EvidenceRef {
+                source: "ir".into(),
+                location: "function:fn_0".into(),
+                detail: None,
+            }],
+        };
+        let request = ModelRequest {
+            task: ModelTask::StructureRecovery,
+            prompt_version: "v1".into(),
+            model: "test".into(),
+            evidence_pack: pack.clone(),
+            max_output_bytes: 10_000,
+            max_output_tokens: 1_200,
+        };
+        assert!(validate_structure_candidate(&request, &candidate).is_ok());
+
+        for changed in [
+            "fn fn_0(data: &[u8], account_count: u64) -> Result<(), ProgramError> { unknown_semantics(); }",
+            "fn fn_0(instruction_data: &[u8], account_count: usize) -> Result<(), ProgramError> { unknown_semantics(); }",
+            "fn fn_0(account_count: u64, instruction_data: &[u8]) -> Result<(), ProgramError> { unknown_semantics(); }",
+            "fn fn_0(instruction_data: &[u8], account_count: u64) -> u64 { unknown_semantics(); }",
+        ] {
+            let mut mutated = candidate.clone();
+            mutated.pseudocode = changed.into();
+            let error = validate_structure_candidate(&request, &mutated).unwrap_err();
+            assert!(error.to_string().contains("changes the accepted signature contract"));
+        }
+
+        let mut refinement_pack = pack;
+        refinement_pack.task = ModelTask::Refinement;
+        let refinement_request = ModelRequest {
+            task: ModelTask::Refinement,
+            prompt_version: "v1".into(),
+            model: "test".into(),
+            evidence_pack: refinement_pack,
+            max_output_bytes: 10_000,
+            max_output_tokens: 1_200,
+        };
+        let valid_refinement = serde_json::json!({
+            "schema_version": 1,
+            "patches": [{
+                "function_id": "fn_0",
+                "replacement": valid_source,
+                "evidence": [{"source": "ir", "location": "function:fn_0", "detail": null}]
+            }],
+            "observations": [],
+            "validation": {"status": "unverified", "notes": []}
+        });
+        assert!(validate_structured_consistency(&refinement_request, &valid_refinement).is_ok());
+        let mut changed_refinement = valid_refinement;
+        changed_refinement["patches"][0]["replacement"] = serde_json::json!(
+            "fn fn_0(data: &[u8], account_count: u64) -> Result<(), ProgramError> {}"
+        );
+        assert!(validate_structured_consistency(&refinement_request, &changed_refinement).is_err());
     }
 
     #[test]

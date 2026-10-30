@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sos-decompiler.dev/schema/v2/evidence-pack.json",
+  "title": "SOS AI evidence pack with accepted signature contracts",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "task",
+    "analysis",
+    "ir",
+    "semantics",
+    "signature_contracts",
+    "untrusted_evidence"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "task": {
+      "enum": [
+        "structure_recovery",
+        "signature_recovery",
+        "semantic_labeling",
+        "explanation",
+        "refinement",
+        "pseudocode_humanization"
+      ]
+    },
+    "artifact_sha256": { "type": ["string", "null"] },
+    "analysis": { "$ref": "../v1/static-analysis.schema.json" },
+    "ir": { "$ref": "../v1/canonical-ir.schema.json" },
+    "semantics": {
+      "type": "object",
+      "required": ["schema_version"],
+      "properties": { "schema_version": { "const": 1 } }
+    },
+    "signature_contracts": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_output_sha256", "signature"],
+        "properties": {
+          "source_output_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "signature": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "function_id",
+              "function_name",
+              "return_type",
+              "parameters",
+              "confidence",
+              "evidence"
+            ],
+            "properties": {
+              "function_id": { "type": "string" },
+              "function_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+              "return_type": { "type": "string", "minLength": 1, "maxLength": 128 },
+              "parameters": {
+                "type": "array",
+                "maxItems": 32,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["name", "type_name", "role", "abi_register"],
+                  "properties": {
+                    "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+                    "type_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+                    "role": { "type": ["string", "null"], "maxLength": 128 },
+                    "abi_register": { "type": ["integer", "null"], "minimum": 1, "maximum": 5 }
+                  }
+                }
+              },
+              "confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+              "evidence": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 8,
+                "items": {
+                  "type": "object",
+                  "required": ["source", "location"],
+                  "properties": {
+                    "source": { "type": "string" },
+                    "location": { "type": "string" },
+                    "detail": { "type": ["string", "null"] }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "untrusted_evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["source", "content"]
+      }
+    }
+  }
+}

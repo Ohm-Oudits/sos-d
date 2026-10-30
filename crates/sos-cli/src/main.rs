@@ -50,8 +50,8 @@ const HUMANIZATION_PROMPT_VERSION: &str = "sos-v1";
 const DETERMINISTIC_HUMANIZER_ID: &str = "sos-deterministic-syntax-v1";
 const HUMANIZATION_CACHE_SCHEMA_VERSION: u32 = 1;
 const HUMANIZATION_CACHE_RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
-const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v7";
-const LIFT_CACHE_SCHEMA_VERSION: u32 = 8;
+const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v8";
+const LIFT_CACHE_SCHEMA_VERSION: u32 = 9;
 const LIFT_CACHE_RECORD_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 fn main() -> ExitCode {
@@ -5413,7 +5413,7 @@ mod tests {
                     sos_ai::ModelTask::StructureRecovery => serde_json::json!({
                         "functions": [{
                             "function_id": function_id,
-                            "pseudocode": format!("fn {function_id}() {{}}"),
+                            "pseudocode": format!("fn {function_id}() -> unknown {{}}"),
                             "effects": required_effects,
                             "evidence": [{
                                 "source": "ir",
@@ -5447,7 +5447,7 @@ mod tests {
                         "schema_version": 1,
                         "patches": [{
                             "function_id": function_id,
-                            "replacement": format!("fn {function_id}() {{}}"),
+                            "replacement": format!("fn {function_id}() -> unknown {{}}"),
                             "evidence": [{
                                 "source": "ir",
                                 "location": format!("operation:{operation_id}"),
