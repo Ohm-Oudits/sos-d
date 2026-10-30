@@ -1023,8 +1023,8 @@ pub struct CompilationResult {
     pub limitations: Vec<String>,
 }
 
-pub const MIR_SUMMARY_SCHEMA_VERSION: u32 = 1;
-pub const MIR_EFFECT_COMPARISON_SCHEMA_VERSION: u32 = 1;
+pub const MIR_SUMMARY_SCHEMA_VERSION: u32 = 2;
+pub const MIR_EFFECT_COMPARISON_SCHEMA_VERSION: u32 = 2;
 
 /// Bounded, compiler-produced control/effect summary of a reconstructed Rust
 /// candidate. The raw textual MIR is intentionally not persisted: rustc marks
@@ -1049,6 +1049,29 @@ pub struct MirFunctionSummary {
     pub effect_dependencies: Vec<MirEffectDependency>,
     #[serde(default)]
     pub memory_write_dependencies: Vec<MirMemoryWriteDependency>,
+    /// Structured regions recovered from rustc's compiler-produced CFG. These
+    /// are compared with the binary-derived contracts without requiring block
+    /// numbers or compiler-inserted safety paths to match exactly.
+    #[serde(default)]
+    pub control_flow_regions: Vec<MirControlFlowRegionSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MirControlFlowArmSummary {
+    pub entry_block: usize,
+    pub member_blocks: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MirControlFlowRegionSummary {
+    pub kind: ControlFlowRegionKind,
+    pub header_block: usize,
+    pub member_blocks: Vec<usize>,
+    pub entry_blocks: Vec<usize>,
+    pub exit_blocks: Vec<usize>,
+    pub join_block: Option<usize>,
+    pub arms: Vec<MirControlFlowArmSummary>,
+    pub cycle_edges: Vec<MirEdge>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1091,6 +1114,19 @@ pub struct MirFunctionEffectComparison {
     pub missing: Vec<RecoveredEffectKind>,
     pub dependency_mismatches: Vec<MirDependencyMismatch>,
     pub memory_write_mismatches: Vec<MirMemoryWriteMismatch>,
+    #[serde(default)]
+    pub region_mismatches: Vec<MirRegionMismatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MirRegionMismatch {
+    pub required_region_id: String,
+    pub kind: ControlFlowRegionKind,
+    pub required_entry_count: usize,
+    pub required_has_join: bool,
+    pub required_has_exit: bool,
+    pub observed_candidate_headers: Vec<usize>,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3645,6 +3681,7 @@ pub fn summarize_rustc_mir(source: &str) -> MirProgramSummary {
             builder.parameter_count,
             has_loop,
         );
+        let control_flow_regions = derive_mir_control_flow_regions(&builder.blocks, &edges);
         MirFunctionSummary {
             name: builder.name,
             parameter_count: builder.parameter_count,
@@ -3657,6 +3694,7 @@ pub fn summarize_rustc_mir(source: &str) -> MirProgramSummary {
             has_loop,
             effect_dependencies,
             memory_write_dependencies,
+            control_flow_regions,
         }
     }
 
@@ -3975,10 +4013,379 @@ fn mir_path_exists(edges: &[MirEdge], start: usize, goal: usize) -> bool {
     false
 }
 
-/// Compare compiler-produced MIR effect classes with deterministic SBPF
-/// obligations. This is deliberately a category-presence gate rather than an
-/// instruction-count comparison because one source loop or assignment can
-/// lower to many SBPF branches and stores.
+fn derive_mir_control_flow_regions(
+    blocks: &BTreeSet<usize>,
+    edges: &[MirEdge],
+) -> Vec<MirControlFlowRegionSummary> {
+    let Some(entry) = blocks.first().copied() else {
+        return Vec::new();
+    };
+    let successors = blocks
+        .iter()
+        .map(|block| {
+            let next = edges
+                .iter()
+                .filter(|edge| edge.source == *block && blocks.contains(&edge.destination))
+                .map(|edge| edge.destination)
+                .collect::<BTreeSet<_>>();
+            (*block, next)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut predecessors = blocks
+        .iter()
+        .map(|block| (*block, BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    for (source, destinations) in &successors {
+        for destination in destinations {
+            predecessors
+                .entry(*destination)
+                .or_default()
+                .insert(*source);
+        }
+    }
+    let reachable = mir_reachable_blocks(entry, &successors);
+    let dominators = mir_dominator_sets(entry, &reachable, &predecessors);
+
+    let mut loop_members = BTreeMap::<usize, BTreeSet<usize>>::new();
+    let mut loop_edges = BTreeMap::<usize, BTreeSet<MirEdge>>::new();
+    for source in &reachable {
+        for destination in successors.get(source).into_iter().flatten() {
+            if !dominators
+                .get(source)
+                .is_some_and(|set| set.contains(destination))
+            {
+                continue;
+            }
+            let members = loop_members.entry(*destination).or_default();
+            members.insert(*destination);
+            members.insert(*source);
+            let mut pending = vec![*source];
+            while let Some(block) = pending.pop() {
+                for predecessor in predecessors.get(&block).into_iter().flatten() {
+                    if reachable.contains(predecessor)
+                        && members.insert(*predecessor)
+                        && predecessor != destination
+                    {
+                        pending.push(*predecessor);
+                    }
+                }
+            }
+            loop_edges.entry(*destination).or_default().insert(MirEdge {
+                source: *source,
+                destination: *destination,
+            });
+        }
+    }
+
+    let mut regions = loop_members
+        .iter()
+        .map(|(header, members)| {
+            mir_loop_region(
+                *header,
+                members,
+                loop_edges.get(header).cloned().unwrap_or_default(),
+                &successors,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    // Rust source normally yields reducible loops. Keep a deterministic SCC
+    // fallback so unusual compiler CFGs are still represented rather than
+    // silently disappearing from the topology summary.
+    let mut assigned = BTreeSet::new();
+    for seed in &reachable {
+        if assigned.contains(seed) {
+            continue;
+        }
+        let forward = mir_reachable_blocks(*seed, &successors);
+        let members = forward
+            .into_iter()
+            .filter(|candidate| mir_path_exists(edges, *candidate, *seed))
+            .collect::<BTreeSet<_>>();
+        assigned.extend(members.iter().copied());
+        let recursive =
+            members.len() > 1 || successors.get(seed).is_some_and(|next| next.contains(seed));
+        if !recursive
+            || regions.iter().any(|region| {
+                region.kind == ControlFlowRegionKind::Loop
+                    && members
+                        .iter()
+                        .all(|block| region.member_blocks.contains(block))
+            })
+        {
+            continue;
+        }
+        let entries = members
+            .iter()
+            .filter(|block| {
+                predecessors
+                    .get(block)
+                    .into_iter()
+                    .flatten()
+                    .any(|predecessor| !members.contains(predecessor))
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let header = entries.first().copied().unwrap_or(*seed);
+        let cycle_edges = edges
+            .iter()
+            .filter(|edge| members.contains(&edge.source) && members.contains(&edge.destination))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        regions.push(mir_loop_region(header, &members, cycle_edges, &successors));
+    }
+
+    let loop_control_blocks = regions
+        .iter()
+        .filter(|region| region.kind == ControlFlowRegionKind::Loop)
+        .flat_map(|region| {
+            std::iter::once(region.header_block)
+                .chain(region.cycle_edges.iter().map(|edge| edge.source))
+        })
+        .collect::<BTreeSet<_>>();
+    let postdominators = mir_postdominator_sets(&reachable, &successors);
+    for header in &reachable {
+        if loop_control_blocks.contains(header) {
+            continue;
+        }
+        let entries = successors.get(header).cloned().unwrap_or_default();
+        if entries.len() < 2 {
+            continue;
+        }
+        let join = mir_immediate_postdominator(*header, &postdominators);
+        let mut members = BTreeSet::from([*header]);
+        let arms = entries
+            .iter()
+            .map(|entry| {
+                let arm_members =
+                    mir_reachable_before_join(*entry, join, *header, &reachable, &successors);
+                members.extend(arm_members.iter().copied());
+                MirControlFlowArmSummary {
+                    entry_block: *entry,
+                    member_blocks: arm_members.into_iter().collect(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let exit_blocks = if let Some(join) = join {
+            vec![join]
+        } else {
+            members
+                .iter()
+                .flat_map(|source| successors.get(source).into_iter().flatten())
+                .filter(|destination| !members.contains(destination))
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        regions.push(MirControlFlowRegionSummary {
+            kind: ControlFlowRegionKind::Branch,
+            header_block: *header,
+            member_blocks: members.into_iter().collect(),
+            entry_blocks: entries.into_iter().collect(),
+            exit_blocks,
+            join_block: join,
+            arms,
+            cycle_edges: Vec::new(),
+        });
+    }
+    regions.sort_by_key(|region| (region.header_block, region.kind));
+    regions
+}
+
+fn mir_reachable_blocks(
+    entry: usize,
+    successors: &BTreeMap<usize, BTreeSet<usize>>,
+) -> BTreeSet<usize> {
+    let mut reachable = BTreeSet::new();
+    let mut pending = vec![entry];
+    while let Some(block) = pending.pop() {
+        if !reachable.insert(block) {
+            continue;
+        }
+        pending.extend(successors.get(&block).into_iter().flatten().copied());
+    }
+    reachable
+}
+
+fn mir_dominator_sets(
+    entry: usize,
+    reachable: &BTreeSet<usize>,
+    predecessors: &BTreeMap<usize, BTreeSet<usize>>,
+) -> BTreeMap<usize, BTreeSet<usize>> {
+    let mut dominators = reachable
+        .iter()
+        .map(|block| {
+            let initial = if *block == entry {
+                BTreeSet::from([*block])
+            } else {
+                reachable.clone()
+            };
+            (*block, initial)
+        })
+        .collect::<BTreeMap<_, _>>();
+    loop {
+        let mut changed = false;
+        for block in reachable.iter().filter(|block| **block != entry) {
+            let incoming = predecessors
+                .get(block)
+                .into_iter()
+                .flatten()
+                .filter(|predecessor| reachable.contains(predecessor))
+                .collect::<Vec<_>>();
+            let mut next = incoming
+                .first()
+                .and_then(|first| dominators.get(*first))
+                .cloned()
+                .unwrap_or_default();
+            for predecessor in incoming.iter().skip(1) {
+                if let Some(set) = dominators.get(*predecessor) {
+                    next.retain(|candidate| set.contains(candidate));
+                }
+            }
+            next.insert(*block);
+            if dominators.get(block) != Some(&next) {
+                dominators.insert(*block, next);
+                changed = true;
+            }
+        }
+        if !changed {
+            return dominators;
+        }
+    }
+}
+
+fn mir_postdominator_sets(
+    reachable: &BTreeSet<usize>,
+    successors: &BTreeMap<usize, BTreeSet<usize>>,
+) -> BTreeMap<usize, BTreeSet<usize>> {
+    let exits = reachable
+        .iter()
+        .filter(|block| {
+            successors
+                .get(block)
+                .is_none_or(|next| next.iter().all(|successor| !reachable.contains(successor)))
+        })
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if exits.is_empty() {
+        return BTreeMap::new();
+    }
+    let mut postdominators = reachable
+        .iter()
+        .map(|block| {
+            let initial = if exits.contains(block) {
+                BTreeSet::from([*block])
+            } else {
+                reachable.clone()
+            };
+            (*block, initial)
+        })
+        .collect::<BTreeMap<_, _>>();
+    loop {
+        let mut changed = false;
+        for block in reachable.iter().filter(|block| !exits.contains(block)) {
+            let next_blocks = successors
+                .get(block)
+                .into_iter()
+                .flatten()
+                .filter(|successor| reachable.contains(successor))
+                .collect::<Vec<_>>();
+            let mut next = next_blocks
+                .first()
+                .and_then(|first| postdominators.get(*first))
+                .cloned()
+                .unwrap_or_default();
+            for successor in next_blocks.iter().skip(1) {
+                if let Some(set) = postdominators.get(*successor) {
+                    next.retain(|candidate| set.contains(candidate));
+                }
+            }
+            next.insert(*block);
+            if postdominators.get(block) != Some(&next) {
+                postdominators.insert(*block, next);
+                changed = true;
+            }
+        }
+        if !changed {
+            return postdominators;
+        }
+    }
+}
+
+fn mir_immediate_postdominator(
+    block: usize,
+    postdominators: &BTreeMap<usize, BTreeSet<usize>>,
+) -> Option<usize> {
+    let strict = postdominators
+        .get(&block)?
+        .iter()
+        .filter(|candidate| **candidate != block)
+        .copied()
+        .collect::<Vec<_>>();
+    strict.iter().find_map(|candidate| {
+        (!strict.iter().any(|other| {
+            other != candidate
+                && postdominators
+                    .get(other)
+                    .is_some_and(|set| set.contains(candidate))
+        }))
+        .then_some(*candidate)
+    })
+}
+
+fn mir_reachable_before_join(
+    entry: usize,
+    join: Option<usize>,
+    header: usize,
+    reachable: &BTreeSet<usize>,
+    successors: &BTreeMap<usize, BTreeSet<usize>>,
+) -> BTreeSet<usize> {
+    let mut members = BTreeSet::new();
+    let mut pending = vec![entry];
+    while let Some(block) = pending.pop() {
+        if block == header || join == Some(block) || !reachable.contains(&block) {
+            continue;
+        }
+        if !members.insert(block) {
+            continue;
+        }
+        pending.extend(successors.get(&block).into_iter().flatten().copied());
+    }
+    members
+}
+
+fn mir_loop_region(
+    header: usize,
+    members: &BTreeSet<usize>,
+    cycle_edges: BTreeSet<MirEdge>,
+    successors: &BTreeMap<usize, BTreeSet<usize>>,
+) -> MirControlFlowRegionSummary {
+    let exit_blocks = members
+        .iter()
+        .flat_map(|source| successors.get(source).into_iter().flatten())
+        .filter(|destination| !members.contains(destination))
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    MirControlFlowRegionSummary {
+        kind: ControlFlowRegionKind::Loop,
+        header_block: header,
+        member_blocks: members.iter().copied().collect(),
+        entry_blocks: vec![header],
+        exit_blocks,
+        join_block: None,
+        arms: Vec::new(),
+        cycle_edges: cycle_edges.into_iter().collect(),
+    }
+}
+
+/// Compare compiler-produced MIR effects and structured regions with
+/// deterministic SBPF obligations. Instruction counts and block identifiers
+/// are deliberately not compared because one source operation can lower to
+/// several compiler operations, but every recovered branch/loop region must
+/// have its own shape-compatible MIR region.
 pub fn compare_mir_effects(
     pack: &EvidencePack,
     summary: Option<&MirProgramSummary>,
@@ -4117,9 +4524,16 @@ pub fn compare_mir_effects(
                     .unwrap_or_default(),
             })
             .collect::<Vec<_>>();
+        let region_mismatches = compare_mir_regions(
+            &required_control_flow_regions(pack, &function.id),
+            candidate
+                .map(|candidate| candidate.control_flow_regions.as_slice())
+                .unwrap_or_default(),
+        );
         has_mismatch |= !missing.is_empty()
             || !dependency_mismatches.is_empty()
             || !memory_write_mismatches.is_empty()
+            || !region_mismatches.is_empty()
             || !summary
                 .functions
                 .iter()
@@ -4131,6 +4545,7 @@ pub fn compare_mir_effects(
             missing,
             dependency_mismatches,
             memory_write_mismatches,
+            region_mismatches,
         });
     }
     MirEffectComparison {
@@ -4142,10 +4557,188 @@ pub fn compare_mir_effects(
         },
         functions,
         limitations: vec![
-            "MIR effect coverage checks category presence, not semantic equivalence or one-to-one instruction lowering".into(),
+            "MIR validation checks effect/dependency coverage and one-to-one branch/loop region topology, not full semantic equivalence or one-to-one instruction lowering".into(),
+            "extra rustc regions are permitted for bounds checks, cleanup, and other compiler-introduced control flow, but cannot satisfy more than one binary-derived region".into(),
+            "region matching preserves branch arity, join/exit presence, and recovered region nesting while allowing compiler block identifiers and member counts to differ".into(),
             "memory-write target/value role signatures are checked per required SBPF store, but identical signatures may reuse one MIR assignment because one source assignment can lower to multiple stores".into(),
             "rustc textual MIR is parsed into a versioned SOS summary because the upstream text format is not stable".into(),
         ],
+    }
+}
+
+fn compare_mir_regions(
+    required: &[ControlFlowRegionContract],
+    observed: &[MirControlFlowRegionSummary],
+) -> Vec<MirRegionMismatch> {
+    let mut required_order = (0..required.len()).collect::<Vec<_>>();
+    required_order.sort_by_key(|index| {
+        (
+            std::cmp::Reverse(required[*index].member_blocks.len()),
+            required[*index].kind,
+            required[*index].header_block_id.clone(),
+        )
+    });
+    let mut used = BTreeSet::new();
+    let mut matched = BTreeMap::<usize, usize>::new();
+    let mut mismatches = BTreeMap::<usize, MirRegionMismatch>::new();
+
+    for required_index in required_order {
+        let contract = &required[required_index];
+        let mut compatible = observed
+            .iter()
+            .enumerate()
+            .filter(|(index, candidate)| {
+                !used.contains(index)
+                    && candidate.kind == contract.kind
+                    && mir_region_shape_reasons(contract, candidate).is_empty()
+                    && matched.iter().all(|(parent_required, parent_observed)| {
+                        !required[*parent_required]
+                            .member_blocks
+                            .contains(&contract.header_block_id)
+                            || observed[*parent_observed]
+                                .member_blocks
+                                .contains(&candidate.header_block)
+                    })
+            })
+            .map(|(index, candidate)| {
+                (
+                    contract
+                        .member_blocks
+                        .len()
+                        .abs_diff(candidate.member_blocks.len()),
+                    candidate.header_block,
+                    index,
+                )
+            })
+            .collect::<Vec<_>>();
+        compatible.sort_unstable();
+        if let Some((_, _, observed_index)) = compatible.first().copied() {
+            used.insert(observed_index);
+            matched.insert(required_index, observed_index);
+            continue;
+        }
+
+        let same_kind = observed
+            .iter()
+            .filter(|candidate| candidate.kind == contract.kind)
+            .collect::<Vec<_>>();
+        let mut reasons = same_kind
+            .iter()
+            .flat_map(|candidate| mir_region_shape_reasons(contract, candidate))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if same_kind.is_empty() {
+            reasons.push(format!("no {:?} MIR region was recovered", contract.kind));
+        } else if reasons.is_empty() {
+            reasons.push(
+                "all shape-compatible MIR regions were already used or violate recovered nesting"
+                    .into(),
+            );
+        }
+        mismatches.insert(
+            required_index,
+            mir_region_mismatch(contract, observed, reasons),
+        );
+    }
+
+    // Verify all pairwise containment relationships after matching. This
+    // catches flattened nested control flow as well as invented nesting among
+    // regions that were siblings in the binary CFG.
+    for (left_required, left_observed) in &matched {
+        for (right_required, right_observed) in &matched {
+            if left_required == right_required {
+                continue;
+            }
+            let required_contains = required[*left_required]
+                .member_blocks
+                .contains(&required[*right_required].header_block_id);
+            let observed_contains = observed[*left_observed]
+                .member_blocks
+                .contains(&observed[*right_observed].header_block);
+            if required_contains == observed_contains {
+                continue;
+            }
+            let reason = if required_contains {
+                format!(
+                    "MIR region does not preserve containment inside {}",
+                    required[*left_required].id
+                )
+            } else {
+                format!(
+                    "MIR region is unexpectedly nested inside {}",
+                    required[*left_required].id
+                )
+            };
+            mismatches
+                .entry(*right_required)
+                .or_insert_with(|| {
+                    mir_region_mismatch(&required[*right_required], observed, Vec::new())
+                })
+                .reasons
+                .push(reason);
+        }
+    }
+
+    mismatches.into_values().collect()
+}
+
+fn mir_region_shape_reasons(
+    required: &ControlFlowRegionContract,
+    observed: &MirControlFlowRegionSummary,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if required.kind != observed.kind {
+        reasons.push(format!(
+            "required {:?}, observed {:?}",
+            required.kind, observed.kind
+        ));
+        return reasons;
+    }
+    if required.entry_blocks.len() != observed.entry_blocks.len() {
+        reasons.push(format!(
+            "required {} entries/arms, observed {}",
+            required.entry_blocks.len(),
+            observed.entry_blocks.len()
+        ));
+    }
+    if required.join_block_id.is_some() != observed.join_block.is_some() {
+        reasons.push(format!(
+            "required join={}, observed join={}",
+            required.join_block_id.is_some(),
+            observed.join_block.is_some()
+        ));
+    }
+    if required.exit_blocks.is_empty() != observed.exit_blocks.is_empty() {
+        reasons.push(format!(
+            "required exit={}, observed exit={}",
+            !required.exit_blocks.is_empty(),
+            !observed.exit_blocks.is_empty()
+        ));
+    }
+    if required.kind == ControlFlowRegionKind::Loop && observed.cycle_edges.is_empty() {
+        reasons.push("observed loop has no cycle edge".into());
+    }
+    reasons
+}
+
+fn mir_region_mismatch(
+    required: &ControlFlowRegionContract,
+    observed: &[MirControlFlowRegionSummary],
+    reasons: Vec<String>,
+) -> MirRegionMismatch {
+    MirRegionMismatch {
+        required_region_id: required.id.clone(),
+        kind: required.kind,
+        required_entry_count: required.entry_blocks.len(),
+        required_has_join: required.join_block_id.is_some(),
+        required_has_exit: !required.exit_blocks.is_empty(),
+        observed_candidate_headers: observed
+            .iter()
+            .filter(|candidate| candidate.kind == required.kind)
+            .map(|candidate| candidate.header_block)
+            .collect(),
+        reasons,
     }
 }
 
@@ -6455,6 +7048,21 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
         assert_eq!(function.returns, 1);
         assert!(function.branch_terminators >= 2);
         assert!(function.has_loop);
+        assert_eq!(function.control_flow_regions.len(), 1);
+        assert_eq!(
+            function.control_flow_regions[0].kind,
+            ControlFlowRegionKind::Loop
+        );
+        assert_eq!(function.control_flow_regions[0].header_block, 1);
+        assert_eq!(function.control_flow_regions[0].member_blocks, vec![1, 2]);
+        assert_eq!(function.control_flow_regions[0].exit_blocks, vec![3]);
+        assert_eq!(
+            function.control_flow_regions[0].cycle_edges,
+            vec![MirEdge {
+                source: 2,
+                destination: 1
+            }]
+        );
         assert!(function.effect_dependencies.iter().any(|dependency| {
             dependency.kind == RecoveredEffectKind::MemoryWrite
                 && dependency.input_parameters == vec![1, 2, 3]
@@ -6515,6 +7123,177 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
     }
 
     #[test]
+    fn mir_region_comparison_preserves_nested_topology_and_allows_extra_regions() {
+        let nested_mir = r#"
+fn fn_80(_1: bool, _2: bool, _3: bool) -> () {
+    let mut _0: ();
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb7, otherwise: bb1];
+    }
+
+    bb1: {
+        switchInt(copy _2) -> [0: bb8, otherwise: bb2];
+    }
+
+    bb2: {
+        switchInt(copy _3) -> [0: bb4, otherwise: bb3];
+    }
+
+    bb3: {
+        goto -> bb2;
+    }
+
+    bb4: {
+        goto -> bb9;
+    }
+
+    bb7: {
+        goto -> bb9;
+    }
+
+    bb8: {
+        goto -> bb2;
+    }
+
+    bb9: {
+        return;
+    }
+}
+"#;
+        let summary = summarize_rustc_mir(nested_mir);
+        let function = &summary.functions[0];
+        assert_eq!(
+            function
+                .control_flow_regions
+                .iter()
+                .filter(|region| region.kind == ControlFlowRegionKind::Branch)
+                .count(),
+            2
+        );
+        assert_eq!(
+            function
+                .control_flow_regions
+                .iter()
+                .filter(|region| region.kind == ControlFlowRegionKind::Loop)
+                .count(),
+            1
+        );
+
+        let mut pack = empty_pack();
+        pack.task = ModelTask::Refinement;
+        pack.ir.functions[0].id = "fn_80".into();
+        pack.ir.operations.clear();
+        pack.control_flow_regions = vec![
+            ControlFlowRegionContract {
+                id: "region_branch_0".into(),
+                function_id: "fn_80".into(),
+                kind: ControlFlowRegionKind::Branch,
+                header_block_id: "bb_0".into(),
+                member_blocks: ["bb_0", "bb_1", "bb_2", "bb_3", "bb_4", "bb_7"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                entry_blocks: vec!["bb_1".into(), "bb_7".into()],
+                exit_blocks: vec!["bb_9".into()],
+                join_block_id: Some("bb_9".into()),
+                arms: vec![
+                    ControlFlowArmContract {
+                        entry_block_id: "bb_1".into(),
+                        member_blocks: vec!["bb_1".into(), "bb_2".into(), "bb_3".into()],
+                    },
+                    ControlFlowArmContract {
+                        entry_block_id: "bb_7".into(),
+                        member_blocks: vec!["bb_7".into()],
+                    },
+                ],
+                cycle_edges: Vec::new(),
+            },
+            ControlFlowRegionContract {
+                id: "region_loop_2".into(),
+                function_id: "fn_80".into(),
+                kind: ControlFlowRegionKind::Loop,
+                header_block_id: "bb_2".into(),
+                member_blocks: vec!["bb_2".into(), "bb_3".into()],
+                entry_blocks: vec!["bb_2".into()],
+                exit_blocks: vec!["bb_4".into()],
+                join_block_id: None,
+                arms: Vec::new(),
+                cycle_edges: vec![ControlFlowEdgeContract {
+                    source_block_id: "bb_3".into(),
+                    destination_block_id: "bb_2".into(),
+                }],
+            },
+        ];
+
+        let comparison = compare_mir_effects(&pack, Some(&summary));
+        assert_eq!(comparison.status, MirEffectComparisonStatus::Covered);
+        assert!(comparison.functions[0].region_mismatches.is_empty());
+
+        let mut missing_loop_exit = summary.clone();
+        missing_loop_exit.functions[0]
+            .control_flow_regions
+            .iter_mut()
+            .find(|region| region.kind == ControlFlowRegionKind::Loop)
+            .unwrap()
+            .exit_blocks
+            .clear();
+        let comparison = compare_mir_effects(&pack, Some(&missing_loop_exit));
+        assert_eq!(comparison.status, MirEffectComparisonStatus::Mismatch);
+        assert!(comparison.functions[0]
+            .region_mismatches
+            .iter()
+            .flat_map(|mismatch| &mismatch.reasons)
+            .any(|reason| reason.contains("required exit=true")));
+
+        let flattened_mir = r#"
+fn fn_80(_1: bool, _2: bool) -> () {
+    let mut _0: ();
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        goto -> bb3;
+    }
+
+    bb2: {
+        goto -> bb3;
+    }
+
+    bb3: {
+        goto -> bb4;
+    }
+
+    bb4: {
+        switchInt(copy _2) -> [0: bb6, otherwise: bb5];
+    }
+
+    bb5: {
+        goto -> bb4;
+    }
+
+    bb6: {
+        return;
+    }
+}
+"#;
+        let flattened = summarize_rustc_mir(flattened_mir);
+        let comparison = compare_mir_effects(&pack, Some(&flattened));
+        assert_eq!(comparison.status, MirEffectComparisonStatus::Mismatch);
+        assert!(
+            comparison.functions[0]
+                .region_mismatches
+                .iter()
+                .flat_map(|mismatch| &mismatch.reasons)
+                .any(|reason| { reason.contains("containment") || reason.contains("nesting") }),
+            "{:?}",
+            comparison.functions[0].region_mismatches
+        );
+    }
+
+    #[test]
     fn mir_effect_comparison_rejects_ledger_only_memory_writes() {
         let mut pack = empty_pack();
         pack.task = ModelTask::Refinement;
@@ -6540,6 +7319,7 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
                     value_input_parameters: Vec::new(),
                 }],
                 memory_write_dependencies: Vec::new(),
+                control_flow_regions: Vec::new(),
             }],
         };
         let comparison = compare_mir_effects(&pack, Some(&summary));
@@ -6598,6 +7378,7 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
                     target_input_parameters: vec![2],
                     value_input_parameters: vec![1],
                 }],
+                control_flow_regions: Vec::new(),
             }],
         };
 
@@ -6714,6 +7495,7 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
                         value_input_parameters: vec![2],
                     },
                 ],
+                control_flow_regions: Vec::new(),
             }],
         };
 

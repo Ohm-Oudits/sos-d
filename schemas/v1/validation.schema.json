@@ -38,7 +38,7 @@
         "mir_summary": {
           "type": ["object", "null"],
           "properties": {
-            "schema_version": {"const": 1},
+            "schema_version": {"enum": [1, 2]},
             "functions": {
               "type": "array",
               "items": {
@@ -87,6 +87,32 @@
                         "value_input_parameters": {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 5}}
                       }
                     }
+                  },
+                  "control_flow_regions": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "kind",
+                        "header_block",
+                        "member_blocks",
+                        "entry_blocks",
+                        "exit_blocks",
+                        "join_block",
+                        "arms",
+                        "cycle_edges"
+                      ],
+                      "properties": {
+                        "kind": {"enum": ["branch", "loop"]},
+                        "header_block": {"type": "integer", "minimum": 0},
+                        "member_blocks": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+                        "entry_blocks": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+                        "exit_blocks": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+                        "join_block": {"type": ["integer", "null"], "minimum": 0},
+                        "arms": {"type": "array"},
+                        "cycle_edges": {"type": "array"}
+                      }
+                    }
                   }
                 }
               }
@@ -99,7 +125,7 @@
     "mir_effects": {
       "type": ["object", "null"],
       "properties": {
-        "schema_version": {"const": 1},
+        "schema_version": {"enum": [1, 2]},
         "status": {"enum": ["covered", "mismatch", "not_available"]},
         "functions": {"type": "array"},
         "limitations": {"type": "array", "items": {"type": "string"}}

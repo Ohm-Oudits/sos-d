@@ -736,9 +736,18 @@ fn validate_command_inner(args: Vec<String>, announce_output: bool) -> ExitCode 
                                     mismatch.required_value_input_registers
                                 )
                             });
+                        let missing_regions = function.region_mismatches.iter().map(|mismatch| {
+                            format!(
+                                "candidate MIR does not preserve {:?} region {}: {}",
+                                mismatch.kind,
+                                mismatch.required_region_id,
+                                mismatch.reasons.join("; ")
+                            )
+                        });
                         missing_effects
                             .chain(missing_dependencies)
                             .chain(missing_write_roles)
+                            .chain(missing_regions)
                     })
                     .collect::<Vec<_>>();
                 let (behavioral_status, mut mismatches, mut limitations) =

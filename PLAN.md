@@ -120,6 +120,10 @@ Already implemented in this workspace:
   subprocess and emits a versioned result that keeps replay status separate; an
   optional `--trace` records observed replay comparison without calling it a
   candidate execution proof.
+- MIR summary/comparison schema v2 derives branch arms, joins, loop bodies,
+  exits, and cycle edges from compiler CFGs. It requires distinct compatible
+  regions and preserves nesting while allowing unmatched rustc safety/cleanup
+  regions; topology mismatches feed the bounded repair loop.
 - `sos judge` compares an original SBPF ELF with a recompiled candidate using
   deterministic name-independent function pairing, normalized instruction
   n-grams, instruction counts, CFG/call/memory shape, unmatched-function

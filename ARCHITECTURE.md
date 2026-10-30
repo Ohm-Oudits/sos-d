@@ -433,6 +433,13 @@ write's role signature, and validation requires every distinct SBPF store
 signature to appear in a MIR assignment. Identical signatures may reuse one MIR
 assignment because one source assignment can lower to several machine stores.
 
+The MIR adapter also derives a second structured CFG view using dominators,
+postdominators, natural backedges, and recursive SCC fallback. The validator
+matches binary-derived regions one-to-one against MIR regions, requiring branch
+arity, join/exit presence, loop cycle evidence, and recovered nesting to agree.
+Extra rustc safety or cleanup regions are retained as evidence and allowed to
+remain unmatched; they cannot be reused to cover a binary region.
+
 After a whole candidate is rebuilt with the pinned Solana/SBPF toolchain,
 `sos judge` provides a separate deterministic binary regression gate. It pairs
 functions without trusting names and scores normalized instruction n-grams,

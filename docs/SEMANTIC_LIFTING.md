@@ -377,6 +377,15 @@ by canonical SBPF IR. Missing categories are fed into bounded repair as external
 validation mismatches. Raw MIR is not persisted because rustc explicitly treats
 its textual representation as unstable.
 
+MIR summary schema v2 also derives structured regions from the compiler CFG.
+It records branch entries/arms, immediate postdominating joins, exits, natural
+loop backedges, and recursive SCC fallbacks. Validation assigns every
+binary-derived region to a distinct shape-compatible MIR region, preserves
+parent/child containment, and rejects flattened loops or changed join/exit
+behavior. Additional compiler-generated regions are allowed, since bounds
+checks, unwinding, and cleanup can add CFG nodes that did not exist as explicit
+source constructs.
+
 The same comparison carries positional data dependencies. SOS taints incoming
 SBPF registers `r1` through `r5`, propagates those identities through register
 moves, arithmetic, loads, CFG joins, and recursive blocks, and records the input
@@ -430,7 +439,8 @@ and automatic pinned candidate rebuilding are implemented. The rebuild gate
 rejects toolchain drift, requires a lockfile, captures bounded build provenance,
 and prevents stale candidate reuse. Memory-write dependencies now distinguish
 destination-address inputs from stored-value inputs across SBPF and MIR, and
-distinct per-write role signatures are checked independently. The remaining
-judge work is type-layout verification, byte-offset/field correspondence,
-stronger call-graph non-regression constraints, and multi-transaction path
-coverage.
+distinct per-write role signatures are checked independently. Compiler CFG
+validation now additionally requires one-to-one branch/loop region coverage,
+branch arity, joins/exits, and nesting. The remaining judge work is type-layout
+verification, byte-offset/field correspondence, stronger call-graph
+non-regression constraints, and multi-transaction path coverage.

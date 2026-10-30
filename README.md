@@ -209,7 +209,12 @@ inputs influence the destination address and which influence the stored value,
 so swapping an account pointer with its data is rejected even when the same
 inputs remain present overall. Distinct store role signatures are checked
 separately, preventing two crossed writes from passing merely because their
-aggregate target and value sets look correct. MIR coverage is still a structural
+aggregate target and value sets look correct. The MIR summary also independently
+recovers branch arms, postdominating joins, natural/SCC loops, cycle edges, and
+loop exits. Every binary-derived control-flow region must match a distinct MIR
+region with the same branch arity and join/exit shape, and nested regions must
+remain nested. Extra rustc regions from bounds checks or cleanup are allowed but
+cannot be reused to satisfy binary contracts. MIR coverage is still a structural
 non-regression check, not a claim of semantic equivalence.
 
 ### Local open-weight semantic lifting

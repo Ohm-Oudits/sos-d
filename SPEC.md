@@ -180,6 +180,12 @@ Incoming SBPF argument identities must be conservatively propagated through
 register operations, loads, loops, and CFG joins. For each effect class, every
 deterministically required input dependency must appear in the corresponding
 candidate MIR effect; dropped dependencies are repairable mismatches.
+The MIR summary must independently derive branch and loop regions. Every
+binary-derived region must match a distinct candidate region with compatible
+branch arity, join presence, exit presence, cycle evidence, and parent/child
+containment. Compiler-introduced regions may remain unmatched, but one MIR
+region must not satisfy multiple binary contracts. Region mismatches must be
+returned to bounded repair.
 
 Each stage returns strict JSON. Inputs are tagged as untrusted data, and model output
 cannot alter facts, evidence references, or confidence values directly.
