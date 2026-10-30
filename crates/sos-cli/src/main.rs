@@ -46,9 +46,9 @@ use sos_types::{ArtifactManifest, ProgramArtifact};
 mod qualification;
 mod rebuild;
 
-const HUMANIZATION_PROMPT_VERSION: &str = "sos-v2";
+const HUMANIZATION_PROMPT_VERSION: &str = "sos-v3";
 const DETERMINISTIC_HUMANIZER_ID: &str = "sos-deterministic-syntax-v1";
-const HUMANIZATION_CACHE_SCHEMA_VERSION: u32 = 2;
+const HUMANIZATION_CACHE_SCHEMA_VERSION: u32 = 3;
 const HUMANIZATION_CACHE_RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v13";
 const LIFT_CACHE_SCHEMA_VERSION: u32 = 14;
@@ -2217,6 +2217,21 @@ fn build_humanization_plan(
     let mut planned_units = Vec::with_capacity(units.len());
     for (unit_index, unit) in units.iter().enumerate() {
         let pack = evidence_pack_from_pseudocode_unit(unit).map_err(|error| error.to_string())?;
+        let symbol_contracts = pack
+            .pseudocode_obligations
+            .iter()
+            .filter(|obligation| {
+                obligation.declared_function.is_some() || !obligation.called_functions.is_empty()
+            })
+            .map(|obligation| {
+                serde_json::json!({
+                    "obligation_id": obligation.id,
+                    "source_line": obligation.source_line,
+                    "declared_function": &obligation.declared_function,
+                    "called_functions": &obligation.called_functions,
+                })
+            })
+            .collect::<Vec<_>>();
         planned_units.push(serde_json::json!({
             "id": unit.id,
             "start_line": unit.start_line,
@@ -2224,13 +2239,14 @@ fn build_humanization_plan(
             "function_id": pack.ir.functions.first().map(|function| &function.id),
             "function_name": unit.function_name,
             "referenced_functions": unit.referenced_functions,
+            "symbol_contracts": symbol_contracts,
             "operation_count": pack.ir.operations.len(),
             "unit_sha256": pack.artifact_sha256,
             "processing_position": processing_positions.get(&unit_index),
         }));
     }
     Ok(serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "mode": "plan_only_no_inference",
         "source_sha256": sha256_hex(source.as_bytes()),
         "unit_count": units.len(),
@@ -4747,10 +4763,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        lift_function_plan, run_deterministic_humanization, run_humanization_units,
-        run_lift_bundle, transaction_account_addresses, BenchmarkOptions, ExplainOptions,
-        HumanizationCache, HumanizeOptions, JudgeOptions, LiftCheckpointCache, LiftOptions,
-        LiftProvider, LiftRunConfig, RemoteOptions, UnavailableHostedProvider,
+        build_humanization_plan, lift_function_plan, run_deterministic_humanization,
+        run_humanization_units, run_lift_bundle, transaction_account_addresses, BenchmarkOptions,
+        ExplainOptions, HumanizationCache, HumanizeOptions, JudgeOptions, LiftCheckpointCache,
+        LiftOptions, LiftProvider, LiftRunConfig, RemoteOptions, UnavailableHostedProvider,
         DETERMINISTIC_HUMANIZER_ID, GROQ_GPT_OSS_120B, HUGGING_FACE_GPT_OSS_120B,
     };
     use sos_ai::{
@@ -4776,7 +4792,11 @@ mod tests {
                     "if unknown_condition_{suffix}() {{ unknown_branch_{suffix}(); }}"
                 ));
             }
+            for called_function in &obligation.called_functions {
+                statements.push(format!("{called_function}();"));
+            }
             if has(PseudocodeConstruct::Call)
+                && obligation.called_functions.is_empty()
                 && !statements.iter().any(|statement| statement.contains('('))
             {
                 statements.push(format!("unknown_call_{suffix}();"));
@@ -4796,15 +4816,15 @@ mod tests {
                 statements.push(format!("let recovered_{suffix} = ();"));
             }
             let fragment = if has(PseudocodeConstruct::FunctionDeclaration) {
+                let declaration_name = obligation
+                    .declared_function
+                    .clone()
+                    .unwrap_or_else(|| format!("recovered_{}", function.name));
                 if statements.is_empty() {
                     open_declaration = true;
-                    format!("fn recovered_{}() {{", function.name)
+                    format!("fn {declaration_name}() {{")
                 } else {
-                    format!(
-                        "fn recovered_{}() {{ {} }}",
-                        function.name,
-                        statements.join(" ")
-                    )
+                    format!("fn {declaration_name}() {{ {} }}", statements.join(" "))
                 }
             } else {
                 statements.join(" ")
@@ -5325,6 +5345,23 @@ mod tests {
             "513".into(),
         ])
         .is_err());
+    }
+
+    #[test]
+    fn humanization_plan_exposes_exact_textual_symbol_contracts() {
+        let source =
+            "undefined8 helper()\n{\n  return 7;\n}\nundefined8 caller()\n{\n  return helper();\n}";
+        let units = sos_ai::partition_pseudocode(source).unwrap();
+        let plan = build_humanization_plan(source, &units).unwrap();
+        assert_eq!(plan["schema_version"], 2);
+        assert_eq!(
+            plan["units"][1]["symbol_contracts"][0]["declared_function"],
+            "caller"
+        );
+        assert_eq!(
+            plan["units"][1]["symbol_contracts"][1]["called_functions"][0],
+            "helper"
+        );
     }
 
     #[test]

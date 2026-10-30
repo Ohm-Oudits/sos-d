@@ -361,6 +361,14 @@ transaction only covers one path and one state.
 The AI subsystem should consume a bounded evidence package, not arbitrary raw chain
 content. Each agent returns strict JSON with evidence references.
 
+For textual output imported from another decompiler, SOS first derives source-line
+obligations and a known-symbol graph. Evidence-pack v6 binds declaration identities
+and recognized cross-function calls to exact lines. The model may restructure bodies
+and improve local names, but the gateway rejects any response that renames a bound
+function or redirects a bound callee. A no-inference planning view exposes those
+contracts and schedules callees before callers, mirroring Patina's name/signature
+handoff before body recovery.
+
 #### Agent A: Structure recovery
 
 Input: function IR, CFG, stack/frame facts, memory accesses, syscall calls.

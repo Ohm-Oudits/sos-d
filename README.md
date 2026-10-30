@@ -476,6 +476,11 @@ at most 128 evidence operations, following the GoonFi/Patina workflow. Hosted
 rate-limit pacing applies between units. A run defaults to at most 16 units;
 review the partition and pass `--max-units N` to authorize a larger run.
 Detected function names and known call relationships are attached to each unit.
+Evidence-pack v6 turns those relationships into exact textual symbol contracts:
+the mapped declaration must retain its known function identity and every mapped
+cross-function call must retain the known callee. The model may improve local names,
+but it cannot silently redirect a call or rename one function differently across
+units.
 Up to two accepted earlier reconstructions are supplied to the next unit as
 explicitly untrusted context; deterministic line evidence remains authoritative.
 Dependency units are processed before callers even when file order is reversed,
@@ -494,8 +499,8 @@ audit. A checked example is
 next to the audit output). On restart, SOS verifies the source, provider, model,
 prompt, unit hash, complete staged evidence-pack hash, output schema,
 anti-cheese rules, every source-obligation mapping, and every evidence reference
-before reuse. Humanization prompt/cache v2 prevents older citation-only
-checkpoints from being reused. Stale or edited
+before reuse. Humanization prompt/cache v3 prevents checkpoints created before
+exact declaration/callee contracts from being reused. Stale or edited
 checkpoints are ignored and recomputed. Use `--cache-dir DIR` with `--resume`
 to choose a stable location. A fully cached hosted run can be reconstructed
 without the selected provider credential; any cache miss

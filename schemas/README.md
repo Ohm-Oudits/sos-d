@@ -7,8 +7,8 @@ tooling. The replay trace is v2 because account-state provenance was added after
 the original trace contract. AI pipeline bundle v3 introduced an
 evidence-constrained signature-recovery stage between structure recovery and
 semantic labeling; v2 had added each stage's enforced output-token budget in
-addition to model identity. The current v8 contract enforces the v5 evidence
-pack with compiler-verifiable memory layouts and resolved internal calls.
+addition to model identity. The current evidence-pack contract is v6; AI-bundle v8
+continues to carry compiler-verifiable memory layouts and resolved internal calls.
 Evidence-pack v2 introduced gateway-accepted signature hypotheses that are
 carried as response-hash-bound contracts that later source stages must preserve.
 For textual pseudocode, it also carries deterministic source-line obligations
@@ -32,6 +32,9 @@ Evidence-pack v5 adds exact resolved internal-call contracts. Refinement schema
 v3 maps those contracts to source calls, while validation schema v2 and MIR
 summary/comparison v3 record and enforce compiled call targets. AI-bundle v8
 invalidates checkpoints that predate these call-edge obligations.
+Evidence-pack v6 adds exact textual function-declaration and known-callee identities
+to pseudocode source obligations. Humanization output must preserve these symbols in
+the mapped code fragments, following Patina's signature/name-before-body discipline.
 Static-analysis and canonical-IR v1 also permit additive `target_pcs` and
 `call_target_pcs` arrays. `target_pc` remains the proven singleton field;
 candidate arrays are bounded, potentially incomplete points-to evidence and must

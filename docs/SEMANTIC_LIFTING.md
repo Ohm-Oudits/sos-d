@@ -287,7 +287,10 @@ reviewable and within hosted token limits. The CLI defaults to 16 units per run
 and requires an explicit `--max-units N` increase for larger submissions.
 
 The partitioner extracts conservative function symbols and calls to other known
-symbols. Each synthetic IR function keeps its recovered name. Accepted output
+symbols. Evidence-pack v6 attaches exact declaration and known-callee identities to
+the corresponding source obligations. The gateway rejects a humanization response
+that renames a known function or redirects/omits a known cross-function call. Each
+synthetic IR function keeps its recovered name. Accepted output
 from up to two earlier units is passed to the next request as bounded, explicitly
 untrusted context, following the iterative GoonFi/Patina pattern without allowing
 model output to replace line-level evidence. A deterministic dependency walk
@@ -298,8 +301,8 @@ For interruption-safe hosted runs, `--resume` checkpoints a unit only after the
 gateway accepts its schema and evidence references. Before reuse, SOS rebuilds
 the current evidence pack and verifies the source, provider, model, prompt,
 unit hash, full staged request hash, anti-cheese constraints, and evidence
-references, including every source-obligation mapping. Humanization prompt and
-cache schema v2 invalidate checkpoints produced before this coverage contract.
+references, including every source-obligation and symbol mapping. Humanization prompt
+and cache schema v3 invalidate checkpoints produced before the symbol contract.
 Invalid or stale records are warned about and recomputed rather
 than trusted. The default directory is derived from `--audit-out`; specify
 `--cache-dir DIR` for a stable path. Checkpoints contain no API credentials.

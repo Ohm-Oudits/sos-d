@@ -89,6 +89,9 @@ Already implemented in this workspace:
   including evidence-linked type spelling, guards, returns, pointer reads/writes,
   calls, explicit untranslated-line preservation, and an audited fallback path
   for unavailable or rejected hosted inference.
+- Evidence-pack v6 textual symbol contracts bind known function declarations and
+  cross-function callees to exact source obligations, preventing a humanization
+  model from silently renaming or redirecting whole-program call relationships.
 - Local model subprocesses have bounded wall-clock execution and convert stalls into
   explicit unavailable stage results.
 - AI gateway exposes bounded retry for transient provider and validation failures;

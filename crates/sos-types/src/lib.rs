@@ -177,6 +177,10 @@ mod tests {
                 include_str!("../../../schemas/v5/evidence-pack.schema.json"),
                 5,
             ),
+            (
+                include_str!("../../../schemas/v6/evidence-pack.schema.json"),
+                6,
+            ),
             (include_str!("../../../schemas/v1/ai-bundle.schema.json"), 1),
             (include_str!("../../../schemas/v2/ai-bundle.schema.json"), 2),
             (include_str!("../../../schemas/v3/ai-bundle.schema.json"), 3),

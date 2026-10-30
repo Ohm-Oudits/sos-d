@@ -242,6 +242,15 @@ prompt identity, stage order, request and response hashes, schema constraints,
 anti-cheese rules, and evidence references. Credentials must never enter cache
 records.
 
+Textual pseudocode humanization must derive immutable line-level obligations before
+inference. In addition to control-flow, call, write, return, and statement coverage,
+the evidence pack must bind every recognized function declaration and call to another
+recognized function to its exact symbol identity. Accepted output must map each
+obligation to a unique concrete code fragment; a model response that renames a known
+function inconsistently or redirects/omits a known callee must be rejected. Local and
+parameter names may remain model hypotheses. Planning mode must expose the dependency
+order and symbol contracts without contacting a provider.
+
 Validation is an external trust boundary. `sos validate` may compile accepted
 refinement snippets in a bounded, non-executing `rustc` subprocess and may compare
 observed replay traces when a trace is supplied. It emits `validation.json` with

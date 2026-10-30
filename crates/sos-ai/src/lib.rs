@@ -36,7 +36,7 @@ pub use huggingface::{HuggingFaceModelProvider, HUGGING_FACE_GPT_OSS_120B};
 pub use ollama::{trusted_open_model, OllamaModelProvider, OpenModelProfile, TRUSTED_OPEN_MODELS};
 pub use openai::OpenAiModelProvider;
 
-pub const AI_SCHEMA_VERSION: u32 = 5;
+pub const AI_SCHEMA_VERSION: u32 = 6;
 pub const AI_BUNDLE_SCHEMA_VERSION: u32 = 8;
 pub const MIN_STAGE_OUTPUT_TOKENS: usize = 128;
 pub const MAX_STAGE_OUTPUT_TOKENS: usize = 32_768;
@@ -1584,6 +1584,15 @@ pub struct PseudocodeObligation {
     pub source_sha256: String,
     pub operation_ids: Vec<String>,
     pub constructs: Vec<PseudocodeConstruct>,
+    /// Exact source-level function identity introduced by this line. Body
+    /// reconstruction may improve local names, but it may not silently rename
+    /// a known function and break whole-program call consistency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_function: Option<String>,
+    /// Exact known function identities called by this source line. These are
+    /// deterministic symbol contracts, not semantic guesses about the callee.
+    #[serde(default)]
+    pub called_functions: Vec<String>,
 }
 
 /// Evidence-preserving syntax normalization used when semantic model inference
@@ -2395,9 +2404,23 @@ fn pseudocode_function_name(line: &str) -> Option<String> {
 }
 
 fn contains_pseudocode_call(source: &str, function_name: &str) -> bool {
-    let needle = format!("{function_name}(");
-    let spaced = format!("{function_name} (");
-    source.contains(&needle) || source.contains(&spaced)
+    pseudocode_named_call_occurrences(source, function_name) > 0
+}
+
+fn pseudocode_named_call_occurrences(source: &str, function_name: &str) -> usize {
+    source
+        .match_indices(function_name)
+        .filter(|(index, _)| {
+            let before = source[..*index].chars().next_back();
+            let after_index = index + function_name.len();
+            let after = source[after_index..].chars().next();
+            let identifier =
+                |character: char| character.is_ascii_alphanumeric() || character == '_';
+            !before.is_some_and(identifier)
+                && !after.is_some_and(identifier)
+                && source[after_index..].trim_start().starts_with('(')
+        })
+        .count()
 }
 
 /// Produce a deterministic pseudo-Rust baseline without invoking a model.
@@ -3087,6 +3110,12 @@ fn build_pseudocode_obligations(
             pseudocode_label(line).map(|label| (label, unit.start_line + index))
         })
         .collect::<BTreeMap<_, _>>();
+    let mut known_functions = unit.referenced_functions.clone();
+    if let Some(function_name) = &unit.function_name {
+        known_functions.push(function_name.clone());
+    }
+    known_functions.sort();
+    known_functions.dedup();
     lines
         .iter()
         .enumerate()
@@ -3096,6 +3125,20 @@ fn build_pseudocode_obligations(
             if constructs.is_empty() {
                 return None;
             }
+            let declared_function = constructs
+                .contains(&PseudocodeConstruct::FunctionDeclaration)
+                .then(|| pseudocode_function_name(source))
+                .flatten();
+            let called_functions = known_functions
+                .iter()
+                .filter(|function_name| {
+                    let declaration_occurrence =
+                        usize::from(declared_function.as_deref() == Some(function_name.as_str()));
+                    pseudocode_named_call_occurrences(source, function_name)
+                        > declaration_occurrence
+                })
+                .cloned()
+                .collect::<Vec<_>>();
             let operation_ids = operations
                 .iter()
                 .filter(|operation| (operation.pc >> 8) + 1 == source_line)
@@ -3107,6 +3150,8 @@ fn build_pseudocode_obligations(
                 source_sha256: sha256_bytes(source.as_bytes()),
                 operation_ids,
                 constructs,
+                declared_function,
+                called_functions,
             })
         })
         .collect()
@@ -6861,6 +6906,22 @@ fn validate_pseudocode_humanization_candidate(
                 )));
             }
         }
+        if let Some(declared_function) = &obligation.declared_function {
+            if !fragment_declares_function(fragment, declared_function) {
+                return Err(AiError::InvalidResponse(format!(
+                    "humanization mapping {} renames or omits declared function {}; exact symbol identity is required",
+                    mapping.obligation_id, declared_function
+                )));
+            }
+        }
+        for called_function in &obligation.called_functions {
+            if !fragment_calls_function(fragment, called_function) {
+                return Err(AiError::InvalidResponse(format!(
+                    "humanization mapping {} redirects or omits call to known function {}; exact callee identity is required",
+                    mapping.obligation_id, called_function
+                )));
+            }
+        }
     }
     let missing = obligations
         .keys()
@@ -6875,6 +6936,18 @@ fn validate_pseudocode_humanization_candidate(
         )));
     }
     Ok(())
+}
+
+fn fragment_declares_function(fragment: &str, function_name: &str) -> bool {
+    fragment.lines().any(|line| {
+        contains_pseudocode_keyword(&line.to_ascii_lowercase(), "fn")
+            && pseudocode_function_name(line).as_deref() == Some(function_name)
+    })
+}
+
+fn fragment_calls_function(fragment: &str, function_name: &str) -> bool {
+    let declaration_occurrence = usize::from(fragment_declares_function(fragment, function_name));
+    pseudocode_named_call_occurrences(fragment, function_name) > declaration_occurrence
 }
 
 fn fragment_realizes_construct(fragment: &str, construct: PseudocodeConstruct) -> bool {
@@ -7470,7 +7543,11 @@ mod tests {
                     "if unknown_condition_{suffix}() {{ unknown_branch_{suffix}(); }}"
                 ));
             }
+            for called_function in &obligation.called_functions {
+                statements.push(format!("{called_function}();"));
+            }
             if has(PseudocodeConstruct::Call)
+                && obligation.called_functions.is_empty()
                 && !statements.iter().any(|statement| statement.contains('('))
             {
                 statements.push(format!("unknown_call_{suffix}();"));
@@ -7490,14 +7567,15 @@ mod tests {
                 statements.push(format!("let recovered_{suffix} = ();"));
             }
             let fragment = if has(PseudocodeConstruct::FunctionDeclaration) {
+                let declaration_name = obligation
+                    .declared_function
+                    .clone()
+                    .unwrap_or_else(|| format!("recovered_{function_id}"));
                 if statements.is_empty() {
                     open_declaration = true;
-                    format!("fn recovered_{function_id}() {{")
+                    format!("fn {declaration_name}() {{")
                 } else {
-                    format!(
-                        "fn recovered_{function_id}() {{ {} }}",
-                        statements.join(" ")
-                    )
+                    format!("fn {declaration_name}() {{ {} }}", statements.join(" "))
                 }
             } else {
                 statements.join(" ")
@@ -10593,6 +10671,84 @@ fn fn_80(_1: bool, _2: bool) -> () {
             .unwrap_err()
             .to_string()
             .contains("does not visibly preserve Branch"));
+    }
+
+    #[test]
+    fn humanization_preserves_known_declarations_and_cross_function_calls() {
+        let source =
+            "undefined8 helper()\n{\n  return 7;\n}\nundefined8 caller()\n{\n  return helper();\n}";
+        let units = partition_pseudocode(source).unwrap();
+        let pack = evidence_pack_from_pseudocode_unit(&units[1]).unwrap();
+        assert_eq!(
+            pack.pseudocode_obligations[0].declared_function.as_deref(),
+            Some("caller")
+        );
+        assert_eq!(
+            pack.pseudocode_obligations[1].called_functions,
+            vec!["helper"]
+        );
+        let function_id = pack.ir.functions[0].id.clone();
+        let request = ModelRequest {
+            task: ModelTask::PseudocodeHumanization,
+            prompt_version: "sos-v3".into(),
+            model: "test".into(),
+            evidence_pack: pack,
+            max_output_bytes: 10_000,
+            max_output_tokens: default_stage_output_tokens(ModelTask::PseudocodeHumanization),
+        };
+        let valid = test_humanization_output(
+            &request.evidence_pack,
+            &function_id,
+            serde_json::json!({
+                "source": "ir",
+                "location": format!("function:{function_id}"),
+                "detail": null
+            }),
+        );
+        assert!(validate_structured_consistency(&request, &valid).is_ok());
+
+        let mut redirected_call = valid.clone();
+        for field in ["pseudocode", "source_mappings"] {
+            let value = &mut redirected_call["functions"][0][field];
+            if let Some(source) = value.as_str() {
+                *value = serde_json::json!(source.replace("helper()", "other_helper()"));
+            } else if let Some(mappings) = value.as_array_mut() {
+                for mapping in mappings {
+                    if let Some(fragment) = mapping["output_fragment"].as_str() {
+                        mapping["output_fragment"] =
+                            serde_json::json!(fragment.replace("helper()", "other_helper()"));
+                    }
+                }
+            }
+        }
+        assert!(validate_structured_consistency(&request, &redirected_call)
+            .unwrap_err()
+            .to_string()
+            .contains("exact callee identity"));
+
+        let mut renamed_declaration = valid;
+        let pseudocode = renamed_declaration["functions"][0]["pseudocode"]
+            .as_str()
+            .unwrap()
+            .replace("fn caller", "fn renamed_caller");
+        renamed_declaration["functions"][0]["pseudocode"] = serde_json::json!(pseudocode);
+        let declaration_mapping = renamed_declaration["functions"][0]["source_mappings"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|mapping| mapping["obligation_id"] == "source_line_0005")
+            .unwrap();
+        let fragment = declaration_mapping["output_fragment"]
+            .as_str()
+            .unwrap()
+            .replace("fn caller", "fn renamed_caller");
+        declaration_mapping["output_fragment"] = serde_json::json!(fragment);
+        assert!(
+            validate_structured_consistency(&request, &renamed_declaration)
+                .unwrap_err()
+                .to_string()
+                .contains("exact symbol identity")
+        );
     }
 
     #[test]
