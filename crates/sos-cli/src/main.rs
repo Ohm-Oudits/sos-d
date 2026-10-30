@@ -50,8 +50,8 @@ const HUMANIZATION_PROMPT_VERSION: &str = "sos-v2";
 const DETERMINISTIC_HUMANIZER_ID: &str = "sos-deterministic-syntax-v1";
 const HUMANIZATION_CACHE_SCHEMA_VERSION: u32 = 2;
 const HUMANIZATION_CACHE_RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
-const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v9";
-const LIFT_CACHE_SCHEMA_VERSION: u32 = 10;
+const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v10";
+const LIFT_CACHE_SCHEMA_VERSION: u32 = 11;
 const LIFT_CACHE_RECORD_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 fn main() -> ExitCode {
@@ -5520,6 +5520,7 @@ mod tests {
                                 region_headers.join("\n")
                             ),
                             "control_flow_mappings": control_flow_mappings,
+                            "memory_field_mappings": [],
                             "effects": required_effects,
                             "evidence": [{
                                 "source": "ir",
@@ -5554,6 +5555,7 @@ mod tests {
                         "patches": [{
                             "function_id": function_id,
                             "replacement": format!("fn {function_id}() -> unknown {{}}"),
+                            "memory_field_mappings": [],
                             "evidence": [{
                                 "source": "ir",
                                 "location": format!("operation:{operation_id}"),

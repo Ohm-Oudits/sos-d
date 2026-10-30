@@ -237,6 +237,15 @@ is also constrained by a conservative SBPF live-in analysis: every incoming
 model parameter and cited at its first-use instruction. Names and types remain
 explicit hypotheses; the register mapping is deterministic evidence.
 
+Evidence-pack schema v3 additionally derives immutable fixed-offset memory-field
+contracts. Each contract records its function, logical offset, observed machine
+offset, access widths/kinds/PCs, conservative field path, and exact instruction
+evidence. Fully recognized stack-materialized `SolAccountInfo` records use paths
+such as `account_0.is_signer`; unresolved accesses retain neutral names such as
+`unknown_memory_r1.field_pos_0x8`. Both structure and final refinement output
+must map every contract to a unique source expression and may not replace an
+unknown field with an unsupported semantic guess.
+
 ```bash
 ollama pull gpt-oss:20b
 cargo run -p sos-cli -- lift ./analysis \

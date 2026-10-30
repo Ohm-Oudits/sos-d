@@ -1,13 +1,14 @@
 # SOS JSON contracts
 
-The files in `schemas/v1/`, `schemas/v2/`, and `schemas/v3/` are the public, forward-compatible
+The files under `schemas/v*/` are the public, forward-compatible
 JSON contracts for SOS bundles. The Rust structs remain the source of serialization
 behavior; these schemas document the wire format for external consumers and CI
 tooling. The replay trace is v2 because account-state provenance was added after
-the original trace contract. The AI pipeline bundle is v3 because an
-evidence-constrained signature-recovery stage now sits between structure
-recovery and semantic labeling. Version 2 added each stage's enforced
-output-token budget in addition to model identity.
+the original trace contract. AI pipeline bundle v3 introduced an
+evidence-constrained signature-recovery stage between structure recovery and
+semantic labeling; v2 had added each stage's enforced output-token budget in
+addition to model identity. The current v6 contract also enforces the v3
+memory-layout evidence pack described below.
 The evidence pack is v2 because gateway-accepted signature hypotheses are
 carried as response-hash-bound contracts that later source stages must preserve.
 For textual pseudocode, it also carries deterministic source-line obligations
@@ -17,6 +18,11 @@ For binary structure recovery, it carries deterministic CFG region contracts
 for branch arms/joins and loop bodies/exits/cycle edges. These contracts are
 derived from dominators, postdominators, backedges, and recursive SCCs and must
 map to distinct source headers in accepted model output.
+Evidence-pack v3 adds immutable fixed-offset memory-field contracts. It records
+logical and observed machine offsets, widths, access kinds/PCs, conservative
+field paths, and whether a semantic SolAccountInfo name was deterministically
+recovered. AI-bundle v6 invalidates older checkpoints that did not prove these
+contracts in both structure and refinement output.
 
 Compatibility rules:
 

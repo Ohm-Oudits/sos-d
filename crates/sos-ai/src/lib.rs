@@ -36,8 +36,8 @@ pub use huggingface::{HuggingFaceModelProvider, HUGGING_FACE_GPT_OSS_120B};
 pub use ollama::{trusted_open_model, OllamaModelProvider, OpenModelProfile, TRUSTED_OPEN_MODELS};
 pub use openai::OpenAiModelProvider;
 
-pub const AI_SCHEMA_VERSION: u32 = 2;
-pub const AI_BUNDLE_SCHEMA_VERSION: u32 = 5;
+pub const AI_SCHEMA_VERSION: u32 = 3;
+pub const AI_BUNDLE_SCHEMA_VERSION: u32 = 6;
 pub const MIN_STAGE_OUTPUT_TOKENS: usize = 128;
 pub const MAX_STAGE_OUTPUT_TOKENS: usize = 32_768;
 
@@ -226,6 +226,11 @@ pub struct RecoveredFunction {
     /// distinct regions with one generic `if` or `loop` token.
     #[serde(default)]
     pub control_flow_mappings: Vec<RecoveredControlFlowMapping>,
+    /// One evidence-backed source expression for every deterministic fixed
+    /// memory field used by this function. Known SolAccountInfo fields retain
+    /// their recovered names; unresolved offsets use stable unknown names.
+    #[serde(default)]
+    pub memory_field_mappings: Vec<RecoveredMemoryFieldMapping>,
     #[serde(default)]
     pub effects: Vec<RecoveredEffect>,
     #[serde(default)]
@@ -241,6 +246,16 @@ pub struct RecoveredSourceMapping {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveredControlFlowMapping {
     pub region_id: String,
+    pub output_fragment: String,
+    #[serde(default)]
+    pub evidence: Vec<sos_types::EvidenceRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveredMemoryFieldMapping {
+    pub contract_id: String,
+    pub field_path: String,
+    pub type_name: String,
     pub output_fragment: String,
     #[serde(default)]
     pub evidence: Vec<sos_types::EvidenceRef>,
@@ -282,6 +297,36 @@ pub struct ControlFlowRegionContract {
     pub cycle_edges: Vec<ControlFlowEdgeContract>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryFieldContractKind {
+    RegisterOffset,
+    SolAccountInfo,
+}
+
+/// Source-neutral layout fact derived from fixed-width machine memory accesses.
+/// Names are deterministic: only fully recovered SolAccountInfo fields receive
+/// semantic names; all other offsets remain explicit `unknown_*` paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryFieldContract {
+    pub id: String,
+    pub function_id: String,
+    pub kind: MemoryFieldContractKind,
+    pub base: String,
+    /// Logical byte offset in the recovered source-level record.
+    pub offset: i32,
+    /// Concrete machine offsets that established this field. For stack-copied
+    /// SolAccountInfo records these differ from the logical record offset.
+    pub machine_offsets: Vec<i32>,
+    pub widths: Vec<u8>,
+    pub access_kinds: Vec<String>,
+    pub access_pcs: Vec<usize>,
+    pub field_path: String,
+    pub type_name: String,
+    pub semantic_name_recovered: bool,
+    pub evidence: Vec<sos_types::EvidenceRef>,
+}
+
 pub fn required_control_flow_regions(
     pack: &EvidencePack,
     function_id: &str,
@@ -289,6 +334,17 @@ pub fn required_control_flow_regions(
     pack.control_flow_regions
         .iter()
         .filter(|region| region.function_id == function_id)
+        .cloned()
+        .collect()
+}
+
+pub fn required_memory_field_contracts(
+    pack: &EvidencePack,
+    function_id: &str,
+) -> Vec<MemoryFieldContract> {
+    pack.memory_field_contracts
+        .iter()
+        .filter(|contract| contract.function_id == function_id)
         .cloned()
         .collect()
 }
@@ -750,6 +806,185 @@ fn loop_region_contract(
     }
 }
 
+fn derive_memory_field_contracts(
+    analysis: &StaticAnalysis,
+    ir: &CanonicalIr,
+    semantics: &SemanticAnalysis,
+) -> Vec<MemoryFieldContract> {
+    #[derive(Default)]
+    struct FieldBuilder {
+        widths: BTreeSet<u8>,
+        access_kinds: BTreeSet<String>,
+        access_pcs: BTreeSet<usize>,
+    }
+
+    let function_for_pc = |pc: usize| {
+        ir.operations
+            .iter()
+            .find(|operation| operation.pc == pc)
+            .and_then(|operation| {
+                ir.blocks
+                    .iter()
+                    .find(|block| block.id == operation.block_id)
+            })
+            .map(|block| block.function_id.clone())
+    };
+    let recovered_stack_pcs = semantics
+        .stack_account_field_candidates
+        .iter()
+        .flat_map(|field| field.access_pcs.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut contracts = Vec::new();
+
+    for field in &semantics.stack_account_field_candidates {
+        let mut by_function = BTreeMap::<String, Vec<usize>>::new();
+        for pc in &field.access_pcs {
+            if let Some(function_id) = function_for_pc(*pc) {
+                by_function.entry(function_id).or_default().push(*pc);
+            }
+        }
+        for (function_id, mut access_pcs) in by_function {
+            access_pcs.sort_unstable();
+            access_pcs.dedup();
+            let field_path = format!("account_{}.{}", field.account_index, field.field);
+            let evidence = access_pcs
+                .iter()
+                .map(|pc| sos_types::EvidenceRef {
+                    source: "analysis".into(),
+                    location: format!("instruction:0x{pc:x}"),
+                    detail: None,
+                })
+                .collect();
+            contracts.push(MemoryFieldContract {
+                id: format!(
+                    "layout_{}_account_{}_{}",
+                    sanitize_contract_component(&function_id),
+                    field.account_index,
+                    sanitize_contract_component(&field.field)
+                ),
+                function_id,
+                kind: MemoryFieldContractKind::SolAccountInfo,
+                base: format!("account_{}", field.account_index),
+                offset: sol_account_info_field_offset(&field.field).unwrap_or_default(),
+                machine_offsets: vec![i32::from(field.frame_offset)],
+                widths: vec![field.width],
+                access_kinds: analysis
+                    .stack_accesses
+                    .iter()
+                    .filter(|access| access_pcs.contains(&access.pc))
+                    .map(|access| access.kind.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+                access_pcs,
+                field_path,
+                type_name: fixed_width_type(&[field.width]),
+                semantic_name_recovered: true,
+                evidence,
+            });
+        }
+    }
+
+    let mut generic = BTreeMap::<(String, u8, i16), FieldBuilder>::new();
+    for access in &analysis.memory_accesses {
+        if recovered_stack_pcs.contains(&access.pc) {
+            continue;
+        }
+        let Some(function_id) = function_for_pc(access.pc) else {
+            continue;
+        };
+        let field = generic
+            .entry((function_id, access.base_register, access.offset))
+            .or_default();
+        field.widths.insert(access.width);
+        field.access_kinds.insert(access.kind.clone());
+        field.access_pcs.insert(access.pc);
+    }
+    for ((function_id, base_register, offset), field) in generic {
+        let widths = field.widths.into_iter().collect::<Vec<_>>();
+        let access_pcs = field.access_pcs.into_iter().collect::<Vec<_>>();
+        let offset_name = if offset < 0 {
+            format!("neg_0x{:x}", offset.unsigned_abs())
+        } else {
+            format!("pos_0x{:x}", offset as u16)
+        };
+        let field_path = format!("unknown_memory_r{base_register}.field_{offset_name}");
+        contracts.push(MemoryFieldContract {
+            id: format!(
+                "layout_{}_r{}_{}",
+                sanitize_contract_component(&function_id),
+                base_register,
+                offset_name
+            ),
+            function_id,
+            kind: MemoryFieldContractKind::RegisterOffset,
+            base: format!("r{base_register}"),
+            offset: i32::from(offset),
+            machine_offsets: vec![i32::from(offset)],
+            type_name: fixed_width_type(&widths),
+            widths,
+            access_kinds: field.access_kinds.into_iter().collect(),
+            evidence: access_pcs
+                .iter()
+                .map(|pc| sos_types::EvidenceRef {
+                    source: "analysis".into(),
+                    location: format!("instruction:0x{pc:x}"),
+                    detail: None,
+                })
+                .collect(),
+            access_pcs,
+            field_path,
+            semantic_name_recovered: false,
+        });
+    }
+    contracts.sort_by(|left, right| {
+        (&left.function_id, left.access_pcs.first(), &left.id).cmp(&(
+            &right.function_id,
+            right.access_pcs.first(),
+            &right.id,
+        ))
+    });
+    contracts
+}
+
+fn fixed_width_type(widths: &[u8]) -> String {
+    match widths {
+        [1] => "u8".into(),
+        [2] => "u16".into(),
+        [4] => "u32".into(),
+        [8] => "u64".into(),
+        _ => "unknown_bytes".into(),
+    }
+}
+
+fn sol_account_info_field_offset(field: &str) -> Option<i32> {
+    match field {
+        "key" => Some(0),
+        "lamports" => Some(8),
+        "data_len" => Some(16),
+        "data" => Some(24),
+        "owner" => Some(32),
+        "rent_epoch" => Some(40),
+        "is_signer" => Some(48),
+        "is_writable" => Some(49),
+        "executable" => Some(50),
+        _ => None,
+    }
+}
+
+fn sanitize_contract_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Machine-checkable coverage ledger linking a readable reconstruction back
 /// to deterministic binary effects. This is intentionally coarser than a full
 /// MIR/dataflow proof, but unlike prose citations it lets the gateway reject a
@@ -989,6 +1224,8 @@ fn default_refinement_schema_version() -> u32 {
 pub struct RefinementPatch {
     pub function_id: String,
     pub replacement: String,
+    #[serde(default)]
+    pub memory_field_mappings: Vec<RecoveredMemoryFieldMapping>,
     #[serde(default)]
     pub evidence: Vec<sos_types::EvidenceRef>,
 }
@@ -1462,6 +1699,11 @@ pub struct EvidencePack {
     /// header; other tasks receive the same immutable contracts for context.
     #[serde(default)]
     pub control_flow_regions: Vec<ControlFlowRegionContract>,
+    /// Deterministic fixed-offset memory layout obligations. Structure-stage
+    /// output must retain every field path and width instead of replacing raw
+    /// offsets with unsupported semantic names.
+    #[serde(default)]
+    pub memory_field_contracts: Vec<MemoryFieldContract>,
     pub untrusted_evidence: Vec<UntrustedEvidence>,
 }
 
@@ -1515,6 +1757,7 @@ impl EvidencePack {
     ) -> Self {
         let ir = build_canonical_ir(&analysis);
         let control_flow_regions = derive_control_flow_regions(&ir);
+        let memory_field_contracts = derive_memory_field_contracts(&analysis, &ir, &semantics);
         Self {
             schema_version: AI_SCHEMA_VERSION,
             task,
@@ -1525,6 +1768,7 @@ impl EvidencePack {
             signature_contracts: Vec::new(),
             pseudocode_obligations: Vec::new(),
             control_flow_regions,
+            memory_field_contracts,
             untrusted_evidence: Vec::new(),
         }
     }
@@ -1824,6 +2068,8 @@ impl EvidencePack {
         pack.ir.functions.truncate(limits.max_functions);
         pack.ir.sccs.truncate(limits.max_sccs);
         pack.control_flow_regions = derive_control_flow_regions(&pack.ir);
+        pack.memory_field_contracts =
+            derive_memory_field_contracts(&pack.analysis, &pack.ir, &pack.semantics);
         pack
     }
 }
@@ -3241,13 +3487,15 @@ where
                 "model output token budget {max_output_tokens} is outside {MIN_STAGE_OUTPUT_TOKENS}..={MAX_STAGE_OUTPUT_TOKENS}"
             )));
         }
-        // Region contracts are a deterministic projection of canonical IR.
+        // Region and memory-layout contracts are deterministic projections.
         // Recompute at the gateway boundary so a stale cache or external caller
-        // cannot suppress a branch/loop obligation by editing this convenience
-        // field before model inference.
+        // cannot suppress obligations by editing convenience fields before
+        // model inference.
         pack.control_flow_regions = derive_control_flow_regions(&pack.ir);
+        pack.memory_field_contracts =
+            derive_memory_field_contracts(&pack.analysis, &pack.ir, &pack.semantics);
         if task == ModelTask::StructureRecovery {
-            let maximum = pack
+            let maximum_regions = pack
                 .ir
                 .functions
                 .iter()
@@ -3259,9 +3507,26 @@ where
                 })
                 .max()
                 .unwrap_or(0);
-            if maximum > 128 {
+            if maximum_regions > 128 {
                 return Err(AiError::InvalidResponse(format!(
-                    "bounded structure request contains {maximum} control-flow regions for one function; the supported maximum is 128"
+                    "bounded structure request contains {maximum_regions} control-flow regions for one function; the supported maximum is 128"
+                )));
+            }
+            let maximum_fields = pack
+                .ir
+                .functions
+                .iter()
+                .map(|function| {
+                    pack.memory_field_contracts
+                        .iter()
+                        .filter(|contract| contract.function_id == function.id)
+                        .count()
+                })
+                .max()
+                .unwrap_or(0);
+            if maximum_fields > 1_024 {
+                return Err(AiError::InvalidResponse(format!(
+                    "bounded structure request contains {maximum_fields} memory fields for one function; the supported maximum is 1024"
                 )));
             }
         }
@@ -5334,6 +5599,8 @@ pub fn validate_model_response_for_pack(
     const MAX_CACHED_INPUT_BYTES: usize = 4 * 1024 * 1024;
     const MAX_CACHED_OUTPUT_BYTES: usize = 1024 * 1024;
     pack.control_flow_regions = derive_control_flow_regions(&pack.ir);
+    pack.memory_field_contracts =
+        derive_memory_field_contracts(&pack.analysis, &pack.ir, &pack.semantics);
     let input_bytes = serde_json::to_vec(&pack)
         .map_err(|error| AiError::InvalidResponse(error.to_string()))?
         .len();
@@ -5537,6 +5804,13 @@ fn validate_structured_consistency(
                     &patch.replacement,
                     "refinement patch",
                 )?;
+                validate_memory_field_mappings(
+                    &request.evidence_pack,
+                    &patch.function_id,
+                    &patch.replacement,
+                    &patch.memory_field_mappings,
+                    "refinement patch",
+                )?;
             }
             if parsed.observations.len() > 64 {
                 return Err(AiError::InvalidResponse(
@@ -5690,6 +5964,13 @@ fn validate_structure_candidate(
         )));
     }
     validate_control_flow_mappings(request, function)?;
+    validate_memory_field_mappings(
+        &request.evidence_pack,
+        &function.function_id,
+        &function.pseudocode,
+        &function.memory_field_mappings,
+        "structure candidate",
+    )?;
     let function_blocks = request
         .evidence_pack
         .ir
@@ -5748,6 +6029,84 @@ fn validate_structure_candidate(
             "structure candidate for {} omits deterministic memory writes",
             function.function_id
         )));
+    }
+    Ok(())
+}
+
+fn validate_memory_field_mappings(
+    pack: &EvidencePack,
+    function_id: &str,
+    source: &str,
+    mappings: &[RecoveredMemoryFieldMapping],
+    candidate_kind: &str,
+) -> Result<(), AiError> {
+    let contracts = required_memory_field_contracts(pack, function_id)
+        .into_iter()
+        .map(|contract| (contract.id.clone(), contract))
+        .collect::<BTreeMap<_, _>>();
+    if mappings.len() != contracts.len() {
+        return Err(AiError::InvalidResponse(format!(
+            "{candidate_kind} for {} maps {} memory fields but {} are required",
+            function_id,
+            mappings.len(),
+            contracts.len()
+        )));
+    }
+    let compact_output = compact_signature(source);
+    let mut covered = BTreeSet::new();
+    let mut fragments = BTreeSet::new();
+    for mapping in mappings {
+        let Some(contract) = contracts.get(&mapping.contract_id) else {
+            return Err(AiError::InvalidResponse(format!(
+                "{candidate_kind} for {} maps unknown memory field contract {}",
+                function_id, mapping.contract_id
+            )));
+        };
+        if !covered.insert(mapping.contract_id.as_str()) {
+            return Err(AiError::InvalidResponse(format!(
+                "{candidate_kind} for {} maps memory field {} more than once",
+                function_id, mapping.contract_id
+            )));
+        }
+        if mapping.field_path != contract.field_path || mapping.type_name != contract.type_name {
+            return Err(AiError::InvalidResponse(format!(
+                "memory field mapping {} must preserve deterministic path {} and type {}",
+                mapping.contract_id, contract.field_path, contract.type_name
+            )));
+        }
+        let fragment = mapping.output_fragment.trim();
+        let compact_fragment = compact_signature(fragment);
+        if fragment.chars().count() < 2
+            || fragment.chars().count() > 512
+            || fragment.contains(['\n', '\r'])
+            || fragment.starts_with("//")
+            || fragment.starts_with("/*")
+            || compact_fragment.is_empty()
+            || !compact_output.contains(&compact_fragment)
+            || !compact_fragment.contains(&compact_signature(&mapping.field_path))
+        {
+            return Err(AiError::InvalidResponse(format!(
+                "memory field mapping {} must name a bounded one-line non-comment expression present in the pseudocode and containing {}",
+                mapping.contract_id, mapping.field_path
+            )));
+        }
+        if !fragments.insert(compact_fragment) {
+            return Err(AiError::InvalidResponse(format!(
+                "{candidate_kind} for {} reuses one source fragment for multiple memory fields",
+                function_id
+            )));
+        }
+        let supported_evidence = mapping.evidence.len() == 1
+            && contract.evidence.iter().any(|evidence| {
+                evidence.source == mapping.evidence[0].source
+                    && evidence.location == mapping.evidence[0].location
+            });
+        if !supported_evidence {
+            return Err(AiError::InvalidResponse(format!(
+                "memory field mapping {} must cite exactly one instruction from its deterministic contract",
+                mapping.contract_id
+            )));
+        }
     }
     Ok(())
 }
@@ -6123,6 +6482,15 @@ fn structured_evidence_refs(
                     }
                     references.extend(mapping.evidence);
                 }
+                for mapping in function.memory_field_mappings {
+                    if mapping.evidence.is_empty() {
+                        return Err(AiError::InvalidResponse(format!(
+                            "memory field mapping {} for {} has no evidence",
+                            mapping.contract_id, function.function_id
+                        )));
+                    }
+                    references.extend(mapping.evidence);
+                }
                 references.extend(function.evidence);
             }
         }
@@ -6183,6 +6551,15 @@ fn structured_evidence_refs(
                     )));
                 }
                 validate_readable_candidate(&patch.replacement, &patch.function_id)?;
+                for mapping in patch.memory_field_mappings {
+                    if mapping.evidence.is_empty() {
+                        return Err(AiError::InvalidResponse(format!(
+                            "memory field mapping {} for refinement {} has no evidence",
+                            mapping.contract_id, patch.function_id
+                        )));
+                    }
+                    references.extend(mapping.evidence);
+                }
                 references.extend(patch.evidence);
             }
             for observation in parsed.observations {
@@ -6620,6 +6997,23 @@ mod tests {
                 }]
             }));
         }
+        let memory_fields = required_memory_field_contracts(pack, function_id);
+        let mut memory_field_mappings = Vec::new();
+        for contract in &memory_fields {
+            let variable = sanitize_contract_component(&contract.id);
+            let fragment = format!(
+                "let recovered_{variable}: {} = {};",
+                contract.type_name, contract.field_path
+            );
+            body.push(fragment.clone());
+            memory_field_mappings.push(serde_json::json!({
+                "contract_id": contract.id,
+                "field_path": contract.field_path,
+                "type_name": contract.type_name,
+                "output_fragment": fragment,
+                "evidence": contract.evidence.first().into_iter().collect::<Vec<_>>(),
+            }));
+        }
         let required = required_structure_effects(pack, function_id);
         if required
             .iter()
@@ -6647,6 +7041,7 @@ mod tests {
                 "function_id": function_id,
                 "pseudocode": format!("{declaration} {{\n{}\n}}", body.join("\n")),
                 "control_flow_mappings": mappings,
+                "memory_field_mappings": memory_field_mappings,
                 "effects": effects,
                 "evidence": [evidence]
             }]
@@ -6805,6 +7200,7 @@ mod tests {
                     "patches": [{
                         "function_id": "fn_0",
                         "replacement": replacement,
+                        "memory_field_mappings": [],
                         "evidence": [{"source": "ir", "location": "function:fn_0"}]
                     }],
                     "observations": [],
@@ -6979,6 +7375,7 @@ mod tests {
             patches: vec![RefinementPatch {
                 function_id: "fn_0".into(),
                 replacement: "fn fn_0() { sos_raw_op!(0, 1, 2, 3, 4); unknown_return(); }".into(),
+                memory_field_mappings: Vec::new(),
                 evidence: vec![],
             }],
             observations: Vec::new(),
@@ -7000,6 +7397,7 @@ mod tests {
             patches: vec![RefinementPatch {
                 function_id: "fn_0".into(),
                 replacement: "fn broken( {".into(),
+                memory_field_mappings: Vec::new(),
                 evidence: vec![],
             }],
             observations: Vec::new(),
@@ -8034,6 +8432,7 @@ fn fn_80(_1: bool, _2: bool) -> () {
             pseudocode: valid_source.into(),
             source_mappings: Vec::new(),
             control_flow_mappings: Vec::new(),
+            memory_field_mappings: Vec::new(),
             effects,
             evidence: vec![sos_types::EvidenceRef {
                 source: "ir".into(),
@@ -8078,6 +8477,7 @@ fn fn_80(_1: bool, _2: bool) -> () {
             "patches": [{
                 "function_id": "fn_0",
                 "replacement": valid_source,
+                "memory_field_mappings": [],
                 "evidence": [{"source": "ir", "location": "function:fn_0", "detail": null}]
             }],
             "observations": [],
@@ -8429,6 +8829,183 @@ fn fn_80(_1: bool, _2: bool) -> () {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn structure_recovery_must_preserve_deterministic_memory_layouts() {
+        let mut analysis = empty_pack().analysis;
+        analysis.instructions[0] = InstructionFact {
+            pc: 0,
+            opcode: 0x7b,
+            dst: 1,
+            src: 2,
+            offset: 8,
+            immediate: 0,
+            assembly: "stxdw [r1+0x8], r2".into(),
+        };
+        analysis.memory_accesses = vec![sos_analysis::MemoryAccessFact {
+            pc: 0,
+            kind: "store".into(),
+            width: 8,
+            base_register: 1,
+            value_register: Some(2),
+            offset: 8,
+            immediate: None,
+            assembly: "stxdw [r1+0x8], r2".into(),
+        }];
+        let semantics = sos_solana::analyze(&analysis);
+        let mut pack =
+            EvidencePack::from_analysis(ModelTask::StructureRecovery, None, analysis, semantics);
+        let contracts = required_memory_field_contracts(&pack, "fn_0");
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0].kind, MemoryFieldContractKind::RegisterOffset);
+        assert_eq!(contracts[0].offset, 8);
+        assert_eq!(contracts[0].machine_offsets, vec![8]);
+        assert_eq!(contracts[0].widths, vec![8]);
+        assert_eq!(contracts[0].access_kinds, vec!["store"]);
+        assert_eq!(contracts[0].field_path, "unknown_memory_r1.field_pos_0x8");
+        assert_eq!(contracts[0].type_name, "u64");
+        assert!(!contracts[0].semantic_name_recovered);
+        let hosted = crate::groq::hosted_model_evidence(&pack);
+        assert_eq!(
+            hosted["program"]["memory_field_contracts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let output = test_structure_output(
+            &pack,
+            "fn_0",
+            "fn fn_0()",
+            serde_json::json!({
+                "source": "ir",
+                "location": "function:fn_0",
+                "detail": null
+            }),
+        );
+        let request = ModelRequest {
+            task: ModelTask::StructureRecovery,
+            prompt_version: "v1".into(),
+            model: "test".into(),
+            evidence_pack: pack.clone(),
+            max_output_bytes: 100_000,
+            max_output_tokens: 2_400,
+        };
+        validate_structured_consistency(&request, &output).unwrap();
+
+        let mut renamed = output.clone();
+        renamed["functions"][0]["memory_field_mappings"][0]["field_path"] =
+            serde_json::json!("account.balance");
+        assert!(validate_structured_consistency(&request, &renamed)
+            .unwrap_err()
+            .to_string()
+            .contains("deterministic path"));
+
+        let mut omitted = output;
+        omitted["functions"][0]["memory_field_mappings"] = serde_json::json!([]);
+        assert!(validate_structured_consistency(&request, &omitted)
+            .unwrap_err()
+            .to_string()
+            .contains("memory fields"));
+
+        let refinement_output = serde_json::json!({
+            "schema_version": 1,
+            "patches": [{
+                "function_id": "fn_0",
+                "replacement": "fn fn_0() { let recovered: u64 = unknown_memory_r1.field_pos_0x8; unknown_memory_write(); }",
+                "memory_field_mappings": [{
+                    "contract_id": contracts[0].id.clone(),
+                    "field_path": contracts[0].field_path.clone(),
+                    "type_name": contracts[0].type_name.clone(),
+                    "output_fragment": "let recovered: u64 = unknown_memory_r1.field_pos_0x8;",
+                    "evidence": [contracts[0].evidence[0].clone()]
+                }],
+                "evidence": [{"source": "ir", "location": "function:fn_0", "detail": null}]
+            }],
+            "observations": [],
+            "validation": {"status": "unverified", "notes": []}
+        });
+        let mut refinement_request = request.clone();
+        refinement_request.task = ModelTask::Refinement;
+        refinement_request.evidence_pack.task = ModelTask::Refinement;
+        validate_structured_consistency(&refinement_request, &refinement_output).unwrap();
+        let mut renamed_refinement = refinement_output;
+        renamed_refinement["patches"][0]["memory_field_mappings"][0]["field_path"] =
+            serde_json::json!("account.balance");
+        assert!(validate_structured_consistency(&refinement_request, &renamed_refinement).is_err());
+
+        pack.memory_field_contracts.clear();
+        let response = ModelGateway::new(EchoProvider, 1024 * 1024, 1024 * 1024)
+            .submit(ModelTask::StructureRecovery, "test", "v1", pack)
+            .unwrap();
+        assert_eq!(
+            response.structured_output["functions"][0]["memory_field_mappings"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn recovered_sol_account_info_layout_uses_logical_fields_and_machine_offsets() {
+        let layout = [
+            (0, 8),
+            (8, 8),
+            (16, 8),
+            (24, 8),
+            (32, 8),
+            (40, 8),
+            (48, 1),
+            (49, 1),
+            (50, 1),
+        ];
+        let mut analysis = empty_pack().analysis;
+        analysis.instructions = layout
+            .iter()
+            .enumerate()
+            .map(|(pc, _)| InstructionFact {
+                pc,
+                opcode: 0,
+                dst: 0,
+                src: 0,
+                offset: 0,
+                immediate: 0,
+                assembly: "stack materialization".into(),
+            })
+            .collect();
+        analysis.basic_blocks[0].end_instruction_index = layout.len();
+        analysis.stack_accesses = layout
+            .iter()
+            .enumerate()
+            .map(
+                |(pc, (field_offset, width))| sos_analysis::StackAccessFact {
+                    pc,
+                    kind: "store".into(),
+                    width: *width,
+                    offset: -112 + *field_offset,
+                    value_register: Some(0),
+                    immediate: None,
+                    frame_register: 10,
+                    assembly: "stack store".into(),
+                },
+            )
+            .collect();
+        let semantics = sos_solana::analyze(&analysis);
+        assert_eq!(semantics.stack_account_field_candidates.len(), 9);
+        let pack =
+            EvidencePack::from_analysis(ModelTask::StructureRecovery, None, analysis, semantics);
+        let signer = required_memory_field_contracts(&pack, "fn_0")
+            .into_iter()
+            .find(|contract| contract.field_path == "account_0.is_signer")
+            .unwrap();
+        assert_eq!(signer.kind, MemoryFieldContractKind::SolAccountInfo);
+        assert_eq!(signer.offset, 48);
+        assert_eq!(signer.machine_offsets, vec![-64]);
+        assert_eq!(signer.type_name, "u8");
+        assert!(signer.semantic_name_recovered);
     }
 
     #[test]
@@ -8811,6 +9388,7 @@ fn fn_80(_1: bool, _2: bool) -> () {
             "patches": [{
                 "function_id": "fn_missing",
                 "replacement": "fn recovered() { }",
+                "memory_field_mappings": [],
                 "evidence": [{
                     "source": "ir",
                     "location": "function:fn_0"

@@ -440,6 +440,15 @@ arity, join/exit presence, loop cycle evidence, and recovered nesting to agree.
 Extra rustc safety or cleanup regions are retained as evidence and allowed to
 remain unmatched; they cannot be reused to cover a binary region.
 
+Before source generation, the same immutable-evidence boundary derives
+fixed-offset memory-field contracts from bounded load/store facts. A contract
+keeps logical and machine offsets separate so stack-copied SolAccountInfo fields
+can retain their source-record offsets while citing concrete frame offsets. Only
+complete recognized layouts receive semantic paths; unresolved bases remain
+stable `unknown_memory_*` records. Both structure and refinement agents must
+return one exact source mapping per field, preventing a later model stage from
+turning an offset into a plausible but unsupported account property.
+
 After a whole candidate is rebuilt with the pinned Solana/SBPF toolchain,
 `sos judge` provides a separate deterministic binary regression gate. It pairs
 functions without trusting names and scores normalized instruction n-grams,

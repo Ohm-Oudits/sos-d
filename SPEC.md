@@ -187,6 +187,14 @@ containment. Compiler-introduced regions may remain unmatched, but one MIR
 region must not satisfy multiple binary contracts. Region mismatches must be
 returned to bounded repair.
 
+Every fixed-offset machine memory field in the bounded function must produce a
+versioned layout contract containing its logical and observed offsets, widths,
+access kinds/PCs, conservative source path, and evidence. Complete recognized
+SolAccountInfo layouts may use recovered semantic field names. All other fields
+must retain deterministic `unknown_memory_*` paths. Structure and refinement
+outputs must map every contract exactly once to a unique non-comment source
+expression and must not substitute unsupported names or widths.
+
 Each stage returns strict JSON. Inputs are tagged as untrusted data, and model output
 cannot alter facts, evidence references, or confidence values directly.
 

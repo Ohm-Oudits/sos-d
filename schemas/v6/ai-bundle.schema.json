@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sos-decompiler.dev/schema/v6/ai-bundle.schema.json",
+  "title": "SOS AI pipeline bundle with memory-layout contract enforcement",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "artifact_sha256", "provider", "model", "stages"],
+  "properties": {
+    "schema_version": {"const": 6},
+    "artifact_sha256": {"type": ["string", "null"]},
+    "provider": {"type": "string"},
+    "model": {"type": "string"},
+    "stages": {
+      "type": "array",
+      "minItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "task",
+          "status",
+          "model",
+          "max_output_tokens",
+          "prompt_version",
+          "input_sha256",
+          "output_sha256",
+          "response",
+          "error"
+        ],
+        "properties": {
+          "task": {
+            "enum": [
+              "structure_recovery",
+              "signature_recovery",
+              "semantic_labeling",
+              "explanation",
+              "refinement"
+            ]
+          },
+          "status": {"enum": ["accepted", "not_available", "rejected"]},
+          "model": {"type": "string"},
+          "max_output_tokens": {"type": "integer", "minimum": 128, "maximum": 32768},
+          "prompt_version": {"type": "string"},
+          "input_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "output_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+          "response": {"type": ["object", "null"]},
+          "error": {"type": ["string", "null"]}
+        }
+      }
+    }
+  }
+}
