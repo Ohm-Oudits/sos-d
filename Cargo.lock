@@ -5097,6 +5097,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sos-callx-fixture"
+version = "0.1.0"
+dependencies = [
+ "solana-program",
+]
+
+[[package]]
 name = "sos-cli"
 version = "0.1.0"
 dependencies = [

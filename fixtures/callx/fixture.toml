@@ -1,0 +1,9 @@
+name = "sos-callx-fixture"
+source = "programs/callx-fixture/src/lib.rs"
+artifact = "target/deploy/sos_callx_fixture.so"
+loader = "upgradeable-v3-or-legacy-direct"
+framework = "native-rust"
+expected_elf_machine = 263
+expected_sbpf = true
+semantic_targets = ["indirect_call", "finite_target_selection"]
+notes = "Native Rust fixture with a runtime-selected two-function target set and real callx instructions; used to prevent unsafe single-target promotion."

@@ -14,6 +14,7 @@ members = [
     "crates/sos-storage",
     "crates/sos-types",
     "programs/hello-world",
+    "programs/callx-fixture",
     "programs/native-abi",
     "programs/pinocchio-fixture",
     "programs/anchor-fixture",

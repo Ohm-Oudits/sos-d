@@ -37,7 +37,9 @@ Already implemented in this workspace:
 - Runtime-aligned verifier diagnostics are captured as structured analysis facts
   and rendered in reports, including an explicit clean/empty state.
 - Conservative direct, indirect, and syscall call-site facts with unresolved-target
-  status, plus ELF relocation facts when exposed by the object parser.
+  status, plus ELF relocation facts when exposed by the object parser. Unique
+  immediate-call hashes and same-basic-block constant `callx` virtual addresses are
+  resolved to exact function entries; path-dependent target sets remain unresolved.
 - Explicit load/store memory facts and conservative entrypoint-input field candidates.
 - Bounded read-only-section string extraction and immediate-constant facts.
 - Bounded read-only-section 32-byte public-key candidates with base58 rendering,
@@ -49,7 +51,9 @@ Already implemented in this workspace:
 - Explicit stack-frame access facts rooted at the SBPF frame register, retained in
   analysis JSON, canonical IR generation, reports, and AI evidence packs.
 - Conservative intra-basic-block register-use facts with immediate/copy/arithmetic
-  propagation and source PCs for call arguments.
+  propagation and source PCs for call arguments. Call-register recovery is
+  SBPF-version-aware, including v2 high-word address construction, and never carries
+  a constant across a basic-block boundary.
 - Versioned logical model of the standard Solana BPF entrypoint ABI, without assuming
   fixed offsets for variable-length account records.
 - Provider-independent AI evidence-pack and response-validation contracts.
@@ -289,7 +293,9 @@ Tasks:
 
 1. Split `sos-analysis` into ELF normalization, decode, CFG, dataflow, and IR modules.
 2. Define stable IDs for instructions, blocks, functions, values, and memory regions.
-3. Add indirect branch and tail-call confidence classes.
+3. Add set-valued, CFG-aware indirect-call/branch and tail-call confidence classes;
+   preserve per-path candidates instead of collapsing a multi-target `callx` to one
+   callee.
 4. Implement an SSA-like IR with explicit unknown values and memory effects.
 5. Build a syscall database from runtime-aligned definitions and test call extraction.
 6. Compare selected results with Anza SBPF and optional external tools.

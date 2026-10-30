@@ -117,6 +117,12 @@ cargo run -p sos-cli -- inspect <PROGRAM_ADDRESS> \
   --out ./reports/<PROGRAM_ADDRESS>
 ```
 
+Call analysis resolves both unique immediate internal calls and `callx` sites whose
+version-specific target register is proven, within one basic block, to contain one
+aligned function-entry virtual address. Those edges become immutable source and
+rustc-MIR target contracts for the model pipeline. Path-dependent function pointers
+remain visibly unresolved; SOS does not ask the model to choose a callee.
+
 Add `--history N` to save available transaction signatures and parsed transaction
 evidence as `history.json`. Missing archive state is recorded as `not_available` and
 does not prevent static analysis.
@@ -635,10 +641,12 @@ crates/sos-ai/                  bounded model gateway and evidence validation
 schemas/v1/                    public JSON contracts for manifests, analysis, IR, semantics, evidence, refinement, validation, and reports
 fuzz/                           offline cargo-fuzz targets for parser boundaries
 .github/workflows/ci.yml        host checks and opt-in pinned SBF fixture CI
+scripts/test-callx-fixture.sh   compiled callx uncertainty regression check
 fixtures/echo-model.sh         local model-provider protocol fixture
 fixtures/compile-model.sh      refinement fixture for external candidate compilation
 fixtures/repair-model.sh       bounded mismatch-driven repair fixture
 fixtures/corpus.toml            labeled fixture corpus manifest
+programs/callx-fixture/         compiled multi-target callx uncertainty fixture
 crates/sos-solana/              syscall, protocol, and Solana semantic candidates
 crates/sos-report/              Markdown, pseudocode, and SARIF renderers
 crates/sos-cli/                 CLI entrypoint

@@ -462,6 +462,10 @@ rustc now verifies nonnegative `#[repr(C)]` offsets and primitive field types.
 Negative frame-relative offsets remain explicit evidence rather than record
 layout assertions. Resolved internal SBPF calls now retain exact caller, call
 site, and callee contracts through both source stages; rustc MIR verifies target
-identity and repeated-call multiplicity. Indirect and hash-ambiguous calls remain
-unresolved. The remaining judge work is indirect-call recovery and
-multi-transaction path coverage.
+identity and repeated-call multiplicity. This includes `callx` when version-aware
+same-basic-block propagation proves one aligned function-entry virtual address.
+Path-dependent or multi-target function pointers and hash-ambiguous calls remain
+unresolved. The checked `sos-callx-fixture` intentionally selects between two
+functions and guards this uncertainty boundary. The remaining judge work is
+set-valued CFG/interprocedural indirect-call recovery and multi-transaction path
+coverage.

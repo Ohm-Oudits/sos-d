@@ -17,6 +17,15 @@ optimization = "release"
 status = "available"
 
 [[fixture]]
+name = "sos-callx-fixture"
+category = "native-rust"
+source = "programs/callx-fixture/src/lib.rs"
+artifact = "target/deploy/sos_callx_fixture.so"
+optimization = "release"
+status = "available"
+notes = "Runtime-selected function pointer fixture for callx recovery and ambiguity coverage."
+
+[[fixture]]
 name = "sos-pinocchio-fixture"
 category = "pinocchio"
 source = "programs/pinocchio-fixture/src/lib.rs"

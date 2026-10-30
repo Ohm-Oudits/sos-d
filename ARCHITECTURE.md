@@ -273,6 +273,14 @@ Required deterministic outputs:
 - syscall calls with canonical signatures;
 - verifier/runtime diagnostics.
 
+Indirect call recovery uses the SBPF version's actual `callx` target-register
+encoding. A constant is an exact target only after subtracting the loaded text
+virtual address, checking instruction alignment, and matching one known function
+entry. The initial pass is deliberately intra-basic-block. CFG joins and
+interprocedural function-pointer arguments require a bounded set-valued lattice;
+until that pass proves a complete singleton, the edge remains unresolved rather
+than being guessed by a model.
+
 Do not make a third-party GUI decompiler the core dependency. An optional Ghidra
 adapter can provide a comparison baseline, but the open-source product needs its own
 stable IR, JSON export, and testable native pipeline.
@@ -601,8 +609,10 @@ and security tooling do not have to scrape human output.
 - Historical account hydration where supported.
 - Sandboxed SVM/LiteSVM replay.
 - Pinned candidate compilation and deterministic binary-similarity judging.
-- Type-layout and resolved-direct-call non-regression checks; retain indirect
-  and hash-ambiguous calls as explicit unresolved edges.
+- Type-layout and resolved-call non-regression checks. Exact same-block `callx`
+  constants receive the same source/MIR target contract as resolved immediate calls;
+  path-dependent, multi-target, and hash-ambiguous calls remain explicit unresolved
+  edges.
 - Trace comparison and bounded AI repair loop.
 
 ### Phase 6 — research-grade product

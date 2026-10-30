@@ -10,12 +10,14 @@ command -v cargo-build-sbf >/dev/null 2>&1 || {
 }
 
 cargo-build-sbf --manifest-path programs/hello-world/Cargo.toml
+cargo-build-sbf --manifest-path programs/callx-fixture/Cargo.toml
 cargo-build-sbf --manifest-path programs/native-abi/Cargo.toml
 cargo-build-sbf --manifest-path programs/pinocchio-fixture/Cargo.toml
 cargo-build-sbf --manifest-path programs/anchor-fixture/Cargo.toml
 ./scripts/build-c-fixture.sh
 
 test -s target/deploy/sos_hello_world.so
+test -s target/deploy/sos_callx_fixture.so
 test -s target/deploy/sos_native_abi.so
 test -s target/deploy/sos_pinocchio_fixture.so
 test -s target/deploy/sos_anchor_fixture.so

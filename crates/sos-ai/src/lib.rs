@@ -345,7 +345,9 @@ pub struct MemoryFieldContract {
     pub evidence: Vec<sos_types::EvidenceRef>,
 }
 
-/// A resolved internal SBPF call edge. Unlike a generic call effect, this
+/// A resolved internal SBPF call edge. The historical `DirectCallContract`
+/// name covers both immediate calls and indirect `callx` sites whose target
+/// register is deterministically resolved. Unlike a generic call effect, this
 /// contract preserves the exact caller, call site, and callee identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectCallContract {
@@ -1007,7 +1009,12 @@ fn derive_direct_call_contracts(
     let resolved_calls = analysis
         .calls
         .iter()
-        .filter(|call| call.kind == "direct_internal_call" && call.status == "resolved")
+        .filter(|call| {
+            matches!(
+                call.kind.as_str(),
+                "direct_internal_call" | "indirect_internal_call"
+            ) && call.status == "resolved"
+        })
         .filter_map(|call| call.target_pc.map(|target| ((call.call_pc, target), call)))
         .collect::<BTreeMap<_, _>>();
     let mut contracts = BTreeMap::new();
@@ -8284,6 +8291,24 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
                 .as_array()
                 .map(Vec::len),
             Some(1)
+        );
+        let mut indirect_analysis = pack.analysis.clone();
+        indirect_analysis.calls[0].kind = "indirect_internal_call".into();
+        indirect_analysis.instructions[0].assembly = "callx r9".into();
+        let indirect_semantics = sos_solana::analyze(&indirect_analysis);
+        let indirect_pack = EvidencePack::from_analysis(
+            ModelTask::StructureRecovery,
+            None,
+            indirect_analysis,
+            indirect_semantics,
+        );
+        assert_eq!(
+            required_direct_call_contracts(&indirect_pack, "fn_0"),
+            contracts
+        );
+        assert_eq!(
+            indirect_pack.ir.operations[0].kind,
+            "indirect_internal_call"
         );
 
         let output = test_structure_output(

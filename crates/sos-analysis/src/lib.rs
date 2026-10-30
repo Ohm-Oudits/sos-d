@@ -885,6 +885,7 @@ pub fn analyze_elf(bytes: &[u8]) -> Result<StaticAnalysis, AnalysisError> {
     Ok(convert_analysis(
         &analysis,
         executable.get_sbpf_version(),
+        executable.get_text_bytes().0,
         bytes,
         verifier_diagnostics,
     ))
@@ -893,6 +894,7 @@ pub fn analyze_elf(bytes: &[u8]) -> Result<StaticAnalysis, AnalysisError> {
 fn convert_analysis(
     analysis: &Analysis<'_>,
     sbpf_version: solana_sbpf::program::SBPFVersion,
+    text_section_vaddr: u64,
     elf_bytes: &[u8],
     verifier_diagnostics: Vec<String>,
 ) -> StaticAnalysis {
@@ -944,7 +946,13 @@ fn convert_analysis(
     let strings = extract_elf_strings(elf_bytes);
     let public_key_candidates = extract_elf_public_keys(elf_bytes);
     let register_uses = collect_register_uses(&instructions, &basic_blocks);
-    let calls = collect_calls(&instructions, &functions);
+    let calls = collect_calls(
+        &instructions,
+        &functions,
+        &basic_blocks,
+        sbpf_version,
+        text_section_vaddr,
+    );
     let relocations = extract_relocations(elf_bytes);
     let (sccs, dataflow_edges) = convert_graph_facts(analysis);
     StaticAnalysis {
@@ -1061,14 +1069,165 @@ fn extract_relocations(bytes: &[u8]) -> Vec<RelocationFact> {
     relocations
 }
 
-fn collect_calls(instructions: &[InstructionFact], functions: &[FunctionFact]) -> Vec<CallFact> {
+fn callx_target_register(
+    instruction: &InstructionFact,
+    sbpf_version: solana_sbpf::program::SBPFVersion,
+) -> Option<u8> {
+    let register = if sbpf_version.callx_uses_src_reg() {
+        instruction.src
+    } else if sbpf_version.callx_uses_dst_reg() {
+        instruction.dst
+    } else {
+        u8::try_from(instruction.immediate).ok()?
+    };
+    (register <= solana_sbpf::ebpf::FRAME_PTR_REG as u8).then_some(register)
+}
+
+/// Resolve `callx` targets only when the target register has one constant value
+/// established in the same basic block and that value is the exact virtual
+/// address of one known function entry. Crossing a block boundary without a
+/// proper value lattice would turn path-dependent values into false facts, so
+/// this intentionally resets state at every boundary.
+fn collect_constant_callx_targets(
+    instructions: &[InstructionFact],
+    functions: &[FunctionFact],
+    basic_blocks: &[BasicBlockFact],
+    sbpf_version: solana_sbpf::program::SBPFVersion,
+    text_section_vaddr: u64,
+) -> BTreeMap<usize, (usize, u32)> {
     use solana_sbpf::ebpf;
+
+    let block_starts = basic_blocks
+        .iter()
+        .map(|block| block.start_pc)
+        .collect::<HashSet<_>>();
+    let first_pc = instructions.first().map(|instruction| instruction.pc);
+    let mut registers: [Option<KnownRegisterValue>; 11] = [None; 11];
+    let mut targets = BTreeMap::new();
+
+    for instruction in instructions {
+        if block_starts.contains(&instruction.pc) && Some(instruction.pc) != first_pc {
+            registers = [None; 11];
+        }
+
+        if instruction.opcode == ebpf::CALL_REG {
+            let target = callx_target_register(instruction, sbpf_version)
+                .and_then(|register| registers[register as usize])
+                .map(|known| known.value as u64)
+                .and_then(|address| address.checked_sub(text_section_vaddr))
+                .filter(|offset| offset % ebpf::INSN_SIZE as u64 == 0)
+                .and_then(|offset| usize::try_from(offset / ebpf::INSN_SIZE as u64).ok())
+                .and_then(|target_pc| {
+                    let mut matches = functions.iter().filter(|function| function.pc == target_pc);
+                    let first = matches.next()?;
+                    matches
+                        .next()
+                        .is_none()
+                        .then_some((first.pc, first.symbol_hash))
+                });
+            if let Some(target) = target {
+                targets.insert(instruction.pc, target);
+            }
+        }
+
+        match instruction.opcode {
+            ebpf::LD_DW_IMM | ebpf::MOV32_IMM | ebpf::MOV64_IMM => {
+                update_immediate(
+                    &mut registers,
+                    instruction.dst,
+                    instruction.immediate,
+                    instruction.pc,
+                );
+            }
+            ebpf::MOV32_REG | ebpf::MOV64_REG => {
+                let source = registers.get(instruction.src as usize).copied().flatten();
+                update_register(&mut registers, instruction.dst, source);
+            }
+            ebpf::HOR64_IMM if sbpf_version.disable_lddw() => {
+                let register = &mut registers[instruction.dst as usize];
+                if let Some(known) = register.as_mut() {
+                    known.value = ((known.value as u64)
+                        | (instruction.immediate as u64).wrapping_shl(32))
+                        as i64;
+                }
+            }
+            ebpf::ADD32_IMM | ebpf::ADD64_IMM => {
+                update_arithmetic(
+                    &mut registers,
+                    instruction.dst,
+                    Some(instruction.immediate),
+                    false,
+                );
+            }
+            ebpf::SUB32_IMM | ebpf::SUB64_IMM => {
+                update_arithmetic(
+                    &mut registers,
+                    instruction.dst,
+                    Some(instruction.immediate),
+                    true,
+                );
+            }
+            ebpf::ADD32_REG | ebpf::ADD64_REG => {
+                let operand = registers
+                    .get(instruction.src as usize)
+                    .copied()
+                    .flatten()
+                    .map(|value| value.value);
+                update_arithmetic(&mut registers, instruction.dst, operand, false);
+            }
+            ebpf::SUB32_REG | ebpf::SUB64_REG => {
+                let operand = registers
+                    .get(instruction.src as usize)
+                    .copied()
+                    .flatten()
+                    .map(|value| value.value);
+                update_arithmetic(&mut registers, instruction.dst, operand, true);
+            }
+            ebpf::CALL_IMM | ebpf::CALL_REG => {
+                for register in registers.iter_mut().take(6) {
+                    *register = None;
+                }
+            }
+            _ if writes_register(instruction.opcode) => {
+                registers[instruction.dst as usize] = None;
+            }
+            _ => {}
+        }
+    }
+
+    targets
+}
+
+fn collect_calls(
+    instructions: &[InstructionFact],
+    functions: &[FunctionFact],
+    basic_blocks: &[BasicBlockFact],
+    sbpf_version: solana_sbpf::program::SBPFVersion,
+    text_section_vaddr: u64,
+) -> Vec<CallFact> {
+    use solana_sbpf::ebpf;
+
+    let constant_callx_targets = collect_constant_callx_targets(
+        instructions,
+        functions,
+        basic_blocks,
+        sbpf_version,
+        text_section_vaddr,
+    );
 
     instructions
         .iter()
         .filter_map(|instruction| {
             let (kind, target_pc, target_symbol_hash, status) = match instruction.opcode {
-                ebpf::CALL_REG => ("indirect", None, None, "unresolved"),
+                ebpf::CALL_REG => match constant_callx_targets.get(&instruction.pc) {
+                    Some((target_pc, symbol_hash)) => (
+                        "indirect_internal_call",
+                        Some(*target_pc),
+                        Some(*symbol_hash),
+                        "resolved",
+                    ),
+                    None => ("indirect", None, None, "unresolved"),
+                },
                 ebpf::CALL_IMM if instruction.assembly.starts_with("syscall ") => (
                     "syscall",
                     None,
@@ -1201,7 +1360,11 @@ fn collect_register_uses(
                     .map(|value| value.value);
                 update_arithmetic(&mut registers, instruction.dst, operand, true);
             }
-            ebpf::CALL_IMM | ebpf::CALL_REG => registers[0] = None,
+            ebpf::CALL_IMM | ebpf::CALL_REG => {
+                for register in registers.iter_mut().take(6) {
+                    *register = None;
+                }
+            }
             _ if writes_register(instruction.opcode) => {
                 registers[instruction.dst as usize] = None;
             }
@@ -2115,6 +2278,9 @@ mod static_tests {
                 symbol_hash: 0,
                 name: "entry".into(),
             }],
+            &[],
+            solana_sbpf::program::SBPFVersion::V0,
+            ebpf::MM_BYTECODE_START,
         );
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].kind, "direct_or_relocated");
@@ -2150,6 +2316,9 @@ mod static_tests {
                     name: "callee".into(),
                 },
             ],
+            &[],
+            solana_sbpf::program::SBPFVersion::V0,
+            ebpf::MM_BYTECODE_START,
         );
 
         assert_eq!(calls[0].kind, "direct_internal_call");
@@ -2180,9 +2349,171 @@ mod static_tests {
                     name: "collision_b".into(),
                 },
             ],
+            &[],
+            solana_sbpf::program::SBPFVersion::V0,
+            ebpf::MM_BYTECODE_START,
         );
         assert_eq!(ambiguous[0].target_pc, None);
         assert_eq!(ambiguous[0].status, "ambiguous");
+    }
+
+    #[test]
+    fn resolves_constant_callx_targets_for_every_register_encoding() {
+        use solana_sbpf::{ebpf, program::SBPFVersion};
+
+        let target_pc = 16usize;
+        let target_address = ebpf::MM_BYTECODE_START + target_pc as u64 * ebpf::INSN_SIZE as u64;
+        let functions = [
+            FunctionFact {
+                pc: 0,
+                symbol_hash: 0xaaaa,
+                name: "caller".into(),
+            },
+            FunctionFact {
+                pc: target_pc,
+                symbol_hash: 0xbbbb,
+                name: "callee".into(),
+            },
+        ];
+
+        for version in [
+            SBPFVersion::V0,
+            SBPFVersion::V1,
+            SBPFVersion::V2,
+            SBPFVersion::V3,
+            SBPFVersion::V4,
+        ] {
+            let mut instructions = if version.disable_lddw() {
+                vec![
+                    InstructionFact {
+                        pc: 4,
+                        opcode: ebpf::MOV64_IMM,
+                        dst: 9,
+                        src: 0,
+                        offset: 0,
+                        immediate: target_address as u32 as i64,
+                        assembly: "mov64 r9, 0x80".into(),
+                    },
+                    InstructionFact {
+                        pc: 5,
+                        opcode: ebpf::HOR64_IMM,
+                        dst: 9,
+                        src: 0,
+                        offset: 0,
+                        immediate: (target_address >> 32) as i64,
+                        assembly: "hor64 r9, 0x1".into(),
+                    },
+                ]
+            } else {
+                vec![InstructionFact {
+                    pc: 4,
+                    opcode: ebpf::LD_DW_IMM,
+                    dst: 9,
+                    src: 0,
+                    offset: 0,
+                    immediate: target_address as i64,
+                    assembly: format!("lddw r9, 0x{target_address:x}"),
+                }]
+            };
+            let call_pc = instructions.last().unwrap().pc + 1;
+            instructions.push(InstructionFact {
+                pc: call_pc,
+                opcode: ebpf::CALL_REG,
+                dst: if version.callx_uses_dst_reg() { 9 } else { 0 },
+                src: if version.callx_uses_src_reg() { 9 } else { 0 },
+                offset: 0,
+                immediate: if version.callx_uses_src_reg() || version.callx_uses_dst_reg() {
+                    0
+                } else {
+                    9
+                },
+                assembly: "callx r9".into(),
+            });
+            let blocks = [BasicBlockFact {
+                start_pc: 4,
+                end_instruction_index: instructions.len(),
+                destinations: vec![],
+                label: "caller".into(),
+            }];
+
+            let calls = collect_calls(
+                &instructions,
+                &functions,
+                &blocks,
+                version,
+                ebpf::MM_BYTECODE_START,
+            );
+            assert_eq!(calls.len(), 1, "{version:?}");
+            assert_eq!(calls[0].kind, "indirect_internal_call", "{version:?}");
+            assert_eq!(calls[0].target_pc, Some(target_pc), "{version:?}");
+            assert_eq!(calls[0].target_symbol_hash, Some(0xbbbb), "{version:?}");
+            assert_eq!(calls[0].status, "resolved", "{version:?}");
+        }
+    }
+
+    #[test]
+    fn does_not_propagate_callx_constants_across_basic_block_boundaries() {
+        use solana_sbpf::{ebpf, program::SBPFVersion};
+
+        let target_pc = 16usize;
+        let target_address = ebpf::MM_BYTECODE_START + target_pc as u64 * ebpf::INSN_SIZE as u64;
+        let instructions = [
+            InstructionFact {
+                pc: 4,
+                opcode: ebpf::LD_DW_IMM,
+                dst: 9,
+                src: 0,
+                offset: 0,
+                immediate: target_address as i64,
+                assembly: format!("lddw r9, 0x{target_address:x}"),
+            },
+            InstructionFact {
+                pc: 8,
+                opcode: ebpf::CALL_REG,
+                dst: 0,
+                src: 0,
+                offset: 0,
+                immediate: 9,
+                assembly: "callx r9".into(),
+            },
+        ];
+        let functions = [
+            FunctionFact {
+                pc: 0,
+                symbol_hash: 1,
+                name: "caller".into(),
+            },
+            FunctionFact {
+                pc: target_pc,
+                symbol_hash: 2,
+                name: "callee".into(),
+            },
+        ];
+        let blocks = [
+            BasicBlockFact {
+                start_pc: 4,
+                end_instruction_index: 1,
+                destinations: vec![8],
+                label: "load".into(),
+            },
+            BasicBlockFact {
+                start_pc: 8,
+                end_instruction_index: 2,
+                destinations: vec![],
+                label: "call".into(),
+            },
+        ];
+
+        let calls = collect_calls(
+            &instructions,
+            &functions,
+            &blocks,
+            SBPFVersion::V0,
+            ebpf::MM_BYTECODE_START,
+        );
+        assert_eq!(calls[0].kind, "indirect");
+        assert_eq!(calls[0].target_pc, None);
+        assert_eq!(calls[0].status, "unresolved");
     }
 
     #[test]

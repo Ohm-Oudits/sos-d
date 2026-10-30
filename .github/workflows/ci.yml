@@ -53,5 +53,8 @@ jobs:
       - name: Build fixtures
         run: ./scripts/build-fixtures.sh
 
+      - name: Verify callx fixture analysis
+        run: ./scripts/test-callx-fixture.sh
+
       - name: Run address-first local inspect E2E
         run: ./scripts/test-local-inspect.sh
