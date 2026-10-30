@@ -36,8 +36,8 @@ pub use huggingface::{HuggingFaceModelProvider, HUGGING_FACE_GPT_OSS_120B};
 pub use ollama::{trusted_open_model, OllamaModelProvider, OpenModelProfile, TRUSTED_OPEN_MODELS};
 pub use openai::OpenAiModelProvider;
 
-pub const AI_SCHEMA_VERSION: u32 = 3;
-pub const AI_BUNDLE_SCHEMA_VERSION: u32 = 6;
+pub const AI_SCHEMA_VERSION: u32 = 4;
+pub const AI_BUNDLE_SCHEMA_VERSION: u32 = 7;
 pub const MIN_STAGE_OUTPUT_TOKENS: usize = 128;
 pub const MAX_STAGE_OUTPUT_TOKENS: usize = 32_768;
 
@@ -256,6 +256,9 @@ pub struct RecoveredMemoryFieldMapping {
     pub contract_id: String,
     pub field_path: String,
     pub type_name: String,
+    pub offset: i32,
+    pub layout_type: String,
+    pub layout_field: String,
     pub output_fragment: String,
     #[serde(default)]
     pub evidence: Vec<sos_types::EvidenceRef>,
@@ -323,6 +326,8 @@ pub struct MemoryFieldContract {
     pub access_pcs: Vec<usize>,
     pub field_path: String,
     pub type_name: String,
+    pub layout_type: String,
+    pub layout_field: String,
     pub semantic_name_recovered: bool,
     pub evidence: Vec<sos_types::EvidenceRef>,
 }
@@ -847,6 +852,8 @@ fn derive_memory_field_contracts(
             access_pcs.sort_unstable();
             access_pcs.dedup();
             let field_path = format!("account_{}.{}", field.account_index, field.field);
+            let layout_type =
+                layout_type_name(&function_id, &format!("account_{}", field.account_index));
             let evidence = access_pcs
                 .iter()
                 .map(|pc| sos_types::EvidenceRef {
@@ -879,6 +886,8 @@ fn derive_memory_field_contracts(
                 access_pcs,
                 field_path,
                 type_name: fixed_width_type(&[field.width]),
+                layout_type,
+                layout_field: field.field.clone(),
                 semantic_name_recovered: true,
                 evidence,
             });
@@ -901,6 +910,7 @@ fn derive_memory_field_contracts(
         field.access_pcs.insert(access.pc);
     }
     for ((function_id, base_register, offset), field) in generic {
+        let layout_type = layout_type_name(&function_id, &format!("r{base_register}"));
         let widths = field.widths.into_iter().collect::<Vec<_>>();
         let access_pcs = field.access_pcs.into_iter().collect::<Vec<_>>();
         let offset_name = if offset < 0 {
@@ -934,6 +944,8 @@ fn derive_memory_field_contracts(
                 .collect(),
             access_pcs,
             field_path,
+            layout_type,
+            layout_field: format!("field_{offset_name}"),
             semantic_name_recovered: false,
         });
     }
@@ -981,6 +993,29 @@ fn sanitize_contract_component(value: &str) -> String {
             } else {
                 '_'
             }
+        })
+        .collect()
+}
+
+fn layout_type_name(function_id: &str, base: &str) -> String {
+    format!(
+        "SosLayout{}{}",
+        rust_type_component(function_id),
+        rust_type_component(base)
+    )
+}
+
+fn rust_type_component(value: &str) -> String {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            let first = characters
+                .next()
+                .map(|character| character.to_ascii_uppercase())
+                .unwrap_or_default();
+            format!("{first}{}", characters.as_str())
         })
         .collect()
 }
@@ -1214,7 +1249,7 @@ pub struct RefinementOutput {
     pub validation: RefinementValidation,
 }
 
-pub const REFINEMENT_SCHEMA_VERSION: u32 = 1;
+pub const REFINEMENT_SCHEMA_VERSION: u32 = 2;
 
 fn default_refinement_schema_version() -> u32 {
     REFINEMENT_SCHEMA_VERSION
@@ -5064,6 +5099,25 @@ pub fn compile_refinement_output(
         source.push_str(replacement);
         source.push_str("\n\n");
     }
+    let (layout_assertions, mut layout_limitations) = match compile_layout_assertions(refinement) {
+        Ok(assertions) => assertions,
+        Err(error) => {
+            let source_sha256 = sha256_bytes(source.as_bytes());
+            return CompilationResult {
+                schema_version: VALIDATION_SCHEMA_VERSION,
+                status: CompilationStatus::Failed,
+                compiler: compiler.map(|path| path.display().to_string()),
+                source_sha256,
+                diagnostics: vec![error],
+                mir_summary: None,
+                limitations: vec![
+                    "memory-layout assertions reject malformed or conflicting model mappings"
+                        .into(),
+                ],
+            };
+        }
+    };
+    source.push_str(&layout_assertions);
     let source_sha256 = sha256_bytes(source.as_bytes());
 
     let Some(compiler) = compiler else {
@@ -5074,7 +5128,10 @@ pub fn compile_refinement_output(
             source_sha256,
             diagnostics: Vec::new(),
             mir_summary: None,
-            limitations: vec!["no Rust compiler was configured".into()],
+            limitations: {
+                layout_limitations.push("no Rust compiler was configured".into());
+                layout_limitations
+            },
         };
     };
 
@@ -5243,10 +5300,72 @@ pub fn compile_refinement_output(
         source_sha256,
         diagnostics,
         mir_summary,
-        limitations: vec![
-            "compilation checks syntax, types, and bounded MIR structure only; it does not execute the candidate".into(),
-        ],
+        limitations: {
+            layout_limitations.push(
+                "compilation checks syntax, types, and bounded MIR structure only; it does not execute the candidate".into(),
+            );
+            layout_limitations
+        },
     }
+}
+
+fn compile_layout_assertions(
+    refinement: &RefinementOutput,
+) -> Result<(String, Vec<String>), String> {
+    let mut fields = BTreeMap::<(String, String), (i32, String)>::new();
+    let mut limitations = Vec::new();
+    for mapping in refinement
+        .patches
+        .iter()
+        .flat_map(|patch| patch.memory_field_mappings.iter())
+    {
+        if !is_rust_identifier(&mapping.layout_type) || !is_rust_identifier(&mapping.layout_field) {
+            return Err(format!(
+                "memory field mapping {} contains an invalid Rust layout identifier",
+                mapping.contract_id
+            ));
+        }
+        if !matches!(
+            mapping.type_name.as_str(),
+            "u8" | "u16" | "u32" | "u64" | "unknown_bytes"
+        ) {
+            return Err(format!(
+                "memory field mapping {} contains unsupported layout type {}",
+                mapping.contract_id, mapping.type_name
+            ));
+        }
+        let key = (mapping.layout_type.clone(), mapping.layout_field.clone());
+        let expected = (mapping.offset, mapping.type_name.clone());
+        if let Some(previous) = fields.insert(key.clone(), expected.clone()) {
+            if previous != expected {
+                return Err(format!(
+                    "conflicting memory layout expectations for {}.{}",
+                    key.0, key.1
+                ));
+            }
+        }
+    }
+
+    let mut source = String::from("\n// SOS compiler-generated memory layout assertions.\n");
+    for (index, ((layout_type, layout_field), (offset, type_name))) in
+        fields.into_iter().enumerate()
+    {
+        if offset < 0 {
+            limitations.push(format!(
+                "negative machine-relative offset {offset} for {layout_type}.{layout_field} cannot be represented by Rust offset_of!"
+            ));
+            continue;
+        }
+        source.push_str(&format!(
+            "const _: () = assert!(std::mem::offset_of!({layout_type}, {layout_field}) == {offset}usize);\n"
+        ));
+        if type_name != "unknown_bytes" {
+            source.push_str(&format!(
+                "#[allow(dead_code)] fn __sos_layout_type_assert_{index}(value: &{layout_type}) {{ let _: &{type_name} = &value.{layout_field}; }}\n"
+            ));
+        }
+    }
+    Ok((source, limitations))
 }
 
 pub const REFINEMENT_LOOP_SCHEMA_VERSION: u32 = 1;
@@ -6068,10 +6187,29 @@ fn validate_memory_field_mappings(
                 function_id, mapping.contract_id
             )));
         }
-        if mapping.field_path != contract.field_path || mapping.type_name != contract.type_name {
+        if mapping.field_path != contract.field_path
+            || mapping.type_name != contract.type_name
+            || mapping.offset != contract.offset
+            || mapping.layout_type != contract.layout_type
+            || mapping.layout_field != contract.layout_field
+        {
             return Err(AiError::InvalidResponse(format!(
-                "memory field mapping {} must preserve deterministic path {} and type {}",
-                mapping.contract_id, contract.field_path, contract.type_name
+                "memory field mapping {} must preserve deterministic path {}, type {}, offset {}, layout type {}, and layout field {}",
+                mapping.contract_id,
+                contract.field_path,
+                contract.type_name,
+                contract.offset,
+                contract.layout_type,
+                contract.layout_field
+            )));
+        }
+        if candidate_kind == "refinement patch"
+            && contract.offset >= 0
+            && !source_declares_repr_c_layout(source, &contract.layout_type)
+        {
+            return Err(AiError::InvalidResponse(format!(
+                "refinement patch for {} must declare #[repr(C)] struct {} for memory field contract {}",
+                function_id, contract.layout_type, contract.id
             )));
         }
         let fragment = mapping.output_fragment.trim();
@@ -6109,6 +6247,127 @@ fn validate_memory_field_mappings(
         }
     }
     Ok(())
+}
+
+fn source_declares_repr_c_layout(source: &str, layout_type: &str) -> bool {
+    if !is_rust_identifier(layout_type) {
+        return false;
+    }
+    let compact = rust_code_without_comments_and_literals(source)
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    [
+        format!("#[repr(C)]struct{layout_type}{{"),
+        format!("#[repr(C)]pubstruct{layout_type}{{"),
+        format!("#[repr(C)]pub(crate)struct{layout_type}{{"),
+        format!("#[repr(C)]pub(super)struct{layout_type}{{"),
+    ]
+    .iter()
+    .any(|declaration| compact.contains(declaration))
+}
+
+fn rust_code_without_comments_and_literals(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut output = bytes.to_vec();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index..].starts_with(b"//") {
+            let start = index;
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            output[start..index].fill(b' ');
+            continue;
+        }
+        if bytes[index..].starts_with(b"/*") {
+            let start = index;
+            index += 2;
+            let mut depth = 1usize;
+            while index < bytes.len() && depth > 0 {
+                if bytes[index..].starts_with(b"/*") {
+                    depth += 1;
+                    index += 2;
+                } else if bytes[index..].starts_with(b"*/") {
+                    depth -= 1;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            output[start..index].fill(b' ');
+            continue;
+        }
+        let raw_prefix = if bytes[index..].starts_with(b"br") || bytes[index..].starts_with(b"cr") {
+            Some(2usize)
+        } else if bytes[index] == b'r' {
+            Some(1usize)
+        } else {
+            None
+        };
+        if let Some(prefix_len) = raw_prefix {
+            let mut marker = index + prefix_len;
+            while marker < bytes.len() && bytes[marker] == b'#' {
+                marker += 1;
+            }
+            if marker < bytes.len() && bytes[marker] == b'\"' {
+                let hashes = marker - (index + prefix_len);
+                let start = index;
+                index = marker + 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\"'
+                        && index + 1 + hashes <= bytes.len()
+                        && bytes[index + 1..index + 1 + hashes]
+                            .iter()
+                            .all(|byte| *byte == b'#')
+                    {
+                        index += 1 + hashes;
+                        break;
+                    }
+                    index += 1;
+                }
+                output[start..index].fill(b' ');
+                continue;
+            }
+        }
+        let quote = if bytes[index] == b'\"' {
+            Some(b'\"')
+        } else if bytes[index..].starts_with(b"b\"") || bytes[index..].starts_with(b"c\"") {
+            index += 1;
+            Some(b'\"')
+        } else {
+            None
+        };
+        if let Some(quote) = quote {
+            let start = if index > 0 && matches!(bytes[index - 1], b'b' | b'c') {
+                index - 1
+            } else {
+                index
+            };
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == b'\\' {
+                    index = (index + 2).min(bytes.len());
+                } else if bytes[index] == quote {
+                    index += 1;
+                    break;
+                } else {
+                    index += 1;
+                }
+            }
+            output[start..index].fill(b' ');
+            continue;
+        }
+        index += 1;
+    }
+    String::from_utf8(output).unwrap_or_default()
+}
+
+fn is_rust_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    matches!(characters.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 fn validate_control_flow_mappings(
@@ -7010,6 +7269,9 @@ mod tests {
                 "contract_id": contract.id,
                 "field_path": contract.field_path,
                 "type_name": contract.type_name,
+                "offset": contract.offset,
+                "layout_type": contract.layout_type,
+                "layout_field": contract.layout_field,
                 "output_fragment": fragment,
                 "evidence": contract.evidence.first().into_iter().collect::<Vec<_>>(),
             }));
@@ -7410,6 +7672,99 @@ mod tests {
             compile_refinement_output(&invalid, Some(Path::new("rustc")), Duration::from_secs(10));
         assert_eq!(invalid_result.status, CompilationStatus::Failed);
         assert!(!invalid_result.diagnostics.is_empty());
+    }
+
+    fn refinement_with_layout(replacement: &str, type_name: &str) -> RefinementOutput {
+        RefinementOutput {
+            schema_version: REFINEMENT_SCHEMA_VERSION,
+            patches: vec![RefinementPatch {
+                function_id: "fn_0".into(),
+                replacement: replacement.into(),
+                memory_field_mappings: vec![RecoveredMemoryFieldMapping {
+                    contract_id: "layout_fn_0_r1_pos_0x8".into(),
+                    field_path: "unknown_memory_r1.field_pos_0x8".into(),
+                    type_name: type_name.into(),
+                    offset: 8,
+                    layout_type: "SosLayoutFn0R1".into(),
+                    layout_field: "field_pos_0x8".into(),
+                    output_fragment: "unknown_memory_r1.field_pos_0x8".into(),
+                    evidence: vec![],
+                }],
+                evidence: vec![],
+            }],
+            observations: Vec::new(),
+            validation: RefinementValidation {
+                status: "unverified".into(),
+                notes: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn refinement_compiler_proves_repr_c_field_offset_and_type() {
+        let valid = refinement_with_layout(
+            "#[repr(C)] struct SosLayoutFn0R1 { _pad_0: [u8; 8], field_pos_0x8: u64 } fn fn_0() {}",
+            "u64",
+        );
+        let valid_result =
+            compile_refinement_output(&valid, Some(Path::new("rustc")), Duration::from_secs(10));
+        assert_eq!(valid_result.status, CompilationStatus::Passed);
+
+        let wrong_offset = refinement_with_layout(
+            "#[repr(C)] struct SosLayoutFn0R1 { field_pos_0x8: u64 } fn fn_0() {}",
+            "u64",
+        );
+        let wrong_offset_result = compile_refinement_output(
+            &wrong_offset,
+            Some(Path::new("rustc")),
+            Duration::from_secs(10),
+        );
+        assert_eq!(wrong_offset_result.status, CompilationStatus::Failed);
+
+        let wrong_type = refinement_with_layout(
+            "#[repr(C)] struct SosLayoutFn0R1 { _pad_0: [u8; 8], field_pos_0x8: u32 } fn fn_0() {}",
+            "u64",
+        );
+        let wrong_type_result = compile_refinement_output(
+            &wrong_type,
+            Some(Path::new("rustc")),
+            Duration::from_secs(10),
+        );
+        assert_eq!(wrong_type_result.status, CompilationStatus::Failed);
+    }
+
+    #[test]
+    fn refinement_compiler_rejects_malformed_layout_mapping() {
+        let mut refinement = refinement_with_layout(
+            "#[repr(C)] struct SosLayoutFn0R1 { _pad_0: [u8; 8], field_pos_0x8: u64 } fn fn_0() {}",
+            "u64",
+        );
+        refinement.patches[0].memory_field_mappings[0].layout_field = "bad.field".into();
+        let result = compile_refinement_output(
+            &refinement,
+            Some(Path::new("rustc")),
+            Duration::from_secs(10),
+        );
+        assert_eq!(result.status, CompilationStatus::Failed);
+        assert!(result.diagnostics[0].contains("invalid Rust layout identifier"));
+    }
+
+    #[test]
+    fn refinement_compiler_reports_negative_layout_offsets_as_unproved() {
+        let mut refinement = refinement_with_layout("fn fn_0() {}", "u64");
+        let mapping = &mut refinement.patches[0].memory_field_mappings[0];
+        mapping.offset = -8;
+        mapping.layout_field = "field_neg_0x8".into();
+        let result = compile_refinement_output(
+            &refinement,
+            Some(Path::new("rustc")),
+            Duration::from_secs(10),
+        );
+        assert_eq!(result.status, CompilationStatus::Passed);
+        assert!(result
+            .limitations
+            .iter()
+            .any(|limitation| limitation.contains("cannot be represented by Rust offset_of!")));
     }
 
     #[test]
@@ -8473,7 +8828,7 @@ fn fn_80(_1: bool, _2: bool) -> () {
             max_output_tokens: 1_200,
         };
         let valid_refinement = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": REFINEMENT_SCHEMA_VERSION,
             "patches": [{
                 "function_id": "fn_0",
                 "replacement": valid_source,
@@ -8865,6 +9220,8 @@ fn fn_80(_1: bool, _2: bool) -> () {
         assert_eq!(contracts[0].access_kinds, vec!["store"]);
         assert_eq!(contracts[0].field_path, "unknown_memory_r1.field_pos_0x8");
         assert_eq!(contracts[0].type_name, "u64");
+        assert_eq!(contracts[0].layout_type, "SosLayoutFn0R1");
+        assert_eq!(contracts[0].layout_field, "field_pos_0x8");
         assert!(!contracts[0].semantic_name_recovered);
         let hosted = crate::groq::hosted_model_evidence(&pack);
         assert_eq!(
@@ -8911,14 +9268,17 @@ fn fn_80(_1: bool, _2: bool) -> () {
             .contains("memory fields"));
 
         let refinement_output = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": REFINEMENT_SCHEMA_VERSION,
             "patches": [{
                 "function_id": "fn_0",
-                "replacement": "fn fn_0() { let recovered: u64 = unknown_memory_r1.field_pos_0x8; unknown_memory_write(); }",
+                "replacement": "#[repr(C)] struct SosLayoutFn0R1 { _pad_0: [u8; 8], field_pos_0x8: u64 } fn fn_0() { let unknown_memory_r1 = SosLayoutFn0R1 { _pad_0: [0; 8], field_pos_0x8: 0 }; let recovered: u64 = unknown_memory_r1.field_pos_0x8; unknown_memory_write(); }",
                 "memory_field_mappings": [{
                     "contract_id": contracts[0].id.clone(),
                     "field_path": contracts[0].field_path.clone(),
                     "type_name": contracts[0].type_name.clone(),
+                    "offset": contracts[0].offset,
+                    "layout_type": contracts[0].layout_type.clone(),
+                    "layout_field": contracts[0].layout_field.clone(),
                     "output_fragment": "let recovered: u64 = unknown_memory_r1.field_pos_0x8;",
                     "evidence": [contracts[0].evidence[0].clone()]
                 }],
@@ -8931,6 +9291,23 @@ fn fn_80(_1: bool, _2: bool) -> () {
         refinement_request.task = ModelTask::Refinement;
         refinement_request.evidence_pack.task = ModelTask::Refinement;
         validate_structured_consistency(&refinement_request, &refinement_output).unwrap();
+        let mut missing_layout = refinement_output.clone();
+        missing_layout["patches"][0]["replacement"] = serde_json::json!(
+            "// #[repr(C)] struct SosLayoutFn0R1 { field_pos_0x8: u64 }\nfn fn_0() { let unknown_memory_r1 = unknown(); let recovered: u64 = unknown_memory_r1.field_pos_0x8; unknown_memory_write(); }"
+        );
+        assert!(
+            validate_structured_consistency(&refinement_request, &missing_layout)
+                .unwrap_err()
+                .to_string()
+                .contains("must declare #[repr(C)] struct")
+        );
+
+        let mut string_only_layout = refinement_output.clone();
+        string_only_layout["patches"][0]["replacement"] = serde_json::json!(
+            "fn fn_0() { let fake = \"#[repr(C)] struct SosLayoutFn0R1 { field_pos_0x8: u64 }\"; let unknown_memory_r1 = unknown(); let recovered: u64 = unknown_memory_r1.field_pos_0x8; unknown_memory_write(); }"
+        );
+        assert!(validate_structured_consistency(&refinement_request, &string_only_layout).is_err());
+
         let mut renamed_refinement = refinement_output;
         renamed_refinement["patches"][0]["memory_field_mappings"][0]["field_path"] =
             serde_json::json!("account.balance");
@@ -9005,6 +9382,8 @@ fn fn_80(_1: bool, _2: bool) -> () {
         assert_eq!(signer.offset, 48);
         assert_eq!(signer.machine_offsets, vec![-64]);
         assert_eq!(signer.type_name, "u8");
+        assert_eq!(signer.layout_type, "SosLayoutFn0Account0");
+        assert_eq!(signer.layout_field, "is_signer");
         assert!(signer.semantic_name_recovered);
     }
 
@@ -9427,7 +9806,7 @@ fn fn_80(_1: bool, _2: bool) -> () {
             max_output_tokens: default_stage_output_tokens(ModelTask::Refinement),
         };
         let unsupported = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": REFINEMENT_SCHEMA_VERSION,
             "patches": [],
             "observations": [{"kind": "host_call", "value": "exec", "evidence": []}],
             "validation": {"status": "unverified", "notes": []}
@@ -9435,7 +9814,7 @@ fn fn_80(_1: bool, _2: bool) -> () {
         assert!(validate_structured_consistency(&request, &unsupported).is_err());
 
         let missing_evidence = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": REFINEMENT_SCHEMA_VERSION,
             "patches": [],
             "observations": [{"kind": "log_contains", "value": "log", "evidence": []}],
             "validation": {"status": "unverified", "notes": []}

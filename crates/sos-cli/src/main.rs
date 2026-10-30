@@ -50,8 +50,8 @@ const HUMANIZATION_PROMPT_VERSION: &str = "sos-v2";
 const DETERMINISTIC_HUMANIZER_ID: &str = "sos-deterministic-syntax-v1";
 const HUMANIZATION_CACHE_SCHEMA_VERSION: u32 = 2;
 const HUMANIZATION_CACHE_RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
-const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v10";
-const LIFT_CACHE_SCHEMA_VERSION: u32 = 11;
+const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v11";
+const LIFT_CACHE_SCHEMA_VERSION: u32 = 12;
 const LIFT_CACHE_RECORD_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 fn main() -> ExitCode {
@@ -5551,7 +5551,7 @@ mod tests {
                         "observations": []
                     }),
                     sos_ai::ModelTask::Refinement => serde_json::json!({
-                        "schema_version": 1,
+                        "schema_version": sos_ai::REFINEMENT_SCHEMA_VERSION,
                         "patches": [{
                             "function_id": function_id,
                             "replacement": format!("fn {function_id}() -> unknown {{}}"),

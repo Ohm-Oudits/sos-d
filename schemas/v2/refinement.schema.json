@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sos-decompiler.dev/schema/v2/refinement.schema.json",
+  "title": "SOS AI refinement output with compiler-verifiable memory layouts",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "patches", "observations", "validation"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "patches": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "required": ["function_id", "replacement", "memory_field_mappings", "evidence"],
+        "properties": {
+          "function_id": {"type": "string", "minLength": 1},
+          "replacement": {"type": "string", "maxLength": 65536},
+          "memory_field_mappings": {
+            "type": "array",
+            "maxItems": 1024,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["contract_id", "field_path", "type_name", "offset", "layout_type", "layout_field", "output_fragment", "evidence"],
+              "properties": {
+                "contract_id": {"type": "string", "minLength": 1},
+                "field_path": {"type": "string", "minLength": 1, "maxLength": 256},
+                "type_name": {"enum": ["u8", "u16", "u32", "u64", "unknown_bytes"]},
+                "offset": {"type": "integer"},
+                "layout_type": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "maxLength": 128},
+                "layout_field": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "maxLength": 128},
+                "output_fragment": {"type": "string", "minLength": 2, "maxLength": 512},
+                "evidence": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 1,
+                  "items": {"$ref": "#/$defs/evidence_ref"}
+                }
+              }
+            }
+          },
+          "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence_ref"}}
+        }
+      }
+    },
+    "observations": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "required": ["kind", "value", "evidence"],
+        "properties": {
+          "kind": {"enum": ["log_contains", "cpi_target", "status", "return_data_base64"]},
+          "value": {"type": "string", "maxLength": 512},
+          "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence_ref"}}
+        }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "required": ["status", "notes"],
+      "properties": {
+        "status": {"enum": ["validated", "unverified", "rejected", "not_available"]},
+        "notes": {"type": "array", "items": {"type": "string", "maxLength": 2048}}
+      }
+    }
+  },
+  "$defs": {
+    "evidence_ref": {
+      "type": "object",
+      "required": ["source", "location"],
+      "properties": {
+        "source": {"type": "string"},
+        "location": {"type": "string"},
+        "detail": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

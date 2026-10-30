@@ -169,13 +169,22 @@ mod tests {
                 include_str!("../../../schemas/v3/evidence-pack.schema.json"),
                 3,
             ),
+            (
+                include_str!("../../../schemas/v4/evidence-pack.schema.json"),
+                4,
+            ),
             (include_str!("../../../schemas/v1/ai-bundle.schema.json"), 1),
             (include_str!("../../../schemas/v2/ai-bundle.schema.json"), 2),
             (include_str!("../../../schemas/v3/ai-bundle.schema.json"), 3),
             (include_str!("../../../schemas/v6/ai-bundle.schema.json"), 6),
+            (include_str!("../../../schemas/v7/ai-bundle.schema.json"), 7),
             (
                 include_str!("../../../schemas/v1/refinement.schema.json"),
                 1,
+            ),
+            (
+                include_str!("../../../schemas/v2/refinement.schema.json"),
+                2,
             ),
             (
                 include_str!("../../../schemas/v1/validation.schema.json"),

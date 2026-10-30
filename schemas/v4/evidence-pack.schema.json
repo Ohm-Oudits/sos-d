@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sos-decompiler.dev/schema/v4/evidence-pack.json",
+  "title": "SOS AI evidence pack with compiler-verifiable memory layouts",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "task",
+    "analysis",
+    "ir",
+    "semantics",
+    "signature_contracts",
+    "pseudocode_obligations",
+    "control_flow_regions",
+    "memory_field_contracts",
+    "untrusted_evidence"
+  ],
+  "properties": {
+    "schema_version": {"const": 4},
+    "task": {
+      "enum": [
+        "structure_recovery",
+        "signature_recovery",
+        "semantic_labeling",
+        "explanation",
+        "refinement",
+        "pseudocode_humanization"
+      ]
+    },
+    "artifact_sha256": {"type": ["string", "null"]},
+    "analysis": {"$ref": "../v1/static-analysis.schema.json"},
+    "ir": {"$ref": "../v1/canonical-ir.schema.json"},
+    "semantics": {"type": "object"},
+    "signature_contracts": {"type": "array", "maxItems": 128},
+    "pseudocode_obligations": {"type": "array", "maxItems": 128},
+    "control_flow_regions": {"type": "array", "maxItems": 256},
+    "memory_field_contracts": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "function_id",
+          "kind",
+          "base",
+          "offset",
+          "machine_offsets",
+          "widths",
+          "access_kinds",
+          "access_pcs",
+          "field_path",
+          "type_name",
+          "layout_type",
+          "layout_field",
+          "semantic_name_recovered",
+          "evidence"
+        ],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "function_id": {"type": "string", "minLength": 1},
+          "kind": {"enum": ["register_offset", "sol_account_info"]},
+          "base": {"type": "string", "minLength": 1},
+          "offset": {"type": "integer"},
+          "machine_offsets": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"type": "integer"}
+          },
+          "widths": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"enum": [1, 2, 4, 8]}
+          },
+          "access_kinds": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"enum": ["load", "store"]}
+          },
+          "access_pcs": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"type": "integer", "minimum": 0}
+          },
+          "field_path": {"type": "string", "minLength": 1, "maxLength": 256},
+          "type_name": {"enum": ["u8", "u16", "u32", "u64", "unknown_bytes"]},
+          "layout_type": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "maxLength": 128},
+          "layout_field": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "maxLength": 128},
+          "semantic_name_recovered": {"type": "boolean"},
+          "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"$ref": "#/$defs/evidence_ref"}
+          }
+        }
+      }
+    },
+    "untrusted_evidence": {"type": "array"}
+  },
+  "$defs": {
+    "evidence_ref": {
+      "type": "object",
+      "required": ["source", "location"],
+      "properties": {
+        "source": {"type": "string"},
+        "location": {"type": "string"},
+        "detail": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

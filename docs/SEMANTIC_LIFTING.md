@@ -65,12 +65,17 @@ satisfy several CFG regions.
 Fixed-width machine accesses are also converted into immutable memory-field
 contracts. Contracts preserve logical and observed machine offsets, all observed
 widths, load/store kinds, access PCs, a conservative field path, and exact
-instruction evidence. Complete stack-materialized `SolAccountInfo` records use
+instruction evidence. Each contract also names a deterministic Rust layout type
+and field. Complete stack-materialized `SolAccountInfo` records use
 recovered names such as `account_0.is_signer`; all other accesses keep stable
 `unknown_memory_*` paths. Structure and refinement responses must map every
 contract to a distinct source expression. An untrusted semantic-stage guess
 cannot silently rename an unresolved offset to `balance`, `authority`, or another
-plausible field.
+plausible field. Refinement source must declare each nonnegative layout as an
+immediately attributed `#[repr(C)]` struct. Before rustc runs, SOS appends
+compile-time `std::mem::offset_of!` assertions and primitive reference-type
+checks for every mapped field. This verifies the declared record layout; it does
+not by itself prove that every runtime pointer has that record type.
 
 Before accepting a signature, SOS runs a conservative forward live-in analysis
 over the scoped SBPF CFG. Argument registers `r1` through `r5` begin as possible
@@ -142,7 +147,7 @@ The default `--model` can be overridden independently with
 validation rejects any bundle created with a different stage assignment.
 The parallel `--structure-tokens`, `--signature-tokens`, `--semantic-tokens`,
 `--explanation-tokens`, and `--refinement-tokens` flags bound generated output;
-the selected budget is sent to the provider, recorded in AI bundle schema v6,
+the selected budget is sent to the provider, recorded in AI bundle schema v7,
 and included in checkpoint validation.
 The local GPT-OSS adapter selects Ollama's `low` reasoning mode so reasoning
 tokens leave room for final schema-constrained JSON. Structure and signature
@@ -452,6 +457,8 @@ destination-address inputs from stored-value inputs across SBPF and MIR, and
 distinct per-write role signatures are checked independently. Compiler CFG
 validation now additionally requires one-to-one branch/loop region coverage,
 branch arity, joins/exits, and nesting. Deterministic memory-field contracts now
-preserve fixed widths and byte offsets through both source-producing stages. The
-remaining judge work is compiler-level struct offset verification, stronger
-call-graph non-regression constraints, and multi-transaction path coverage.
+preserve fixed widths and byte offsets through both source-producing stages, and
+rustc now verifies nonnegative `#[repr(C)]` offsets and primitive field types.
+Negative frame-relative offsets remain explicit evidence rather than record
+layout assertions. The remaining judge work is stronger call-graph
+non-regression constraints and multi-transaction path coverage.

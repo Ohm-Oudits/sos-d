@@ -7,8 +7,8 @@ tooling. The replay trace is v2 because account-state provenance was added after
 the original trace contract. AI pipeline bundle v3 introduced an
 evidence-constrained signature-recovery stage between structure recovery and
 semantic labeling; v2 had added each stage's enforced output-token budget in
-addition to model identity. The current v6 contract also enforces the v3
-memory-layout evidence pack described below.
+addition to model identity. The current v7 contract also enforces the v4
+compiler-verifiable memory-layout evidence pack described below.
 The evidence pack is v2 because gateway-accepted signature hypotheses are
 carried as response-hash-bound contracts that later source stages must preserve.
 For textual pseudocode, it also carries deterministic source-line obligations
@@ -23,6 +23,11 @@ logical and observed machine offsets, widths, access kinds/PCs, conservative
 field paths, and whether a semantic SolAccountInfo name was deterministically
 recovered. AI-bundle v6 invalidates older checkpoints that did not prove these
 contracts in both structure and refinement output.
+Evidence-pack v4 adds deterministic Rust layout type/field identifiers. Final
+refinements must preserve those identifiers and offsets in their mappings and
+declare matching `#[repr(C)]` records. SOS injects rustc `offset_of!` and
+primitive field-type assertions. AI-bundle v7 invalidates checkpoints created
+before this compiler proof was part of refinement schema v2.
 
 Compatibility rules:
 

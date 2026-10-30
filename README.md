@@ -237,14 +237,20 @@ is also constrained by a conservative SBPF live-in analysis: every incoming
 model parameter and cited at its first-use instruction. Names and types remain
 explicit hypotheses; the register mapping is deterministic evidence.
 
-Evidence-pack schema v3 additionally derives immutable fixed-offset memory-field
+Evidence-pack schema v4 additionally derives immutable fixed-offset memory-field
 contracts. Each contract records its function, logical offset, observed machine
 offset, access widths/kinds/PCs, conservative field path, and exact instruction
-evidence. Fully recognized stack-materialized `SolAccountInfo` records use paths
+evidence, plus deterministic Rust layout type and field identifiers. Fully
+recognized stack-materialized `SolAccountInfo` records use paths
 such as `account_0.is_signer`; unresolved accesses retain neutral names such as
 `unknown_memory_r1.field_pos_0x8`. Both structure and final refinement output
 must map every contract to a unique source expression and may not replace an
-unknown field with an unsupported semantic guess.
+unknown field with an unsupported semantic guess. Final refinements must also
+declare the named layout as `#[repr(C)]`; SOS injects `offset_of!` and primitive
+field-type assertions into the bounded rustc input. A cosmetic mapping, wrong
+padding, or wrong primitive field type therefore fails compilation. Negative
+machine-relative stack offsets remain evidence-only because they are not Rust
+record offsets.
 
 ```bash
 ollama pull gpt-oss:20b
