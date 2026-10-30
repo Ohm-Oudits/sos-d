@@ -109,7 +109,8 @@ The deterministic core must use runtime-aligned SBPF decoding and provide:
 - call graph, tail calls, recursion/SCCs, and unresolved calls. An indirect call may
   be promoted to an exact edge only when version-aware register propagation proves a
   single function-entry virtual address; path-dependent or multi-target values must
-  retain explicit uncertainty;
+  retain explicit uncertainty. Bounded candidate lists must be serialized separately
+  from the exact target field and must be labeled potentially incomplete;
 - register liveness, stack slots, frame bounds, and memory-offset accesses;
 - constants, strings, public-key-shaped values, format strings, and relocations;
 - syscall calls, known signatures, and memory effects;

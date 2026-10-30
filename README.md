@@ -120,8 +120,11 @@ cargo run -p sos-cli -- inspect <PROGRAM_ADDRESS> \
 Call analysis resolves both unique immediate internal calls and `callx` sites whose
 version-specific target register is proven, within one basic block, to contain one
 aligned function-entry virtual address. Those edges become immutable source and
-rustc-MIR target contracts for the model pipeline. Path-dependent function pointers
-remain visibly unresolved; SOS does not ask the model to choose a callee.
+rustc-MIR target contracts for the model pipeline. A bounded lattice also carries up
+to eight path-dependent function-pointer candidates across CFG joins and direct-call
+argument handoffs. These appear as `call_candidates` with no exact `target_pc`; SOS
+instructs the model to preserve the uncertain dispatch and never choose one callee or
+claim the set is exhaustive.
 
 Add `--history N` to save available transaction signatures and parsed transaction
 evidence as `history.json`. Missing archive state is recorded as `not_available` and

@@ -231,6 +231,7 @@ pub(crate) fn hosted_model_evidence(pack: &crate::EvidencePack) -> serde_json::V
                 "asm": operation.assembly.chars().take(160).collect::<String>(),
                 "effect": operation.memory_effect,
                 "call": operation.call_target_pc,
+                "call_candidates": operation.call_target_pcs,
             })
         })
         .collect::<Vec<_>>();

@@ -1,7 +1,7 @@
 //! Deterministic analysis pipeline contracts.
 
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     fmt,
     ptr::NonNull,
     sync::Arc,
@@ -227,6 +227,11 @@ pub struct CallFact {
     pub caller_pc: Option<usize>,
     pub kind: String,
     pub target_pc: Option<usize>,
+    /// Bounded statically recovered target candidates. A proven singleton is
+    /// present here and in `target_pc`; candidate-only sets leave `target_pc`
+    /// empty so consumers cannot mistake an incomplete points-to set for proof.
+    #[serde(default)]
+    pub target_pcs: Vec<usize>,
     pub target_symbol_hash: Option<u32>,
     pub status: String,
 }
@@ -318,6 +323,8 @@ pub struct IrOperation {
     pub immediate: i64,
     pub memory_effect: Option<String>,
     pub call_target_pc: Option<usize>,
+    #[serde(default)]
+    pub call_target_pcs: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,6 +440,7 @@ pub fn build_canonical_ir(analysis: &StaticAnalysis) -> CanonicalIr {
                     )
                 }),
                 call_target_pc: call.and_then(|call| call.target_pc),
+                call_target_pcs: call.map(|call| call.target_pcs.clone()).unwrap_or_default(),
             });
         }
     }
@@ -1131,7 +1139,7 @@ fn collect_constant_callx_targets(
         }
 
         match instruction.opcode {
-            ebpf::LD_DW_IMM | ebpf::MOV32_IMM | ebpf::MOV64_IMM => {
+            ebpf::LD_DW_IMM | ebpf::MOV64_IMM => {
                 update_immediate(
                     &mut registers,
                     instruction.dst,
@@ -1139,8 +1147,25 @@ fn collect_constant_callx_targets(
                     instruction.pc,
                 );
             }
-            ebpf::MOV32_REG | ebpf::MOV64_REG => {
+            ebpf::MOV32_IMM => update_immediate(
+                &mut registers,
+                instruction.dst,
+                zero_extend_32(instruction.immediate),
+                instruction.pc,
+            ),
+            ebpf::MOV64_REG => {
                 let source = registers.get(instruction.src as usize).copied().flatten();
+                update_register(&mut registers, instruction.dst, source);
+            }
+            ebpf::MOV32_REG => {
+                let source = registers
+                    .get(instruction.src as usize)
+                    .copied()
+                    .flatten()
+                    .map(|mut value| {
+                        value.value = zero_extend_32(value.value);
+                        value
+                    });
                 update_register(&mut registers, instruction.dst, source);
             }
             ebpf::HOR64_IMM if sbpf_version.disable_lddw() => {
@@ -1151,7 +1176,7 @@ fn collect_constant_callx_targets(
                         as i64;
                 }
             }
-            ebpf::ADD32_IMM | ebpf::ADD64_IMM => {
+            ebpf::ADD64_IMM => {
                 update_arithmetic(
                     &mut registers,
                     instruction.dst,
@@ -1159,7 +1184,7 @@ fn collect_constant_callx_targets(
                     false,
                 );
             }
-            ebpf::SUB32_IMM | ebpf::SUB64_IMM => {
+            ebpf::SUB64_IMM => {
                 update_arithmetic(
                     &mut registers,
                     instruction.dst,
@@ -1167,7 +1192,19 @@ fn collect_constant_callx_targets(
                     true,
                 );
             }
-            ebpf::ADD32_REG | ebpf::ADD64_REG => {
+            ebpf::ADD32_IMM => update_arithmetic_32(
+                &mut registers,
+                instruction.dst,
+                Some(instruction.immediate),
+                false,
+            ),
+            ebpf::SUB32_IMM => update_arithmetic_32(
+                &mut registers,
+                instruction.dst,
+                Some(instruction.immediate),
+                true,
+            ),
+            ebpf::ADD64_REG => {
                 let operand = registers
                     .get(instruction.src as usize)
                     .copied()
@@ -1175,13 +1212,26 @@ fn collect_constant_callx_targets(
                     .map(|value| value.value);
                 update_arithmetic(&mut registers, instruction.dst, operand, false);
             }
-            ebpf::SUB32_REG | ebpf::SUB64_REG => {
+            ebpf::SUB64_REG => {
                 let operand = registers
                     .get(instruction.src as usize)
                     .copied()
                     .flatten()
                     .map(|value| value.value);
                 update_arithmetic(&mut registers, instruction.dst, operand, true);
+            }
+            ebpf::ADD32_REG | ebpf::SUB32_REG => {
+                let operand = registers
+                    .get(instruction.src as usize)
+                    .copied()
+                    .flatten()
+                    .map(|value| value.value);
+                update_arithmetic_32(
+                    &mut registers,
+                    instruction.dst,
+                    operand,
+                    instruction.opcode == ebpf::SUB32_REG,
+                );
             }
             ebpf::CALL_IMM | ebpf::CALL_REG => {
                 for register in registers.iter_mut().take(6) {
@@ -1196,6 +1246,387 @@ fn collect_constant_callx_targets(
     }
 
     targets
+}
+
+const MAX_INDIRECT_TARGET_CANDIDATES: usize = 8;
+const MAX_INTERPROCEDURAL_VALUE_ROUNDS: usize = 16;
+
+type ConstantValueSet = Option<BTreeSet<i64>>;
+type RegisterValueSets = [ConstantValueSet; 11];
+type CallArgumentValueSets = [ConstantValueSet; 5];
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ValueSetAnalysis {
+    callx_values: BTreeMap<usize, BTreeSet<i64>>,
+    call_arguments: BTreeMap<usize, CallArgumentValueSets>,
+}
+
+fn unknown_register_value_sets() -> RegisterValueSets {
+    std::array::from_fn(|_| None)
+}
+
+fn bounded_value_union(left: &BTreeSet<i64>, right: &BTreeSet<i64>) -> ConstantValueSet {
+    let values = left.union(right).copied().collect::<BTreeSet<_>>();
+    (values.len() <= MAX_INDIRECT_TARGET_CANDIDATES).then_some(values)
+}
+
+fn merge_register_value_sets(
+    existing: &mut RegisterValueSets,
+    incoming: &RegisterValueSets,
+) -> bool {
+    let mut changed = false;
+    for register in 0..existing.len() {
+        let merged = match (&existing[register], &incoming[register]) {
+            (Some(left), Some(right)) => bounded_value_union(left, right),
+            _ => None,
+        };
+        if existing[register] != merged {
+            existing[register] = merged;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn bounded_binary_values(
+    left: &ConstantValueSet,
+    right: &ConstantValueSet,
+    operation: impl Fn(i64, i64) -> i64,
+) -> ConstantValueSet {
+    let (Some(left), Some(right)) = (left, right) else {
+        return None;
+    };
+    let mut values = BTreeSet::new();
+    for left in left {
+        for right in right {
+            values.insert(operation(*left, *right));
+            if values.len() > MAX_INDIRECT_TARGET_CANDIDATES {
+                return None;
+            }
+        }
+    }
+    Some(values)
+}
+
+fn apply_value_set_instruction(
+    registers: &mut RegisterValueSets,
+    instruction: &InstructionFact,
+    sbpf_version: solana_sbpf::program::SBPFVersion,
+) {
+    use solana_sbpf::ebpf;
+
+    let destination = instruction.dst as usize;
+    if destination >= registers.len() {
+        return;
+    }
+    match instruction.opcode {
+        ebpf::LD_DW_IMM | ebpf::MOV64_IMM => {
+            registers[destination] = Some(BTreeSet::from([instruction.immediate]));
+        }
+        ebpf::MOV32_IMM => {
+            registers[destination] = Some(BTreeSet::from([zero_extend_32(instruction.immediate)]));
+        }
+        ebpf::MOV64_REG => {
+            registers[destination] = registers
+                .get(instruction.src as usize)
+                .cloned()
+                .unwrap_or(None);
+        }
+        ebpf::MOV32_REG => {
+            registers[destination] = registers
+                .get(instruction.src as usize)
+                .and_then(|values| values.as_ref())
+                .map(|values| values.iter().map(|value| zero_extend_32(*value)).collect());
+        }
+        ebpf::HOR64_IMM if sbpf_version.disable_lddw() => {
+            registers[destination] = registers[destination].as_ref().map(|values| {
+                values
+                    .iter()
+                    .map(|value| {
+                        ((*value as u64) | (instruction.immediate as u64).wrapping_shl(32)) as i64
+                    })
+                    .collect()
+            });
+        }
+        ebpf::ADD64_IMM => {
+            registers[destination] = registers[destination].as_ref().map(|values| {
+                values
+                    .iter()
+                    .map(|value| value.wrapping_add(instruction.immediate))
+                    .collect()
+            });
+        }
+        ebpf::SUB64_IMM => {
+            registers[destination] = registers[destination].as_ref().map(|values| {
+                values
+                    .iter()
+                    .map(|value| value.wrapping_sub(instruction.immediate))
+                    .collect()
+            });
+        }
+        ebpf::ADD32_IMM | ebpf::SUB32_IMM => {
+            let subtract = instruction.opcode == ebpf::SUB32_IMM;
+            registers[destination] = registers[destination].as_ref().map(|values| {
+                values
+                    .iter()
+                    .map(|value| alu_32(*value, instruction.immediate, subtract))
+                    .collect()
+            });
+        }
+        ebpf::ADD64_REG => {
+            let source = registers
+                .get(instruction.src as usize)
+                .cloned()
+                .unwrap_or(None);
+            registers[destination] =
+                bounded_binary_values(&registers[destination], &source, i64::wrapping_add);
+        }
+        ebpf::SUB64_REG => {
+            let source = registers
+                .get(instruction.src as usize)
+                .cloned()
+                .unwrap_or(None);
+            registers[destination] =
+                bounded_binary_values(&registers[destination], &source, i64::wrapping_sub);
+        }
+        ebpf::ADD32_REG | ebpf::SUB32_REG => {
+            let source = registers
+                .get(instruction.src as usize)
+                .cloned()
+                .unwrap_or(None);
+            let subtract = instruction.opcode == ebpf::SUB32_REG;
+            registers[destination] =
+                bounded_binary_values(&registers[destination], &source, |left, right| {
+                    alu_32(left, right, subtract)
+                });
+        }
+        ebpf::CALL_IMM | ebpf::CALL_REG => {
+            for register in registers.iter_mut().take(6) {
+                *register = None;
+            }
+        }
+        _ if writes_register(instruction.opcode) => registers[destination] = None,
+        _ => {}
+    }
+}
+
+fn analyze_cfg_value_sets(
+    instructions: &[InstructionFact],
+    functions: &[FunctionFact],
+    basic_blocks: &[BasicBlockFact],
+    sbpf_version: solana_sbpf::program::SBPFVersion,
+    function_entry_values: &BTreeMap<usize, RegisterValueSets>,
+) -> ValueSetAnalysis {
+    use solana_sbpf::ebpf;
+
+    let instruction_indices = instructions
+        .iter()
+        .enumerate()
+        .map(|(index, instruction)| (instruction.pc, index))
+        .collect::<BTreeMap<_, _>>();
+    let mut sorted_functions = functions.to_vec();
+    sorted_functions.sort_by_key(|function| function.pc);
+    let mut result = ValueSetAnalysis::default();
+
+    for (function_index, function) in sorted_functions.iter().enumerate() {
+        let next_function_pc = sorted_functions.get(function_index + 1).map(|next| next.pc);
+        let mut blocks = basic_blocks
+            .iter()
+            .filter(|block| {
+                block.start_pc >= function.pc
+                    && next_function_pc.is_none_or(|next| block.start_pc < next)
+            })
+            .collect::<Vec<_>>();
+        blocks.sort_by_key(|block| block.start_pc);
+        let Some(entry_block) = blocks.first() else {
+            continue;
+        };
+        let blocks_by_start = blocks
+            .iter()
+            .map(|block| (block.start_pc, *block))
+            .collect::<BTreeMap<_, _>>();
+        let mut entries = BTreeMap::from([(
+            entry_block.start_pc,
+            function_entry_values
+                .get(&function.pc)
+                .cloned()
+                .unwrap_or_else(unknown_register_value_sets),
+        )]);
+        let mut worklist = VecDeque::from([entry_block.start_pc]);
+
+        while let Some(block_pc) = worklist.pop_front() {
+            let Some(block) = blocks_by_start.get(&block_pc) else {
+                continue;
+            };
+            let Some(start_index) = instruction_indices.get(&block_pc).copied() else {
+                continue;
+            };
+            let end_index = block.end_instruction_index.min(instructions.len());
+            if end_index <= start_index {
+                continue;
+            }
+            let mut registers = entries
+                .get(&block_pc)
+                .cloned()
+                .unwrap_or_else(unknown_register_value_sets);
+
+            for instruction in &instructions[start_index..end_index] {
+                if instruction.opcode == ebpf::CALL_REG {
+                    let values = callx_target_register(instruction, sbpf_version)
+                        .and_then(|register| registers[register as usize].clone());
+                    if let Some(values) = values {
+                        result.callx_values.insert(instruction.pc, values);
+                    } else {
+                        result.callx_values.remove(&instruction.pc);
+                    }
+                }
+                if instruction.opcode == ebpf::CALL_IMM {
+                    result.call_arguments.insert(
+                        instruction.pc,
+                        std::array::from_fn(|index| registers[index + 1].clone()),
+                    );
+                }
+                apply_value_set_instruction(&mut registers, instruction, sbpf_version);
+            }
+
+            for destination in &block.destinations {
+                if !blocks_by_start.contains_key(destination) {
+                    continue;
+                }
+                if let Some(existing) = entries.get_mut(destination) {
+                    if merge_register_value_sets(existing, &registers) {
+                        worklist.push_back(*destination);
+                    }
+                } else {
+                    entries.insert(*destination, registers.clone());
+                    worklist.push_back(*destination);
+                }
+            }
+        }
+    }
+
+    result
+}
+
+fn unique_direct_call_target(
+    instruction: &InstructionFact,
+    functions: &[FunctionFact],
+    sbpf_version: solana_sbpf::program::SBPFVersion,
+) -> Option<usize> {
+    use solana_sbpf::ebpf;
+
+    if instruction.opcode != ebpf::CALL_IMM || instruction.assembly.starts_with("syscall ") {
+        return None;
+    }
+    let mut targets = if sbpf_version.static_syscalls() {
+        if instruction.src != 1 {
+            return None;
+        }
+        let target_pc = sbpf_version
+            .calculate_call_imm_target_pc(instruction.pc, instruction.immediate)
+            as usize;
+        functions
+            .iter()
+            .filter(move |function| function.pc == target_pc)
+            .map(|function| function.pc)
+            .collect::<Vec<_>>()
+    } else {
+        let symbol_hash = instruction.immediate as u32;
+        functions
+            .iter()
+            .filter(move |function| symbol_hash != 0 && function.symbol_hash == symbol_hash)
+            .map(|function| function.pc)
+            .collect::<Vec<_>>()
+    };
+    targets.sort_unstable();
+    targets.dedup();
+    (targets.len() == 1).then_some(targets[0])
+}
+
+fn collect_cfg_callx_target_candidates(
+    instructions: &[InstructionFact],
+    functions: &[FunctionFact],
+    basic_blocks: &[BasicBlockFact],
+    sbpf_version: solana_sbpf::program::SBPFVersion,
+    text_section_vaddr: u64,
+) -> BTreeMap<usize, Vec<(usize, u32)>> {
+    use solana_sbpf::ebpf;
+
+    let instructions_by_pc = instructions
+        .iter()
+        .map(|instruction| (instruction.pc, instruction))
+        .collect::<BTreeMap<_, _>>();
+    let mut entry_values = BTreeMap::<usize, RegisterValueSets>::new();
+    let mut value_analysis = analyze_cfg_value_sets(
+        instructions,
+        functions,
+        basic_blocks,
+        sbpf_version,
+        &entry_values,
+    );
+
+    for _ in 0..MAX_INTERPROCEDURAL_VALUE_ROUNDS {
+        let mut next_entry_values = BTreeMap::<usize, RegisterValueSets>::new();
+        for (call_pc, arguments) in &value_analysis.call_arguments {
+            let Some(instruction) = instructions_by_pc.get(call_pc) else {
+                continue;
+            };
+            let Some(target_pc) = unique_direct_call_target(instruction, functions, sbpf_version)
+            else {
+                continue;
+            };
+            let target_entry = next_entry_values
+                .entry(target_pc)
+                .or_insert_with(unknown_register_value_sets);
+            for (argument_index, values) in arguments.iter().enumerate() {
+                let Some(values) = values else {
+                    continue;
+                };
+                let register = argument_index + 1;
+                target_entry[register] = match &target_entry[register] {
+                    Some(existing) => bounded_value_union(existing, values),
+                    None => Some(values.clone()),
+                };
+            }
+        }
+        if next_entry_values == entry_values {
+            break;
+        }
+        entry_values = next_entry_values;
+        value_analysis = analyze_cfg_value_sets(
+            instructions,
+            functions,
+            basic_blocks,
+            sbpf_version,
+            &entry_values,
+        );
+    }
+
+    value_analysis
+        .callx_values
+        .into_iter()
+        .filter_map(|(call_pc, addresses)| {
+            let mut targets = addresses
+                .into_iter()
+                .filter_map(|address| {
+                    let offset = (address as u64).checked_sub(text_section_vaddr)?;
+                    if offset % ebpf::INSN_SIZE as u64 != 0 {
+                        return None;
+                    }
+                    let target_pc = usize::try_from(offset / ebpf::INSN_SIZE as u64).ok()?;
+                    let mut matches = functions.iter().filter(|function| function.pc == target_pc);
+                    let first = matches.next()?;
+                    matches
+                        .next()
+                        .is_none()
+                        .then_some((first.pc, first.symbol_hash))
+                })
+                .collect::<Vec<_>>();
+            targets.sort_unstable();
+            targets.dedup();
+            (!targets.is_empty()).then_some((call_pc, targets))
+        })
+        .collect()
 }
 
 fn collect_calls(
@@ -1214,46 +1645,116 @@ fn collect_calls(
         sbpf_version,
         text_section_vaddr,
     );
+    let cfg_callx_target_candidates = collect_cfg_callx_target_candidates(
+        instructions,
+        functions,
+        basic_blocks,
+        sbpf_version,
+        text_section_vaddr,
+    );
 
     instructions
         .iter()
         .filter_map(|instruction| {
-            let (kind, target_pc, target_symbol_hash, status) = match instruction.opcode {
+            let (kind, target_pc, target_pcs, target_symbol_hash, status) = match instruction.opcode
+            {
                 ebpf::CALL_REG => match constant_callx_targets.get(&instruction.pc) {
                     Some((target_pc, symbol_hash)) => (
                         "indirect_internal_call",
                         Some(*target_pc),
+                        vec![*target_pc],
                         Some(*symbol_hash),
                         "resolved",
                     ),
-                    None => ("indirect", None, None, "unresolved"),
+                    None => match cfg_callx_target_candidates.get(&instruction.pc) {
+                        Some(targets) => (
+                            "indirect_internal_call_set",
+                            None,
+                            targets.iter().map(|(pc, _)| *pc).collect(),
+                            None,
+                            "candidates",
+                        ),
+                        None => ("indirect", None, Vec::new(), None, "unresolved"),
+                    },
                 },
-                ebpf::CALL_IMM if instruction.assembly.starts_with("syscall ") => (
-                    "syscall",
-                    None,
-                    Some(instruction.immediate as u32),
-                    "resolved",
-                ),
+                ebpf::CALL_IMM
+                    if instruction.assembly.starts_with("syscall ")
+                        || (sbpf_version.static_syscalls() && instruction.src == 0) =>
+                {
+                    (
+                        "syscall",
+                        None,
+                        Vec::new(),
+                        Some(instruction.immediate as u32),
+                        "resolved",
+                    )
+                }
                 ebpf::CALL_IMM => {
-                    let symbol_hash = instruction.immediate as u32;
-                    let mut targets = functions
-                        .iter()
-                        .filter(|function| symbol_hash != 0 && function.symbol_hash == symbol_hash)
-                        .map(|function| function.pc);
-                    let first = targets.next();
-                    if first.is_some() && targets.next().is_none() {
-                        ("direct_internal_call", first, Some(symbol_hash), "resolved")
-                    } else {
+                    if sbpf_version.static_syscalls() {
+                        let target_pc = sbpf_version
+                            .calculate_call_imm_target_pc(instruction.pc, instruction.immediate)
+                            as usize;
+                        let mut targets =
+                            functions.iter().filter(|function| function.pc == target_pc);
+                        let first = targets.next();
+                        let unique = first.is_some() && targets.next().is_none();
+                        if unique {
+                            let target = first.expect("checked above");
+                            return Some(CallFact {
+                                call_pc: instruction.pc,
+                                caller_pc: functions
+                                    .iter()
+                                    .filter(|function| function.pc <= instruction.pc)
+                                    .max_by_key(|function| function.pc)
+                                    .map(|function| function.pc),
+                                kind: "direct_internal_call".into(),
+                                target_pc: Some(target.pc),
+                                target_pcs: vec![target.pc],
+                                target_symbol_hash: Some(target.symbol_hash),
+                                status: "resolved".into(),
+                            });
+                        }
                         (
                             "direct_or_relocated",
                             None,
-                            Some(symbol_hash),
+                            Vec::new(),
+                            None,
                             if first.is_some() {
                                 "ambiguous"
                             } else {
                                 "unresolved"
                             },
                         )
+                    } else {
+                        let symbol_hash = instruction.immediate as u32;
+                        let mut targets = functions
+                            .iter()
+                            .filter(|function| {
+                                symbol_hash != 0 && function.symbol_hash == symbol_hash
+                            })
+                            .map(|function| function.pc);
+                        let first = targets.next();
+                        if first.is_some() && targets.next().is_none() {
+                            (
+                                "direct_internal_call",
+                                first,
+                                first.into_iter().collect(),
+                                Some(symbol_hash),
+                                "resolved",
+                            )
+                        } else {
+                            (
+                                "direct_or_relocated",
+                                None,
+                                Vec::new(),
+                                Some(symbol_hash),
+                                if first.is_some() {
+                                    "ambiguous"
+                                } else {
+                                    "unresolved"
+                                },
+                            )
+                        }
                     }
                 }
                 _ => return None,
@@ -1268,6 +1769,7 @@ fn collect_calls(
                 caller_pc,
                 kind: kind.into(),
                 target_pc,
+                target_pcs,
                 target_symbol_hash,
                 status: status.into(),
             })
@@ -1316,7 +1818,7 @@ fn collect_register_uses(
         }
 
         match instruction.opcode {
-            ebpf::LD_DW_IMM | ebpf::MOV32_IMM | ebpf::MOV64_IMM => {
+            ebpf::LD_DW_IMM | ebpf::MOV64_IMM => {
                 update_immediate(
                     &mut registers,
                     instruction.dst,
@@ -1324,11 +1826,28 @@ fn collect_register_uses(
                     instruction.pc,
                 );
             }
-            ebpf::MOV32_REG | ebpf::MOV64_REG => {
+            ebpf::MOV32_IMM => update_immediate(
+                &mut registers,
+                instruction.dst,
+                zero_extend_32(instruction.immediate),
+                instruction.pc,
+            ),
+            ebpf::MOV64_REG => {
                 let source = registers.get(instruction.src as usize).copied().flatten();
                 update_register(&mut registers, instruction.dst, source);
             }
-            ebpf::ADD32_IMM | ebpf::ADD64_IMM => {
+            ebpf::MOV32_REG => {
+                let source = registers
+                    .get(instruction.src as usize)
+                    .copied()
+                    .flatten()
+                    .map(|mut value| {
+                        value.value = zero_extend_32(value.value);
+                        value
+                    });
+                update_register(&mut registers, instruction.dst, source);
+            }
+            ebpf::ADD64_IMM => {
                 update_arithmetic(
                     &mut registers,
                     instruction.dst,
@@ -1336,7 +1855,7 @@ fn collect_register_uses(
                     false,
                 );
             }
-            ebpf::SUB32_IMM | ebpf::SUB64_IMM => {
+            ebpf::SUB64_IMM => {
                 update_arithmetic(
                     &mut registers,
                     instruction.dst,
@@ -1344,7 +1863,19 @@ fn collect_register_uses(
                     true,
                 );
             }
-            ebpf::ADD32_REG | ebpf::ADD64_REG => {
+            ebpf::ADD32_IMM => update_arithmetic_32(
+                &mut registers,
+                instruction.dst,
+                Some(instruction.immediate),
+                false,
+            ),
+            ebpf::SUB32_IMM => update_arithmetic_32(
+                &mut registers,
+                instruction.dst,
+                Some(instruction.immediate),
+                true,
+            ),
+            ebpf::ADD64_REG => {
                 let operand = registers
                     .get(instruction.src as usize)
                     .copied()
@@ -1352,13 +1883,26 @@ fn collect_register_uses(
                     .map(|value| value.value);
                 update_arithmetic(&mut registers, instruction.dst, operand, false);
             }
-            ebpf::SUB32_REG | ebpf::SUB64_REG => {
+            ebpf::SUB64_REG => {
                 let operand = registers
                     .get(instruction.src as usize)
                     .copied()
                     .flatten()
                     .map(|value| value.value);
                 update_arithmetic(&mut registers, instruction.dst, operand, true);
+            }
+            ebpf::ADD32_REG | ebpf::SUB32_REG => {
+                let operand = registers
+                    .get(instruction.src as usize)
+                    .copied()
+                    .flatten()
+                    .map(|value| value.value);
+                update_arithmetic_32(
+                    &mut registers,
+                    instruction.dst,
+                    operand,
+                    instruction.opcode == ebpf::SUB32_REG,
+                );
             }
             ebpf::CALL_IMM | ebpf::CALL_REG => {
                 for register in registers.iter_mut().take(6) {
@@ -1821,6 +2365,38 @@ fn update_arithmetic(
             } else {
                 current.value.wrapping_add(operand)
             };
+            Some(current)
+        }
+        _ => None,
+    };
+}
+
+fn zero_extend_32(value: i64) -> i64 {
+    value as u32 as i64
+}
+
+fn alu_32(left: i64, right: i64, subtract: bool) -> i64 {
+    let left = left as u32;
+    let right = right as u32;
+    if subtract {
+        left.wrapping_sub(right) as i64
+    } else {
+        left.wrapping_add(right) as i64
+    }
+}
+
+fn update_arithmetic_32(
+    registers: &mut [Option<KnownRegisterValue>; 11],
+    destination: u8,
+    operand: Option<i64>,
+    subtract: bool,
+) {
+    let Some(slot) = registers.get_mut(destination as usize) else {
+        return;
+    };
+    *slot = match (*slot, operand) {
+        (Some(mut current), Some(operand)) => {
+            current.value = alu_32(current.value, operand, subtract);
             Some(current)
         }
         _ => None,
@@ -2358,6 +2934,59 @@ mod static_tests {
     }
 
     #[test]
+    fn resolves_static_syscall_version_relative_internal_calls() {
+        use solana_sbpf::{ebpf, program::SBPFVersion};
+
+        let functions = [
+            FunctionFact {
+                pc: 0,
+                symbol_hash: 1,
+                name: "caller".into(),
+            },
+            FunctionFact {
+                pc: 16,
+                symbol_hash: 0x1616,
+                name: "callee".into(),
+            },
+        ];
+        let instructions = [
+            InstructionFact {
+                pc: 4,
+                opcode: ebpf::CALL_IMM,
+                dst: 0,
+                src: 1,
+                offset: 0,
+                immediate: 11,
+                assembly: "call ".into(),
+            },
+            InstructionFact {
+                pc: 5,
+                opcode: ebpf::CALL_IMM,
+                dst: 0,
+                src: 0,
+                offset: 0,
+                immediate: 7,
+                assembly: "call 7".into(),
+            },
+        ];
+
+        let calls = collect_calls(
+            &instructions,
+            &functions,
+            &[],
+            SBPFVersion::V3,
+            ebpf::MM_BYTECODE_START,
+        );
+        assert_eq!(calls[0].kind, "direct_internal_call");
+        assert_eq!(calls[0].target_pc, Some(16));
+        assert_eq!(calls[0].target_pcs, vec![16]);
+        assert_eq!(calls[0].target_symbol_hash, Some(0x1616));
+        assert_eq!(calls[0].status, "resolved");
+        assert_eq!(calls[1].kind, "syscall");
+        assert_eq!(calls[1].status, "resolved");
+    }
+
+    #[test]
     fn resolves_constant_callx_targets_for_every_register_encoding() {
         use solana_sbpf::{ebpf, program::SBPFVersion};
 
@@ -2452,7 +3081,72 @@ mod static_tests {
     }
 
     #[test]
-    fn does_not_propagate_callx_constants_across_basic_block_boundaries() {
+    fn callx_recovery_applies_alu32_zero_extension() {
+        use solana_sbpf::{ebpf, program::SBPFVersion};
+
+        let text_section_vaddr = 0xffff_fff0;
+        let functions = [
+            FunctionFact {
+                pc: 0,
+                symbol_hash: 0,
+                name: "caller".into(),
+            },
+            FunctionFact {
+                pc: 1,
+                symbol_hash: 1,
+                name: "callee".into(),
+            },
+        ];
+        let instructions = [
+            InstructionFact {
+                pc: 4,
+                opcode: ebpf::MOV64_IMM,
+                dst: 8,
+                src: 0,
+                offset: 0,
+                immediate: -8,
+                assembly: "mov64 r8, -8".into(),
+            },
+            InstructionFact {
+                pc: 5,
+                opcode: ebpf::MOV32_REG,
+                dst: 9,
+                src: 8,
+                offset: 0,
+                immediate: 0,
+                assembly: "mov32 r9, r8".into(),
+            },
+            InstructionFact {
+                pc: 6,
+                opcode: ebpf::CALL_REG,
+                dst: 0,
+                src: 0,
+                offset: 0,
+                immediate: 9,
+                assembly: "callx r9".into(),
+            },
+        ];
+        let blocks = [BasicBlockFact {
+            start_pc: 4,
+            end_instruction_index: instructions.len(),
+            destinations: vec![],
+            label: "caller".into(),
+        }];
+
+        let calls = collect_calls(
+            &instructions,
+            &functions,
+            &blocks,
+            SBPFVersion::V0,
+            text_section_vaddr,
+        );
+        assert_eq!(calls[0].target_pc, Some(1));
+        assert_eq!(calls[0].target_pcs, vec![1]);
+        assert_eq!(calls[0].status, "resolved");
+    }
+
+    #[test]
+    fn does_not_promote_cross_block_callx_candidates_to_exact_targets() {
         use solana_sbpf::{ebpf, program::SBPFVersion};
 
         let target_pc = 16usize;
@@ -2511,9 +3205,164 @@ mod static_tests {
             SBPFVersion::V0,
             ebpf::MM_BYTECODE_START,
         );
-        assert_eq!(calls[0].kind, "indirect");
+        assert_eq!(calls[0].kind, "indirect_internal_call_set");
         assert_eq!(calls[0].target_pc, None);
-        assert_eq!(calls[0].status, "unresolved");
+        assert_eq!(calls[0].target_pcs, vec![target_pc]);
+        assert_eq!(calls[0].status, "candidates");
+    }
+
+    #[test]
+    fn recovers_bounded_callx_candidates_through_cfg_and_direct_call_arguments() {
+        use solana_sbpf::{ebpf, program::SBPFVersion};
+
+        let helper_pc = 10usize;
+        let target_pcs = [20usize, 24usize];
+        let target_addresses =
+            target_pcs.map(|pc| ebpf::MM_BYTECODE_START + pc as u64 * ebpf::INSN_SIZE as u64);
+        let instructions = [
+            InstructionFact {
+                pc: 0,
+                opcode: ebpf::JEQ64_IMM,
+                dst: 0,
+                src: 0,
+                offset: 0,
+                immediate: 0,
+                assembly: "jeq r0, 0, lbb_4".into(),
+            },
+            InstructionFact {
+                pc: 2,
+                opcode: ebpf::LD_DW_IMM,
+                dst: 1,
+                src: 0,
+                offset: 0,
+                immediate: target_addresses[0] as i64,
+                assembly: format!("lddw r1, 0x{:x}", target_addresses[0]),
+            },
+            InstructionFact {
+                pc: 4,
+                opcode: ebpf::LD_DW_IMM,
+                dst: 1,
+                src: 0,
+                offset: 0,
+                immediate: target_addresses[1] as i64,
+                assembly: format!("lddw r1, 0x{:x}", target_addresses[1]),
+            },
+            InstructionFact {
+                pc: 6,
+                opcode: ebpf::CALL_IMM,
+                dst: 0,
+                src: 1,
+                offset: 0,
+                immediate: 0x1010,
+                assembly: "call ".into(),
+            },
+            InstructionFact {
+                pc: 7,
+                opcode: ebpf::EXIT,
+                dst: 0,
+                src: 0,
+                offset: 0,
+                immediate: 0,
+                assembly: "exit".into(),
+            },
+            InstructionFact {
+                pc: helper_pc,
+                opcode: ebpf::MOV64_REG,
+                dst: 3,
+                src: 1,
+                offset: 0,
+                immediate: 0,
+                assembly: "mov64 r3, r1".into(),
+            },
+            InstructionFact {
+                pc: 11,
+                opcode: ebpf::CALL_REG,
+                dst: 0,
+                src: 0,
+                offset: 0,
+                immediate: 3,
+                assembly: "callx r3".into(),
+            },
+            InstructionFact {
+                pc: 12,
+                opcode: ebpf::EXIT,
+                dst: 0,
+                src: 0,
+                offset: 0,
+                immediate: 0,
+                assembly: "exit".into(),
+            },
+        ];
+        let functions = [
+            FunctionFact {
+                pc: 0,
+                symbol_hash: 1,
+                name: "caller".into(),
+            },
+            FunctionFact {
+                pc: helper_pc,
+                symbol_hash: 0x1010,
+                name: "invoke_selected".into(),
+            },
+            FunctionFact {
+                pc: target_pcs[0],
+                symbol_hash: 0x2020,
+                name: "first_target".into(),
+            },
+            FunctionFact {
+                pc: target_pcs[1],
+                symbol_hash: 0x2424,
+                name: "second_target".into(),
+            },
+        ];
+        let blocks = [
+            BasicBlockFact {
+                start_pc: 0,
+                end_instruction_index: 1,
+                destinations: vec![2, 4],
+                label: "dispatch".into(),
+            },
+            BasicBlockFact {
+                start_pc: 2,
+                end_instruction_index: 2,
+                destinations: vec![6],
+                label: "first".into(),
+            },
+            BasicBlockFact {
+                start_pc: 4,
+                end_instruction_index: 3,
+                destinations: vec![6],
+                label: "second".into(),
+            },
+            BasicBlockFact {
+                start_pc: 6,
+                end_instruction_index: 5,
+                destinations: vec![],
+                label: "invoke".into(),
+            },
+            BasicBlockFact {
+                start_pc: helper_pc,
+                end_instruction_index: instructions.len(),
+                destinations: vec![],
+                label: "helper".into(),
+            },
+        ];
+
+        let calls = collect_calls(
+            &instructions,
+            &functions,
+            &blocks,
+            SBPFVersion::V0,
+            ebpf::MM_BYTECODE_START,
+        );
+        let direct = calls.iter().find(|call| call.call_pc == 6).unwrap();
+        assert_eq!(direct.target_pc, Some(helper_pc));
+        assert_eq!(direct.target_pcs, vec![helper_pc]);
+        let indirect = calls.iter().find(|call| call.call_pc == 11).unwrap();
+        assert_eq!(indirect.kind, "indirect_internal_call_set");
+        assert_eq!(indirect.target_pc, None);
+        assert_eq!(indirect.target_pcs, target_pcs);
+        assert_eq!(indirect.status, "candidates");
     }
 
     #[test]
@@ -2846,6 +3695,7 @@ mod static_tests {
                 caller_pc: Some(0),
                 kind: "direct_internal_call".into(),
                 target_pc: Some(16),
+                target_pcs: vec![16],
                 target_symbol_hash: Some(16),
                 status: "resolved".into(),
             }],

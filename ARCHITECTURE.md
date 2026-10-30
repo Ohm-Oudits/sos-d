@@ -276,10 +276,11 @@ Required deterministic outputs:
 Indirect call recovery uses the SBPF version's actual `callx` target-register
 encoding. A constant is an exact target only after subtracting the loaded text
 virtual address, checking instruction alignment, and matching one known function
-entry. The initial pass is deliberately intra-basic-block. CFG joins and
-interprocedural function-pointer arguments require a bounded set-valued lattice;
-until that pass proves a complete singleton, the edge remains unresolved rather
-than being guessed by a model.
+entry. A bounded set-valued lattice unions up to eight constants across CFG joins and
+propagates candidate function pointers through uniquely resolved direct-call argument
+registers for up to sixteen rounds. These sets are explicitly non-exhaustive and do
+not become exact-call contracts. Memory-loaded pointers, over-limit sets, and unknown
+values remain unresolved rather than being guessed by a model.
 
 Do not make a third-party GUI decompiler the core dependency. An optional Ghidra
 adapter can provide a comparison baseline, but the open-source product needs its own
@@ -611,7 +612,8 @@ and security tooling do not have to scrape human output.
 - Pinned candidate compilation and deterministic binary-similarity judging.
 - Type-layout and resolved-call non-regression checks. Exact same-block `callx`
   constants receive the same source/MIR target contract as resolved immediate calls;
-  path-dependent, multi-target, and hash-ambiguous calls remain explicit unresolved
+  bounded path-dependent targets are retained as non-exhaustive candidate sets, while
+  memory-dependent, over-limit, and hash-ambiguous calls remain explicit unresolved
   edges.
 - Trace comparison and bounded AI repair loop.
 

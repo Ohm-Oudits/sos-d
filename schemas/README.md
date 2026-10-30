@@ -32,6 +32,10 @@ Evidence-pack v5 adds exact resolved internal-call contracts. Refinement schema
 v3 maps those contracts to source calls, while validation schema v2 and MIR
 summary/comparison v3 record and enforce compiled call targets. AI-bundle v8
 invalidates checkpoints that predate these call-edge obligations.
+Static-analysis and canonical-IR v1 also permit additive `target_pcs` and
+`call_target_pcs` arrays. `target_pc` remains the proven singleton field;
+candidate arrays are bounded, potentially incomplete points-to evidence and must
+not be interpreted as exhaustive or compiler-verified call contracts.
 
 Compatibility rules:
 

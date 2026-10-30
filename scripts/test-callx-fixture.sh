@@ -14,7 +14,7 @@ cargo run --quiet -p sos-cli -- analyze "$artifact" --out "$audit_dir" >/dev/nul
 
 jq -e '[.instructions[] | select(.assembly | startswith("callx "))] | length > 0' \
   "$audit_dir/analysis.json" >/dev/null
-jq -e '[.calls[] | select(.kind == "indirect" and .status == "unresolved")] | length > 0' \
+jq -e '[.calls[] | select(.kind == "indirect_internal_call_set" and .status == "candidates" and (.target_pc == null) and ((.target_pcs | length) == 2))] | length > 0' \
   "$audit_dir/analysis.json" >/dev/null
 
-echo "Verified compiled callx instructions and conservative unresolved-target evidence."
+echo "Verified compiled callx instructions and a conservative two-target candidate set."

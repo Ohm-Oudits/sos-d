@@ -50,8 +50,8 @@ const HUMANIZATION_PROMPT_VERSION: &str = "sos-v2";
 const DETERMINISTIC_HUMANIZER_ID: &str = "sos-deterministic-syntax-v1";
 const HUMANIZATION_CACHE_SCHEMA_VERSION: u32 = 2;
 const HUMANIZATION_CACHE_RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
-const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v12";
-const LIFT_CACHE_SCHEMA_VERSION: u32 = 13;
+const LIFT_PROMPT_VERSION: &str = "sos-semantic-lift-v13";
+const LIFT_CACHE_SCHEMA_VERSION: u32 = 14;
 const LIFT_CACHE_RECORD_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 fn main() -> ExitCode {
@@ -3117,9 +3117,6 @@ fn lift_function_plan(
         .collect::<BTreeMap<_, _>>();
     let mut dependencies = vec![Vec::<usize>::new(); functions.len()];
     for call in &analysis.calls {
-        let Some(target_index) = call.target_pc.and_then(|pc| by_pc.get(&pc).copied()) else {
-            continue;
-        };
         let caller_index = call
             .caller_pc
             .and_then(|pc| by_pc.get(&pc).copied())
@@ -3134,8 +3131,20 @@ fn lift_function_plan(
         let Some(caller_index) = caller_index else {
             continue;
         };
-        if caller_index != target_index {
-            dependencies[caller_index].push(target_index);
+        // Candidate targets affect processing order and context only. They do
+        // not become exact direct-call contracts or proof that the set is
+        // exhaustive.
+        for target_pc in call
+            .target_pc
+            .into_iter()
+            .chain(call.target_pcs.iter().copied())
+        {
+            let Some(target_index) = by_pc.get(&target_pc).copied() else {
+                continue;
+            };
+            if caller_index != target_index {
+                dependencies[caller_index].push(target_index);
+            }
         }
     }
     for items in &mut dependencies {
@@ -4738,11 +4747,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        run_deterministic_humanization, run_humanization_units, run_lift_bundle,
-        transaction_account_addresses, BenchmarkOptions, ExplainOptions, HumanizationCache,
-        HumanizeOptions, JudgeOptions, LiftCheckpointCache, LiftOptions, LiftProvider,
-        LiftRunConfig, RemoteOptions, UnavailableHostedProvider, DETERMINISTIC_HUMANIZER_ID,
-        GROQ_GPT_OSS_120B, HUGGING_FACE_GPT_OSS_120B,
+        lift_function_plan, run_deterministic_humanization, run_humanization_units,
+        run_lift_bundle, transaction_account_addresses, BenchmarkOptions, ExplainOptions,
+        HumanizationCache, HumanizeOptions, JudgeOptions, LiftCheckpointCache, LiftOptions,
+        LiftProvider, LiftRunConfig, RemoteOptions, UnavailableHostedProvider,
+        DETERMINISTIC_HUMANIZER_ID, GROQ_GPT_OSS_120B, HUGGING_FACE_GPT_OSS_120B,
     };
     use sos_ai::{
         AiError, AiStageModels, AiStageTokenBudgets, ModelProvider, ModelRequest, ModelResponse,
@@ -5454,6 +5463,65 @@ mod tests {
     }
 
     #[test]
+    fn semantic_lift_schedules_bounded_call_candidates_before_the_caller() {
+        let analysis = sos_analysis::StaticAnalysis {
+            schema_version: 1,
+            sbpf_version: "V0".into(),
+            entrypoint: 0,
+            instructions: Vec::new(),
+            functions: vec![
+                sos_analysis::FunctionFact {
+                    pc: 0,
+                    symbol_hash: 0,
+                    name: "caller".into(),
+                },
+                sos_analysis::FunctionFact {
+                    pc: 8,
+                    symbol_hash: 8,
+                    name: "candidate_a".into(),
+                },
+                sos_analysis::FunctionFact {
+                    pc: 16,
+                    symbol_hash: 16,
+                    name: "candidate_b".into(),
+                },
+            ],
+            basic_blocks: Vec::new(),
+            memory_accesses: Vec::new(),
+            stack_accesses: Vec::new(),
+            strings: Vec::new(),
+            public_key_candidates: Vec::new(),
+            immediate_constants: Vec::new(),
+            register_uses: Vec::new(),
+            calls: vec![sos_analysis::CallFact {
+                call_pc: 4,
+                caller_pc: Some(0),
+                kind: "indirect_internal_call_set".into(),
+                target_pc: None,
+                target_pcs: vec![8, 16],
+                target_symbol_hash: None,
+                status: "candidates".into(),
+            }],
+            relocations: Vec::new(),
+            sccs: Vec::new(),
+            dataflow_edges: Vec::new(),
+            verifier_diagnostics: Vec::new(),
+        };
+
+        let (functions, dependencies, order) = lift_function_plan(&analysis);
+        assert_eq!(
+            functions
+                .iter()
+                .map(|function| function.pc)
+                .collect::<Vec<_>>(),
+            vec![0, 8, 16]
+        );
+        assert_eq!(dependencies, vec![vec![1, 2], vec![], vec![]]);
+        assert_eq!(order, vec![1, 2, 0]);
+        assert!(analysis.calls[0].target_pc.is_none());
+    }
+
+    #[test]
     fn semantic_lift_processes_callees_first_and_passes_their_recovery_to_callers() {
         type RecordedStructureRequests = Arc<Mutex<Vec<(usize, Vec<String>)>>>;
 
@@ -5672,6 +5740,7 @@ mod tests {
                 caller_pc: Some(0),
                 kind: "direct_internal_call".into(),
                 target_pc: Some(8),
+                target_pcs: vec![8],
                 target_symbol_hash: Some(8),
                 status: "resolved".into(),
             }],

@@ -39,7 +39,10 @@ Already implemented in this workspace:
 - Conservative direct, indirect, and syscall call-site facts with unresolved-target
   status, plus ELF relocation facts when exposed by the object parser. Unique
   immediate-call hashes and same-basic-block constant `callx` virtual addresses are
-  resolved to exact function entries; path-dependent target sets remain unresolved.
+  resolved to exact function entries. A bounded eight-value lattice unions constants
+  across CFG joins and carries candidate function pointers through uniquely resolved
+  direct-call arguments for up to sixteen rounds; these path-dependent sets are
+  exported as non-exhaustive candidates, never exact callees.
 - Explicit load/store memory facts and conservative entrypoint-input field candidates.
 - Bounded read-only-section string extraction and immediate-constant facts.
 - Bounded read-only-section 32-byte public-key candidates with base58 rendering,
@@ -293,8 +296,9 @@ Tasks:
 
 1. Split `sos-analysis` into ELF normalization, decode, CFG, dataflow, and IR modules.
 2. Define stable IDs for instructions, blocks, functions, values, and memory regions.
-3. Add set-valued, CFG-aware indirect-call/branch and tail-call confidence classes;
-   preserve per-path candidates instead of collapsing a multi-target `callx` to one
+3. Extend indirect-call candidates through bounded stack/read-only-data loads, attach
+   completeness/confidence classes, and add indirect-branch and tail-call recovery.
+   Preserve per-path candidates instead of collapsing a multi-target `callx` to one
    callee.
 4. Implement an SSA-like IR with explicit unknown values and memory effects.
 5. Build a syscall database from runtime-aligned definitions and test call extraction.

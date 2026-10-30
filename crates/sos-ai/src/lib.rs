@@ -8197,6 +8197,7 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
             immediate: 0,
             memory_effect: None,
             call_target_pc: None,
+            call_target_pcs: Vec::new(),
         });
         pack.ir.operations.push(sos_analysis::IrOperation {
             id: "op_2".into(),
@@ -8210,6 +8211,7 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
             immediate: 0,
             memory_effect: None,
             call_target_pc: None,
+            call_target_pcs: Vec::new(),
         });
         pack.ir.sccs = vec![sos_analysis::SccFact {
             id: 0,
@@ -8275,6 +8277,7 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
             caller_pc: Some(0),
             kind: "direct_internal_call".into(),
             target_pc: Some(8),
+            target_pcs: vec![8],
             target_symbol_hash: Some(8),
             status: "resolved".into(),
         }];
@@ -8309,6 +8312,26 @@ fn fn_80(_1: &mut [u8], _2: u8, _3: usize) -> () {
         assert_eq!(
             indirect_pack.ir.operations[0].kind,
             "indirect_internal_call"
+        );
+        let mut candidate_analysis = pack.analysis.clone();
+        candidate_analysis.calls[0].kind = "indirect_internal_call_set".into();
+        candidate_analysis.calls[0].target_pc = None;
+        candidate_analysis.calls[0].target_pcs = vec![8, 10];
+        candidate_analysis.calls[0].target_symbol_hash = None;
+        candidate_analysis.calls[0].status = "candidates".into();
+        candidate_analysis.instructions[0].assembly = "callx r9".into();
+        let candidate_semantics = sos_solana::analyze(&candidate_analysis);
+        let candidate_pack = EvidencePack::from_analysis(
+            ModelTask::StructureRecovery,
+            None,
+            candidate_analysis,
+            candidate_semantics,
+        );
+        assert!(required_direct_call_contracts(&candidate_pack, "fn_0").is_empty());
+        let candidate_hosted = crate::groq::hosted_model_evidence(&candidate_pack);
+        assert_eq!(
+            candidate_hosted["program"]["operations"][0]["call_candidates"],
+            serde_json::json!([8, 10])
         );
 
         let output = test_structure_output(
@@ -9444,6 +9467,7 @@ fn fn_80(_1: bool, _2: bool) -> () {
             immediate: 0,
             memory_effect: None,
             call_target_pc: None,
+            call_target_pcs: Vec::new(),
         });
         pack.ir.operations.push(sos_analysis::IrOperation {
             id: "op_2".into(),
@@ -9457,6 +9481,7 @@ fn fn_80(_1: bool, _2: bool) -> () {
             immediate: 0,
             memory_effect: None,
             call_target_pc: None,
+            call_target_pcs: Vec::new(),
         });
         pack.ir.sccs = vec![sos_analysis::SccFact {
             id: 0,

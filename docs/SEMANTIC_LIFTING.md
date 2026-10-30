@@ -153,9 +153,9 @@ The local GPT-OSS adapter selects Ollama's `low` reasoning mode so reasoning
 tokens leave room for final schema-constrained JSON. Structure and signature
 schemas require a candidate for every scoped IR function; an empty array is not
 treated as successful decompilation.
-Semantic-lift prompt v9 and lift-cache schema v10 bind checkpoints to the CFG
-region mapping contract, so older effect-only structure responses are never
-silently reused.
+Semantic-lift prompt v13 and lift-cache schema v14 bind checkpoints to CFG regions,
+memory layouts, exact call contracts, and the non-exhaustive indirect-call candidate
+semantics, so older responses are never silently reused under stronger obligations.
 
 ## Running a lift
 
@@ -464,8 +464,10 @@ layout assertions. Resolved internal SBPF calls now retain exact caller, call
 site, and callee contracts through both source stages; rustc MIR verifies target
 identity and repeated-call multiplicity. This includes `callx` when version-aware
 same-basic-block propagation proves one aligned function-entry virtual address.
-Path-dependent or multi-target function pointers and hash-ambiguous calls remain
-unresolved. The checked `sos-callx-fixture` intentionally selects between two
-functions and guards this uncertainty boundary. The remaining judge work is
-set-valued CFG/interprocedural indirect-call recovery and multi-transaction path
-coverage.
+Path-dependent function pointers recovered through CFG joins and direct-call argument
+handoffs are exported as bounded, non-exhaustive `call_candidates`; they never create
+an exact direct-call contract. Hash-ambiguous, memory-loaded, and over-limit targets
+remain unresolved. The checked `sos-callx-fixture` intentionally selects between two
+functions and proves this separation end to end. The remaining judge work includes
+memory/stack points-to recovery, candidate-set completeness proofs, and
+multi-transaction path coverage.

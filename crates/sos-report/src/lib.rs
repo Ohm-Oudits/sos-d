@@ -202,7 +202,7 @@ pub fn render_markdown(analysis: &StaticAnalysis, semantics: &SemanticAnalysis) 
     if analysis.calls.is_empty() {
         output.push_str("No call sites were identified.\n\n");
     } else {
-        output.push_str("| Call PC | Caller | Kind | Target | Symbol hash | Status |\n|---:|---:|---|---:|---:|---|\n");
+        output.push_str("| Call PC | Caller | Kind | Target / candidates | Symbol hash | Status |\n|---:|---:|---|---|---:|---|\n");
         for call in &analysis.calls {
             output.push_str(&format!(
                 "| `0x{:x}` | `{}` | `{}` | `{}` | `{}` | `{}` |\n",
@@ -213,6 +213,18 @@ pub fn render_markdown(analysis: &StaticAnalysis, semantics: &SemanticAnalysis) 
                 call.kind,
                 call.target_pc
                     .map(|pc| format!("0x{pc:x}"))
+                    .or_else(|| {
+                        (!call.target_pcs.is_empty()).then(|| {
+                            format!(
+                                "candidates:{{{}}}",
+                                call.target_pcs
+                                    .iter()
+                                    .map(|pc| format!("0x{pc:x}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        })
+                    })
                     .unwrap_or_else(|| "unresolved".into()),
                 call.target_symbol_hash
                     .map(|hash| hash.to_string())
@@ -944,6 +956,43 @@ fn render_instruction(
         ));
         return;
     }
+    let indirect_candidates = analysis.calls.iter().find(|call| {
+        call.call_pc == instruction.pc
+            && call.kind == "indirect_internal_call_set"
+            && !call.target_pcs.is_empty()
+    });
+    if let Some(call) = indirect_candidates {
+        let targets = call
+            .target_pcs
+            .iter()
+            .map(|pc| format!("fn_{pc:04x}"))
+            .collect::<Vec<_>>();
+        if c_like {
+            output.push_str(&format!(
+                "{padding}/* 0x{:x}: path-dependent indirect call; bounded candidates {{{}}}; set may be incomplete; evidence: analysis/instruction:0x{:x} */\n",
+                instruction.pc,
+                targets.join(", "),
+                instruction.pc
+            ));
+            output.push_str(&format!(
+                "{padding}sos_unknown_indirect_call((void *[]){{{}}}, {});\n",
+                targets.join(", "),
+                targets.len()
+            ));
+        } else {
+            output.push_str(&format!(
+                "{padding}// 0x{:x}: path-dependent indirect call; bounded candidates {{{}}}; set may be incomplete; evidence: analysis/instruction:0x{:x}\n",
+                instruction.pc,
+                targets.join(", "),
+                instruction.pc
+            ));
+            output.push_str(&format!(
+                "{padding}unknown_indirect_call(&[{}]);\n",
+                targets.join(", ")
+            ));
+        }
+        return;
+    }
     let syscall = semantics
         .syscalls
         .iter()
@@ -1067,6 +1116,60 @@ mod tests {
             .as_f64()
             .unwrap();
         assert!((confidence - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn pseudocode_renders_indirect_target_sets_without_claiming_exhaustiveness() {
+        let analysis = StaticAnalysis {
+            schema_version: 1,
+            sbpf_version: "V0".into(),
+            entrypoint: 0,
+            instructions: vec![sos_analysis::InstructionFact {
+                pc: 0,
+                opcode: 0x8d,
+                dst: 0,
+                src: 0,
+                offset: 0,
+                immediate: 3,
+                assembly: "callx r3".into(),
+            }],
+            functions: vec![FunctionFact {
+                pc: 0,
+                symbol_hash: 1,
+                name: "entrypoint".into(),
+            }],
+            basic_blocks: vec![sos_analysis::BasicBlockFact {
+                start_pc: 0,
+                end_instruction_index: 1,
+                destinations: vec![],
+                label: "entrypoint".into(),
+            }],
+            memory_accesses: vec![],
+            stack_accesses: vec![],
+            strings: vec![],
+            public_key_candidates: vec![],
+            immediate_constants: vec![],
+            register_uses: vec![],
+            calls: vec![sos_analysis::CallFact {
+                call_pc: 0,
+                caller_pc: Some(0),
+                kind: "indirect_internal_call_set".into(),
+                target_pc: None,
+                target_pcs: vec![65, 68],
+                target_symbol_hash: None,
+                status: "candidates".into(),
+            }],
+            relocations: vec![],
+            sccs: vec![],
+            dataflow_edges: vec![],
+            verifier_diagnostics: vec![],
+        };
+        let semantics = sos_solana::analyze(&analysis);
+        let source = render_pseudocode(&analysis, &semantics);
+        assert!(source.contains("bounded candidates {fn_0041, fn_0044}"));
+        assert!(source.contains("set may be incomplete"));
+        assert!(source.contains("unknown_indirect_call(&[fn_0041, fn_0044])"));
+        assert!(!source.contains("fn_0041();"));
     }
 
     #[test]

@@ -32,6 +32,11 @@ deployed address / .so
 The model receives a compact projection rather than the raw ELF. A stage result
 is accepted only after local validation. Accepted output is still marked
 unverified until compiler, replay, and binary-similarity checks support it.
+Exact internal callees are supplied as immutable call contracts. Path-dependent
+indirect calls are different: the compact projection may contain a bounded
+`call_candidates` list with no exact target. Providers are instructed to preserve an
+uncertain dispatch over those alternatives, never select one callee, claim the list
+is exhaustive, or emit an exact-call mapping for it.
 
 ## Staged agents
 
@@ -56,8 +61,8 @@ stage model identities, prompt version, stage input, and stage output. A changed
 provider or stage model cannot silently reuse another result.
 Structure-stage region contracts are derived locally from dominators,
 postdominators, natural backedges, and recursive SCCs; they are not model
-claims. Prompt v9 and lift-cache schema v10 invalidate earlier checkpoints that
-did not carry this per-region mapping proof.
+claims. Prompt v13 and lift-cache schema v14 invalidate checkpoints that predate the
+current CFG, memory-layout, exact-call, and indirect-call-candidate rules.
 
 `--model` selects the default agent model. The following optional overrides
 implement Patina-style role specialization while retaining one provider and one
